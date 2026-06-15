@@ -227,11 +227,32 @@ def fit_correlation(
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     r2     = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
     dof    = len(t) - len(free)
+
+    # Weighted chi² (requires sigma); unweighted red. chi² is always available.
     if s is not None and dof > 0:
         chi2     = float(np.sum((resid / s) ** 2))
         red_chi2 = chi2 / dof
     else:
         chi2 = red_chi2 = float("nan")
+    red_chi2_unweighted = (ss_res / dof) if dof > 0 else float("nan")
+
+    # Correlation matrix among free parameters (from curve_fit's covariance).
+    # corr[i,j] = cov[i,j] / (σ_i · σ_j).  Fixed params get a NaN row/col.
+    n_all = len(names)
+    corr_matrix = np.full((n_all, n_all), float("nan"))
+    try:
+        diag = np.diag(pcov)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            std = np.sqrt(diag)
+            outer_std = np.outer(std, std)
+            corr_free = np.where(outer_std > 0, pcov / outer_std, float("nan"))
+        # Map free-parameter indices back to full parameter list.
+        free_idx = [names.index(n) for n in free]
+        for ii, fi in enumerate(free_idx):
+            for jj, fj in enumerate(free_idx):
+                corr_matrix[fi, fj] = corr_free[ii, jj]
+    except Exception:
+        pass  # leave as NaN if covariance is degenerate
 
     return {
         "model": model, "names": names, "free": free,
@@ -240,6 +261,8 @@ def fit_correlation(
         "guesses": dict(guesses), "lowers": dict(lowers),
         "uppers": dict(uppers), "fixed": dict(fixed),
         "r2": r2, "chi2": chi2, "red_chi2": red_chi2,
+        "red_chi2_unweighted": red_chi2_unweighted,
+        "corr_matrix": corr_matrix,
         "ss_res": ss_res, "n_points": len(t), "dof": dof,
         "weighted": s is not None,
     }
@@ -282,8 +305,9 @@ def plot_fit(
         unit = next((p.unit for p in model.params if p.name == n), "")
         tag = "  (fixed)" if result["fixed"].get(n) else f" ± {err:.3g}"
         lines.append(f"{n} = {val:.4g}{tag} {unit}".rstrip())
-    gof = (f"red. χ² = {result['red_chi2']:.3g}"
+    gof = (f"red. χ² = {result['red_chi2']:.3g} (wtd)"
            if result["weighted"] else f"R² = {result['r2']:.4f}")
+    gof += f"\nred. χ² = {result['red_chi2_unweighted']:.3g} (unwtd)"
     lines.append(gof)
     ax.text(0.98, 0.95, "\n".join(lines), transform=ax.transAxes,
             ha="right", va="top", fontsize=9, family="monospace",
@@ -338,7 +362,8 @@ def _fits_dir(source_path: Path) -> Path:
 
 def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     """
-    Write a human-readable .txt report plus a .csv of the fitted curve.
+    Write a human-readable .txt report, a .csv of the fitted curve, and a
+    _corr.csv containing the parameter correlation matrix.
 
     Returns
     -------
@@ -351,6 +376,7 @@ def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
 
     report_path = out_dir / f"{stem}.txt"
     curve_path  = out_dir / f"{stem}_curve.csv"
+    corr_path   = out_dir / f"{stem}_corr.csv"
 
     # ── Report ────────────────────────────────────────────────────────────────
     L: list[str] = []
@@ -382,12 +408,36 @@ def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     L.append("")
     L.append("Goodness of fit")
     L.append("-" * 60)
-    L.append(f"  SS_res     : {result['ss_res']:.6g}")
-    L.append(f"  R^2        : {result['r2']:.6f}")
+    L.append(f"  SS_res            : {result['ss_res']:.6g}")
+    L.append(f"  R^2               : {result['r2']:.6f}")
+    L.append(f"  red. chi^2 (unwtd): {result['red_chi2_unweighted']:.6g}")
     if result["weighted"]:
-        L.append(f"  chi^2      : {result['chi2']:.6g}")
-        L.append(f"  red. chi^2 : {result['red_chi2']:.6g}")
+        L.append(f"  chi^2             : {result['chi2']:.6g}")
+        L.append(f"  red. chi^2 (wtd)  : {result['red_chi2']:.6g}")
     L.append("")
+
+    # ── Correlation matrix block in the report ────────────────────────────────
+    names  = result["names"]
+    cm     = result["corr_matrix"]
+    free   = result["free"]
+    L.append("Parameter correlation matrix  (free parameters only)")
+    L.append("-" * 60)
+    col_w = 10
+    L.append(" " * 8 + "".join(f"{n:>{col_w}}" for n in free))
+    for i, ni in enumerate(names):
+        if result["fixed"].get(ni, False):
+            continue
+        fi = names.index(ni)
+        row_vals = []
+        for j, nj in enumerate(names):
+            if result["fixed"].get(nj, False):
+                continue
+            fj = names.index(nj)
+            v = cm[fi, fj]
+            row_vals.append(f"{v:>{col_w}.4f}" if np.isfinite(v) else f"{'nan':>{col_w}}")
+        L.append(f"{ni:<8}" + "".join(row_vals))
+    L.append("")
+
     report_path.write_text("\n".join(L), encoding="utf-8")
 
     # ── Curve CSV ─────────────────────────────────────────────────────────────
@@ -401,17 +451,33 @@ def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     }
     if result["weighted"]:
         cols["sigma"] = result["sigma"]
-    names = list(cols.keys())
+    col_names = list(cols.keys())
     with curve_path.open("w", encoding="utf-8", newline="") as fh:
         fh.write(f"# FCS fit curve — {model.key}\n")
         fh.write(f"# source : {source_path.name}\n")
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
-        fh.write(",".join(names) + "\n")
-        for row in zip(*(cols[n] for n in names)):
+        fh.write(",".join(col_names) + "\n")
+        for row in zip(*(cols[n] for n in col_names)):
             fh.write(",".join(f"{v:.10g}" for v in row) + "\n")
+
+    # ── Correlation matrix CSV ─────────────────────────────────────────────────
+    with corr_path.open("w", encoding="utf-8", newline="") as fh:
+        fh.write(f"# FCS fit parameter correlation matrix — {model.key}\n")
+        fh.write(f"# source : {source_path.name}\n")
+        fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
+        fh.write(f"# note : free parameters only; fixed parameters omitted\n")
+        fh.write("param," + ",".join(free) + "\n")
+        free_idx = [names.index(n) for n in free]
+        for fi, ni in zip(free_idx, free):
+            row = [ni] + [
+                f"{cm[fi, fj]:.10g}" if np.isfinite(cm[fi, fj]) else "nan"
+                for fj in free_idx
+            ]
+            fh.write(",".join(row) + "\n")
 
     print(f"[fit] wrote {report_path}")
     print(f"[fit] wrote {curve_path}")
+    print(f"[fit] wrote {corr_path}")
     return report_path, curve_path
 
 
@@ -571,6 +637,23 @@ def fit_global(
         chi2, red_chi2 = ss_res_tot, ss_res_tot / dof
     else:
         chi2 = red_chi2 = float("nan")
+    red_chi2_unweighted = (ss_res_tot / dof) if dof > 0 else float("nan")
+
+    # Correlation matrix among free parameters (from Jacobian-based covariance).
+    # Rows/cols correspond to free_spec order; expand to full names × names below
+    # for the single-dataset case.  For global fits we store it in free_spec order.
+    global_corr_free = np.full((n_par, n_par), float("nan"))
+    global_corr_labels: list = [f"{p}{'_linked' if di is None else f'_ds{di}'}"
+                                 for (p, di) in free_spec]
+    try:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            diag = np.diag(cov)
+            std = np.sqrt(np.clip(diag, 0.0, np.inf))
+            outer_std = np.outer(std, std)
+            global_corr_free = np.where(outer_std > 0, cov / outer_std,
+                                        float("nan"))
+    except Exception:
+        pass  # leave as NaN if covariance is degenerate
 
     return {
         "model": model, "names": names, "datasets": per_dataset,
@@ -578,7 +661,11 @@ def fit_global(
         "lowers": dict(lowers), "uppers": dict(uppers), "guesses": dict(guesses),
         "weighted": use_weights, "n_datasets": D,
         "dof": dof, "n_free": n_par, "n_obs": n_obs,
-        "chi2": chi2, "red_chi2": red_chi2, "ss_res": ss_res_tot,
+        "chi2": chi2, "red_chi2": red_chi2,
+        "red_chi2_unweighted": red_chi2_unweighted,
+        "corr_matrix": global_corr_free,
+        "corr_labels": global_corr_labels,
+        "ss_res": ss_res_tot,
         "success": bool(sol.success), "message": str(sol.message),
     }
 
@@ -623,9 +710,10 @@ def plot_global_fit(result: dict, show: bool = True):
         unit = next((p.unit for p in model.params if p.name == n), "")
         tag = "(fixed)" if result["fixed"].get(n) else f"± {referr[n]:.2g}"
         box.append(f"{n} = {ref[n]:.4g} {tag} {unit}".rstrip())
-    gof = (f"red. χ² = {result['red_chi2']:.3g}"
+    gof = (f"red. χ² = {result['red_chi2']:.3g} (wtd)"
            if result["weighted"] else
            f"global R² = {1 - result['ss_res'] / _grand_ss_tot(dsets):.4f}")
+    gof += f"\nred. χ² = {result['red_chi2_unweighted']:.3g} (unwtd)"
     box.append(gof)
     if box:
         ax.text(0.98, 0.95, "linked:\n" + "\n".join(box),
@@ -683,8 +771,9 @@ def export_global_fit(result: dict, out_source: str | Path,
              f"dof: {result['dof']}")
     L.append(f"weighted   : {'yes (σ from G_std)' if result['weighted'] else 'no'}")
     L.append(f"converged  : {result['success']}  ({result['message']})")
+    L.append(f"red. chi^2 (unwtd) : {result['red_chi2_unweighted']:.6g}")
     if result["weighted"]:
-        L.append(f"red. chi^2 : {result['red_chi2']:.6g}")
+        L.append(f"red. chi^2 (wtd)   : {result['red_chi2']:.6g}")
     L.append("")
     L.append("Parameter linking")
     L.append("-" * 64)
@@ -733,6 +822,22 @@ def export_global_fit(result: dict, out_source: str | Path,
                      f"{bg['factor']:>10.4f}")
         L.append("  (corrected <N> = <N> × factor;  factor = (1−f1)(1−f2) "
                  "for cross, (1−fX)² for auto)")
+        L.append("")
+
+    # ── Correlation matrix block ───────────────────────────────────────────────
+    corr_labels = result.get("corr_labels", [])
+    corr_matrix = result.get("corr_matrix")
+    if corr_labels and corr_matrix is not None:
+        L.append("Parameter correlation matrix  (free parameters, free_spec order)")
+        L.append("-" * 64)
+        col_w = max(12, max((len(lb) for lb in corr_labels), default=8) + 2)
+        L.append(" " * col_w + "".join(f"{lb:>{col_w}}" for lb in corr_labels))
+        for i, ri in enumerate(corr_labels):
+            row_vals = []
+            for j in range(len(corr_labels)):
+                v = corr_matrix[i, j]
+                row_vals.append(f"{v:>{col_w}.4f}" if np.isfinite(v) else f"{'nan':>{col_w}}")
+            L.append(f"{ri:<{col_w}}" + "".join(row_vals))
         L.append("")
 
     report_path.write_text("\n".join(L), encoding="utf-8")
@@ -787,6 +892,7 @@ def export_global_fit(result: dict, out_source: str | Path,
         fh.write(f"# weighted : {'yes' if result['weighted'] else 'no'}\n")
         fh.write(f"# linked : {', '.join(linked_names) if linked_names else '(none)'}\n")
         fh.write(f"# fixed : {', '.join(fixed_names) if fixed_names else '(none)'}\n")
+        fh.write(f"# global_red_chi2_unweighted : {result['red_chi2_unweighted']:.6g}\n")
         if result["weighted"]:
             fh.write(f"# global_red_chi2 : {result['red_chi2']:.6g}\n")
         fh.write(f"# units : tau_D in seconds\n")
@@ -825,6 +931,20 @@ def export_global_fit(result: dict, out_source: str | Path,
             row.append(f"{ds['r2']:.10g}")
             row.append(str(ds["n_points"]))
             fh.write(_join_csv(row) + "\n")
+
+        # ── Correlation matrix appended below the parameter rows ───────────────
+        corr_labels = result.get("corr_labels", [])
+        corr_matrix = result.get("corr_matrix")
+        if corr_labels and corr_matrix is not None:
+            fh.write("\n")
+            fh.write("# --- parameter correlation matrix (free params) ---\n")
+            fh.write(_join_csv(["corr_param"] + corr_labels) + "\n")
+            for i, label in enumerate(corr_labels):
+                row = [label] + [
+                    f"{corr_matrix[i, j]:.10g}" if np.isfinite(corr_matrix[i, j]) else "nan"
+                    for j in range(len(corr_labels))
+                ]
+                fh.write(_join_csv(row) + "\n")
 
     print(f"[globalfit] wrote {params_path}")
     return report_path, curve_path, params_path
@@ -1280,8 +1400,11 @@ def _global_setup_dialog(parent, model, datasets, out_source):
             f"{n} = {result['datasets'][0]['values'][n]:.4g} (linked)"
             for n in result["names"] if result["linked"].get(n)
         ]
-        gof = (f"red. χ² = {result['red_chi2']:.3g}"
-               if result["weighted"] else f"{result['n_datasets']} datasets")
+        gof = (f"red. χ² = {result['red_chi2']:.3g} (wtd)\n"
+               f"red. χ² = {result['red_chi2_unweighted']:.3g} (unwtd)"
+               if result["weighted"]
+               else f"{result['n_datasets']} datasets\n"
+               f"red. χ² = {result['red_chi2_unweighted']:.3g} (unwtd)")
         messagebox.showinfo(
             "Global fit complete",
             f"{model.name}\n\n"
@@ -1507,8 +1630,11 @@ def _fit_setup_dialog(parent, model, csv_path, tau_s, G, sigma):
             + ("" if result['fixed'].get(n) else f" ± {result['errors'][n]:.2g}")
             for n in result["names"]
         )
-        gof = (f"red. χ² = {result['red_chi2']:.3g}"
-               if result["weighted"] else f"R² = {result['r2']:.4f}")
+        gof = (f"red. χ² = {result['red_chi2']:.3g} (wtd)\n"
+               f"red. χ² = {result['red_chi2_unweighted']:.3g} (unwtd)"
+               if result["weighted"]
+               else f"R² = {result['r2']:.4f}\n"
+               f"red. χ² = {result['red_chi2_unweighted']:.3g} (unwtd)")
         messagebox.showinfo(
             "Fit complete",
             f"{model.name}\n\n{summary}\n\n{gof}\n\n"

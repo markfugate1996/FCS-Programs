@@ -79,6 +79,166 @@ _MIN_SEGMENTS = 5
 
 _POINTS_PER_DECADE = 20
 
+# ── Time estimation ───────────────────────────────────────────────────────────
+
+def estimate_corr_time(
+    N: int,
+    n_bins: int,
+    method: Method,
+    n_segs: int = 1,
+    tau_max_s: float = 1.0,
+    total_s: float = 1.0,
+) -> str:
+    """
+    Return a rough human-readable estimate of the correlation computation time.
+
+    Parameters
+    ----------
+    N        : number of photons (max of ch1, ch2)
+    n_bins   : number of lag bins
+    method   : backend to be used
+    n_segs   : number of segments (1 for unsegmented)
+    tau_max_s: maximum lag in seconds
+    total_s  : total dataset duration in seconds
+
+    Returns
+    -------
+    str — e.g. "~3 s" or "~2 min" or "< 1 s"
+    """
+    import math
+
+    # N per segment (photons split roughly evenly across time)
+    N_per_seg = N / n_segs if n_segs > 1 else N
+
+    if method == "perbin":
+        # O(n_bins × N_seg × log N_seg): searchsorted is very fast in numpy;
+        # empirical constant ~5 ns per (bin × photon) on typical hardware.
+        _PERBIN_NS = 5e-9   # seconds per bin-photon operation
+        ops = n_bins * N_per_seg * math.log2(max(N_per_seg, 2))
+        t_seg = _PERBIN_NS * ops
+    elif method == "twopointer":
+        if _NUMBA and N_per_seg >= _NUMBA_THRESHOLD:
+            # Numba JIT: ~10 ns per photon-pair scan step
+            _TP_NUMBA_NS = 10e-9
+        else:
+            # Pure Python: ~300 ns per photon-pair step
+            _TP_NUMBA_NS = 300e-9
+        # Average B photons in window per A photon ≈ N_B × (tau_max / T)
+        lag_frac = min(tau_max_s / max(total_s / n_segs, tau_max_s), 1.0)
+        pairs_per_photon = N_per_seg * lag_frac
+        t_seg = _TP_NUMBA_NS * N_per_seg * pairs_per_photon
+    else:
+        return "unknown"
+
+    total_t = t_seg * n_segs
+
+    if total_t < 1.0:
+        return "< 1 s"
+    elif total_t < 60:
+        return f"~{int(round(total_t))} s"
+    elif total_t < 3600:
+        mins = total_t / 60
+        return f"~{mins:.1f} min"
+    else:
+        hrs = total_t / 3600
+        return f"~{hrs:.1f} h"
+
+
+# ── Progress window ───────────────────────────────────────────────────────────
+
+class _ProgressWindow:
+    """
+    Lightweight tkinter progress window for long correlation computations.
+
+    Usage
+    -----
+    pw = _ProgressWindow(parent, total_steps, title="Computing…")
+    pw.step(completed, label="Segment 3 / 10")   # update bar + ETA
+    pw.close()
+
+    The window is non-blocking: call pw.update() or pw.step() regularly so
+    the event loop gets processed and the Cancel button stays responsive.
+
+    pw.cancelled() returns True if the user clicked Cancel.
+    """
+
+    def __init__(self, parent, total_steps: int, title: str = "Computing…"):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self._cancelled = False
+        self._total     = max(1, total_steps)
+        self._t_start   = None   # set on first step() call
+
+        # Use Toplevel if a root already exists; otherwise create a root.
+        # In the normal dialog flow, the main app root is always alive here.
+        root = tk._get_default_root("create Toplevel")  # type: ignore[attr-defined]
+        self._win = tk.Toplevel(root) if root is not None else tk.Tk()
+        self._win.title(title)
+        self._win.geometry("360x130")
+        self._win.resizable(False, False)
+        self._win.grab_set()
+        self._win.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        # Status label (e.g. "Segment 3 / 10")
+        self._status_var = tk.StringVar(value="Starting…")
+        tk.Label(self._win, textvariable=self._status_var,
+                 font=("Helvetica", 10), anchor="w",
+                 padx=16).pack(fill="x", pady=(14, 2))
+
+        # Progress bar
+        self._bar = ttk.Progressbar(
+            self._win, orient="horizontal", length=320,
+            mode="determinate", maximum=self._total,
+        )
+        self._bar.pack(padx=16, pady=4)
+
+        # ETA label
+        self._eta_var = tk.StringVar(value="")
+        tk.Label(self._win, textvariable=self._eta_var,
+                 font=("Helvetica", 9), fg="grey", anchor="w",
+                 padx=16).pack(fill="x")
+
+        # Cancel button
+        tk.Button(self._win, text="Cancel", width=10,
+                  command=self._on_cancel).pack(pady=8)
+
+        self._win.update()
+
+    def _on_cancel(self):
+        self._cancelled = True
+
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def step(self, completed: int, label: str = ""):
+        import time
+        if self._t_start is None:
+            self._t_start = time.monotonic()
+
+        self._bar["value"] = completed
+        if label:
+            self._status_var.set(label)
+
+        # ETA: elapsed / fraction_done × remaining_fraction
+        if completed > 0:
+            elapsed  = time.monotonic() - self._t_start
+            fraction = completed / self._total
+            if fraction > 0:
+                eta_s = elapsed / fraction * (1 - fraction)
+                if eta_s < 60:
+                    self._eta_var.set(f"ETA: {int(eta_s)} s")
+                else:
+                    self._eta_var.set(f"ETA: {eta_s/60:.1f} min")
+
+        self._win.update()
+
+    def close(self):
+        try:
+            self._win.destroy()
+        except Exception:
+            pass
+
 
 def build_tau_edges(tau_min_s: float, tau_max_s: float) -> np.ndarray:
     """
@@ -153,6 +313,8 @@ def _correlate_perbin(
     timesA: np.ndarray,
     timesB: np.ndarray,
     tau_edges: np.ndarray,
+    progress_cb=None,
+    progress_offset: int = 0,
 ) -> np.ndarray:
     """
     Per-bin vectorised cross-correlator.
@@ -162,6 +324,15 @@ def _correlate_perbin(
     [tA + tau_edges[k], tA + tau_edges[k+1]).  No Python loop over photons.
 
     Complexity: O(n_bins × N log N).
+
+    Parameters
+    ----------
+    progress_cb : callable(completed: int, label: str) | None
+        Called after each bin. completed is the absolute step count
+        (progress_offset + bins done so far).
+    progress_offset : int
+        Added to the completed count; used when this call is one segment
+        in a multi-segment computation.
     """
     nBins  = len(tau_edges) - 1
     counts = np.zeros(nBins, dtype=np.float64)
@@ -169,6 +340,8 @@ def _correlate_perbin(
         lo = np.searchsorted(timesB, timesA + tau_edges[k],     side='left')
         hi = np.searchsorted(timesB, timesA + tau_edges[k + 1], side='left')
         counts[k] = float(np.sum(hi - lo))
+        if progress_cb is not None:
+            progress_cb(progress_offset + k + 1, f"Bin {k + 1} / {nBins}")
     return counts
 
 
@@ -253,20 +426,98 @@ def _correlate_twopointer_numba(
     return counts
 
 
+def _correlate_twopointer_chunked(
+    timesA: np.ndarray,
+    timesB: np.ndarray,
+    tau_edges: np.ndarray,
+    progress_cb=None,
+    progress_offset: int = 0,
+    chunk_size: int = 10_000,
+) -> np.ndarray:
+    """
+    Two-pointer correlator with chunked progress reporting.
+
+    The numba/numpy twopointer backends process all photons in one call,
+    making mid-run callbacks impossible.  This wrapper slices timesA into
+    chunks of chunk_size photons and calls the backend on each chunk,
+    accumulating counts and reporting progress between chunks.
+
+    Note: because the two-pointer j_start state is NOT preserved across
+    chunks (timesB is always searched from the beginning for each chunk),
+    correctness is maintained — j_start is re-derived via searchsorted at
+    the start of each chunk.  This adds a small O(log N_B) overhead per
+    chunk, which is negligible compared to the inner-loop work.
+
+    Parameters
+    ----------
+    progress_cb : callable(completed: int, label: str) | None
+    progress_offset : int
+    chunk_size  : number of A-photons per chunk (default 10 000)
+    """
+    nBins   = len(tau_edges) - 1
+    counts  = np.zeros(nBins, dtype=np.float64)
+    NA      = len(timesA)
+    n_chunks = max(1, (NA + chunk_size - 1) // chunk_size)
+
+    use_numba = _NUMBA and NA >= _NUMBA_THRESHOLD
+
+    for ci in range(n_chunks):
+        lo_i = ci * chunk_size
+        hi_i = min(lo_i + chunk_size, NA)
+        chunkA = timesA[lo_i:hi_i]
+
+        # For each chunk: restrict timesB to a window that can contain
+        # any pair with chunkA.  This avoids redundant work on large datasets.
+        minTau = tau_edges[0]
+        maxTau = tau_edges[-1]
+        b_lo = np.searchsorted(timesB, chunkA[0]  + minTau, side='left')
+        b_hi = np.searchsorted(timesB, chunkA[-1] + maxTau, side='right')
+        chunkB = timesB[b_lo:b_hi]
+
+        if use_numba:
+            counts += _correlate_twopointer_numba(chunkA, chunkB, tau_edges)
+        else:
+            counts += _correlate_twopointer_numpy(chunkA, chunkB, tau_edges)
+
+        if progress_cb is not None:
+            done = ci + 1
+            progress_cb(
+                progress_offset + done,
+                f"Photon chunk {done} / {n_chunks}",
+            )
+
+    return counts
+
+
+# Number of twopointer chunks for progress reporting (approximate chunk size)
+_TP_CHUNK_SIZE = 10_000
+
+
 def _correlate(
     timesA: np.ndarray,
     timesB: np.ndarray,
     tau_edges: np.ndarray,
     method: Method,
+    progress_cb=None,
+    progress_offset: int = 0,
 ) -> np.ndarray:
-    """Dispatch to the requested backend, returning raw pair counts."""
+    """
+    Dispatch to the requested backend, returning raw pair counts.
+
+    Parameters
+    ----------
+    progress_cb : callable(completed: int, label: str) | None
+        Progress callback; passed through to the backend.
+    progress_offset : int
+        Step offset added to completed counts (for multi-segment calls).
+    """
     if method == "perbin":
-        return _correlate_perbin(timesA, timesB, tau_edges)
+        return _correlate_perbin(
+            timesA, timesB, tau_edges, progress_cb, progress_offset)
     if method == "twopointer":
-        N = max(len(timesA), len(timesB))
-        if _NUMBA and N >= _NUMBA_THRESHOLD:
-            return _correlate_twopointer_numba(timesA, timesB, tau_edges)
-        return _correlate_twopointer_numpy(timesA, timesB, tau_edges)
+        return _correlate_twopointer_chunked(
+            timesA, timesB, tau_edges, progress_cb, progress_offset,
+            chunk_size=_TP_CHUNK_SIZE)
     if method == "wiener_khinchin":
         raise NotImplementedError(
             "Wiener–Khinchin FFT correlator is not yet implemented."
@@ -309,6 +560,7 @@ def compute_segmented(
     tau_edges: np.ndarray,
     method: Method = "perbin",
     segment: bool = False,
+    progress_cb=None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Compute a cross-correlation, optionally with per-segment uncertainty.
@@ -336,6 +588,15 @@ def compute_segmented(
     segment : bool
         If False (default), correlate the full dataset as one block.
         If True, segment and return mean +/- std across segments.
+    progress_cb : callable(completed: int, label: str) | None
+        Optional progress callback.  Called after each unit of work with:
+          completed — number of steps done so far (out of total_steps)
+          label     — human-readable status string
+        The total number of steps is:
+          • segment=False, perbin:      n_bins
+          • segment=False, twopointer:  ceil(N / _TP_CHUNK_SIZE)
+          • segment=True,  perbin:      n_segs × n_bins
+          • segment=True,  twopointer:  n_segs × ceil(N_seg / _TP_CHUNK_SIZE)
 
     Returns
     -------
@@ -354,18 +615,27 @@ def compute_segmented(
         maskB   = (timesB_s >= t_start) & (timesB_s <= t_end)
         segA    = timesA_s[maskA] - t_start
         segB    = timesB_s[maskB] - t_start
-        counts  = _correlate(segA, segB, tau_edges, method)
+        counts  = _correlate(segA, segB, tau_edges, method, progress_cb, 0)
         G_mean  = _normalize(counts, segA, segB, tau_edges)
         G_std   = np.full_like(G_mean, np.nan)
         return tau, G_mean, G_std, 1
 
     # Segmented path
     tau_max        = tau_edges[-1]
+    n_bins         = len(tau_edges) - 1
     seg_duration_s = _MIN_SEGMENT_FACTOR * tau_max
     t_start = max(timesA_s[0], timesB_s[0])
     t_end   = min(timesA_s[-1], timesB_s[-1])
     total   = t_end - t_start
     n_segs  = max(1, int(total // seg_duration_s))
+
+    # Pre-compute step size per segment for the progress offset
+    if method == "perbin":
+        steps_per_seg = n_bins
+    else:
+        # Approximate photons per segment (used to size chunk count)
+        avg_N_seg = max(len(timesA_s), len(timesB_s)) // n_segs
+        steps_per_seg = max(1, (avg_N_seg + _TP_CHUNK_SIZE - 1) // _TP_CHUNK_SIZE)
 
     G_segments = []
     for k in range(n_segs):
@@ -377,7 +647,18 @@ def compute_segmented(
         segB  = timesB_s[maskB] - lo
         if len(segA) < 2 or len(segB) < 2:
             continue
-        counts = _correlate(segA, segB, tau_edges, method)
+
+        # Wrap progress_cb to inject the segment label prefix
+        seg_cb = None
+        if progress_cb is not None:
+            offset = k * steps_per_seg
+            def seg_cb(completed, label, _k=k, _n=n_segs, _off=offset):
+                progress_cb(
+                    _off + completed,
+                    f"Segment {_k + 1} / {_n}  —  {label}",
+                )
+
+        counts = _correlate(segA, segB, tau_edges, method, seg_cb, 0)
         G_segments.append(_normalize(counts, segA, segB, tau_edges))
 
     if not G_segments:
@@ -404,6 +685,7 @@ def compute_crosscorr(
     tau_edges: np.ndarray,
     method: Method = "perbin",
     segment: bool = False,
+    progress_cb=None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Directed cross-correlation G_AB(tau) with optional segmented uncertainty.
@@ -412,7 +694,8 @@ def compute_crosscorr(
     -------
     tau, G_mean, G_std, n_segments
     """
-    return compute_segmented(timesA_s, timesB_s, tau_edges, method, segment)
+    return compute_segmented(
+        timesA_s, timesB_s, tau_edges, method, segment, progress_cb)
 
 
 def compute_autocorr(
@@ -420,6 +703,7 @@ def compute_autocorr(
     tau_edges: np.ndarray,
     method: Method = "perbin",
     segment: bool = False,
+    progress_cb=None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Autocorrelation G(tau) with optional segmented uncertainty.
@@ -428,7 +712,8 @@ def compute_autocorr(
     -------
     tau, G_mean, G_std, n_segments
     """
-    return compute_segmented(times_s, times_s, tau_edges, method, segment)
+    return compute_segmented(
+        times_s, times_s, tau_edges, method, segment, progress_cb)
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
@@ -763,6 +1048,45 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
                    variable=method_var, value="wiener_khinchin",
                    anchor="w", state="disabled", fg="grey").pack(fill="x")
 
+    # Info label: estimated computation time
+    time_est_var = tk.StringVar(value="")
+    time_est_label = tk.Label(method_frame, textvariable=time_est_var,
+                              font=("Helvetica", 9), fg="grey", anchor="w")
+    time_est_label.pack(fill="x")
+
+    def _update_time_estimate(*_):
+        """Recompute and display the estimated computation time."""
+        try:
+            tau_max_s  = float(max_var.get()) * 1e-3
+            tau_min_s  = float(min_var.get()) * 1e-3
+            tau_edges_ = build_tau_edges(tau_min_s, tau_max_s)
+            n_bins     = len(tau_edges_) - 1
+            method     = method_var.get()
+            if method == "wiener_khinchin":
+                time_est_var.set("  (not yet implemented)")
+                return
+
+            N        = max(len(fcs_data.ch1_times_s), len(fcs_data.ch2_times_s))
+            total_s  = fcs_data.duration_s
+            seg_on   = segment_var.get()
+            if seg_on:
+                seg_dur = _MIN_SEGMENT_FACTOR * tau_max_s
+                n_segs  = max(1, int(total_s // seg_dur))
+            else:
+                n_segs = 1
+
+            est = estimate_corr_time(
+                N=N, n_bins=n_bins, method=method,
+                n_segs=n_segs, tau_max_s=tau_max_s, total_s=total_s,
+            )
+            time_est_var.set(f"  Estimated time: {est}")
+        except (ValueError, ZeroDivisionError):
+            time_est_var.set("")
+
+    for _var in (method_var, min_var, max_var, segment_var):
+        _var.trace_add("write", _update_time_estimate)
+    _update_time_estimate()
+
     # ── Buttons ───────────────────────────────────────────────────────────────
     btn_frame = tk.Frame(dialog)
     btn_frame.pack(pady=10)
@@ -829,6 +1153,7 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
 
         tau_min_s = tau_min_ms * 1e-3
         tau_edges = build_tau_edges(tau_min_s, tau_max_s)
+        n_bins    = len(tau_edges) - 1
 
         # ── Photon stream selection (with optional gating) ───────────────────
         # Assign macrotimes and microtimes; apply gate if requested.
@@ -856,22 +1181,65 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
         else:
             gate_min_ns = gate_max_ns = None
 
+        # ── Compute total progress steps ─────────────────────────────────────
+        N = max(len(times_ch1), len(times_ch2))
+        if segment:
+            seg_dur = _MIN_SEGMENT_FACTOR * tau_max_s
+            total_s = fcs_data.duration_s
+            n_segs  = max(1, int(total_s // seg_dur))
+        else:
+            n_segs = 1
+
+        if method == "perbin":
+            total_steps = n_segs * n_bins
+        else:
+            N_per_seg   = max(1, N // n_segs)
+            total_steps = n_segs * max(1, (N_per_seg + _TP_CHUNK_SIZE - 1)
+                                          // _TP_CHUNK_SIZE)
+
+        # ── Progress window ──────────────────────────────────────────────────
+        pw = _ProgressWindow(
+            None,   # None → tkinter uses the default root window
+            total_steps,
+            title="Computing correlation…",
+        )
+
+        cancelled = False
+
+        def _progress(completed: int, label: str):
+            nonlocal cancelled
+            if pw.cancelled():
+                cancelled = True
+                raise KeyboardInterrupt("User cancelled")
+            pw.step(completed, label)
+
         try:
             if corr_type == "cross":
                 tau, G_mean, G_std, n_segs = compute_crosscorr(
-                    times_ch1, times_ch2, tau_edges, method, segment)
+                    times_ch1, times_ch2, tau_edges, method, segment,
+                    progress_cb=_progress)
             elif corr_type == "auto_ch1":
                 tau, G_mean, G_std, n_segs = compute_autocorr(
-                    times_ch1, tau_edges, method, segment)
+                    times_ch1, tau_edges, method, segment,
+                    progress_cb=_progress)
             else:
                 tau, G_mean, G_std, n_segs = compute_autocorr(
-                    times_ch2, tau_edges, method, segment)
+                    times_ch2, tau_edges, method, segment,
+                    progress_cb=_progress)
+        except KeyboardInterrupt:
+            pw.close()
+            messagebox.showinfo("Cancelled", "Correlation computation cancelled.")
+            return
         except NotImplementedError as e:
+            pw.close()
             messagebox.showerror("Not implemented", str(e))
             return
         except Exception as e:
+            pw.close()
             messagebox.showerror("Computation error", str(e))
             return
+
+        pw.close()
 
         plot_correlation(
             tau, G_mean, G_std,
