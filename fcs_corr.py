@@ -240,14 +240,25 @@ class _ProgressWindow:
             pass
 
 
-def build_tau_edges(tau_min_s: float, tau_max_s: float) -> np.ndarray:
+def build_tau_edges(
+    tau_min_s: float,
+    tau_max_s: float,
+    points_per_decade: int = _POINTS_PER_DECADE,
+) -> np.ndarray:
     """
-    Build a log-spaced array of lag bin edges (~30 per decade).
+    Build a log-spaced array of lag bin edges.
 
     Parameters
     ----------
     tau_min_s, tau_max_s : float
         Minimum and maximum lag times in seconds.
+    points_per_decade : int
+        Number of lag bins per decade of lag time (default: _POINTS_PER_DECADE).
+        Reducing this linearly reduces n_bins and therefore linearly reduces
+        the compute time for the perbin backend.  Typical values:
+          20  — full resolution (default)
+          10  — half the bins; adequate for fitting standard models
+           5  — coarse; useful for a quick preview
 
     Returns
     -------
@@ -257,10 +268,36 @@ def build_tau_edges(tau_min_s: float, tau_max_s: float) -> np.ndarray:
         raise ValueError(
             f"Need 0 < tau_min < tau_max; got {tau_min_s:.3g}, {tau_max_s:.3g}"
         )
+    ppd = max(2, int(points_per_decade))
     log_min = np.log10(tau_min_s)
     log_max = np.log10(tau_max_s)
-    n = max(10, int(round((log_max - log_min) * _POINTS_PER_DECADE)) + 1)
+    n = max(10, int(round((log_max - log_min) * ppd)) + 1)
     return np.logspace(log_min, log_max, n)
+
+
+def thin_photons(times_s: np.ndarray, keep_every: int) -> np.ndarray:
+    """
+    Uniformly thin a photon arrival time array by retaining every k-th photon.
+
+    This reduces N — and therefore computation time — while preserving the
+    full temporal range of the dataset (so normalisation is unaffected).
+    The correlation amplitude G(τ) is unchanged; only the noise floor rises
+    (as 1/√N_kept).
+
+    Parameters
+    ----------
+    times_s    : sorted photon arrival time array (seconds)
+    keep_every : decimation factor k; keep photons at indices 0, k, 2k, …
+                 k=1 returns the original array unchanged.
+
+    Returns
+    -------
+    np.ndarray — thinned, sorted arrival time array.
+    """
+    k = max(1, int(keep_every))
+    if k == 1:
+        return times_s
+    return times_s[::k]
 
 
 # ── Segmentation ──────────────────────────────────────────────────────────────
@@ -916,12 +953,14 @@ def apply_time_gate(
 # ── Dialog ────────────────────────────────────────────────────────────────────
 
 _defaults: dict = {
-    "tau_min_ms": 0.01,
-    "tau_max_ms": 1000.0,
-    "corr_type":  "cross",
-    "method":     "perbin",
-    "segment":    False,
-    "gate":       False,
+    "tau_min_ms":       0.01,
+    "tau_max_ms":       1000.0,
+    "corr_type":        "cross",
+    "method":           "perbin",
+    "segment":          False,
+    "gate":             False,
+    "points_per_decade": _POINTS_PER_DECADE,
+    "thin_factor":      1,
 }
 
 
@@ -935,7 +974,7 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
 
     dialog = tk.Toplevel()
     dialog.title("Correlation — options")
-    dialog.geometry("340x520")
+    dialog.geometry("340x640")
     dialog.resizable(False, True)
     dialog.grab_set()
 
@@ -1026,6 +1065,66 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
         anchor="w",
     ).pack(fill="x")
 
+    # ── Speed controls ────────────────────────────────────────────────────────
+    speed_frame = tk.LabelFrame(dialog, text="Speed / resolution trade-off",
+                                padx=10, pady=6)
+    speed_frame.pack(fill="x", **pad)
+
+    # Bins per decade
+    ppd_row = tk.Frame(speed_frame)
+    ppd_row.pack(fill="x", pady=(0, 3))
+    tk.Label(ppd_row, text="Bins / decade:", anchor="w", width=16).pack(side="left")
+    ppd_var = tk.StringVar(value=str(_defaults["points_per_decade"]))
+    tk.Spinbox(ppd_row, from_=2, to=50, increment=1,
+               textvariable=ppd_var, width=5).pack(side="left", padx=4)
+    ppd_n_var = tk.StringVar(value="")
+    tk.Label(ppd_row, textvariable=ppd_n_var,
+             font=("Helvetica", 9), fg="grey").pack(side="left", padx=6)
+
+    def _update_ppd_info(*_):
+        try:
+            tau_max_s_ = float(max_var.get()) * 1e-3
+            tau_min_s_ = float(min_var.get()) * 1e-3
+            ppd        = max(2, int(ppd_var.get()))
+            edges_     = build_tau_edges(tau_min_s_, tau_max_s_, ppd)
+            ppd_n_var.set(f"→ {len(edges_) - 1} bins total")
+        except (ValueError, tk.TclError):
+            ppd_n_var.set("")
+
+    ppd_var.trace_add("write", _update_ppd_info)
+    min_var.trace_add("write", _update_ppd_info)
+    max_var.trace_add("write", _update_ppd_info)
+    _update_ppd_info()
+
+    # Photon thinning
+    thin_row = tk.Frame(speed_frame)
+    thin_row.pack(fill="x")
+    tk.Label(thin_row, text="Keep 1 in:", anchor="w", width=16).pack(side="left")
+    thin_var = tk.StringVar(value=str(_defaults["thin_factor"]))
+    tk.Spinbox(thin_row, from_=1, to=100, increment=1,
+               textvariable=thin_var, width=5).pack(side="left", padx=4)
+    thin_info_var = tk.StringVar(value="")
+    tk.Label(thin_row, textvariable=thin_info_var,
+             font=("Helvetica", 9), fg="grey").pack(side="left", padx=6)
+
+    def _update_thin_info(*_):
+        try:
+            k  = max(1, int(thin_var.get()))
+            N  = max(len(fcs_data.ch1_times_s), len(fcs_data.ch2_times_s))
+            Nk = (N + k - 1) // k
+            if k == 1:
+                thin_info_var.set(f"photons  ({N:,} total, no thinning)")
+            else:
+                thin_info_var.set(
+                    f"photons  ({Nk:,} kept of {N:,};  "
+                    f"SNR factor ×{1/k**0.5:.2f})"
+                )
+        except (ValueError, tk.TclError):
+            thin_info_var.set("")
+
+    thin_var.trace_add("write", _update_thin_info)
+    _update_thin_info()
+
     # ── Method ────────────────────────────────────────────────────────────────
     method_frame = tk.LabelFrame(dialog, text="Method", padx=10, pady=4)
     method_frame.pack(fill="x", **pad)
@@ -1059,14 +1158,17 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
         try:
             tau_max_s  = float(max_var.get()) * 1e-3
             tau_min_s  = float(min_var.get()) * 1e-3
-            tau_edges_ = build_tau_edges(tau_min_s, tau_max_s)
+            ppd        = max(2, int(ppd_var.get()))
+            tau_edges_ = build_tau_edges(tau_min_s, tau_max_s, ppd)
             n_bins     = len(tau_edges_) - 1
             method     = method_var.get()
             if method == "wiener_khinchin":
                 time_est_var.set("  (not yet implemented)")
                 return
 
-            N        = max(len(fcs_data.ch1_times_s), len(fcs_data.ch2_times_s))
+            N_raw    = max(len(fcs_data.ch1_times_s), len(fcs_data.ch2_times_s))
+            k        = max(1, int(thin_var.get()))
+            N        = (N_raw + k - 1) // k
             total_s  = fcs_data.duration_s
             seg_on   = segment_var.get()
             if seg_on:
@@ -1080,10 +1182,10 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
                 n_segs=n_segs, tau_max_s=tau_max_s, total_s=total_s,
             )
             time_est_var.set(f"  Estimated time: {est}")
-        except (ValueError, ZeroDivisionError):
+        except (ValueError, ZeroDivisionError, tk.TclError):
             time_est_var.set("")
 
-    for _var in (method_var, min_var, max_var, segment_var):
+    for _var in (method_var, min_var, max_var, segment_var, ppd_var, thin_var):
         _var.trace_add("write", _update_time_estimate)
     _update_time_estimate()
 
@@ -1106,6 +1208,15 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
                                  parent=dialog)
             return
 
+        try:
+            ppd         = max(2, int(ppd_var.get()))
+            thin_factor = max(1, int(thin_var.get()))
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Invalid input",
+                                 "Bins/decade and thinning factor must be integers.",
+                                 parent=dialog)
+            return
+
         corr_type = type_var.get()
         method    = method_var.get()
         segment   = segment_var.get()
@@ -1114,10 +1225,11 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
         # Slow-path warning for two-pointer without numba
         if method == "twopointer" and not _NUMBA:
             N = max(len(fcs_data.ch1_deltas), len(fcs_data.ch2_deltas))
-            if N > 5_000:
+            N_eff = (N + thin_factor - 1) // thin_factor
+            if N_eff > 5_000:
                 if not messagebox.askyesno(
                     "Slow computation",
-                    f"{N:,} photons with two-pointer (pure Python) may take "
+                    f"{N_eff:,} photons with two-pointer (pure Python) may take "
                     f"several minutes.\n\nProceed anyway?",
                     parent=dialog,
                 ):
@@ -1142,29 +1254,29 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
                     return
 
         # Persist
-        _defaults["tau_min_ms"] = tau_min_ms
-        _defaults["tau_max_ms"] = tau_max_ms
-        _defaults["corr_type"]  = corr_type
-        _defaults["method"]     = method
-        _defaults["segment"]    = segment
-        _defaults["gate"]       = use_gate
+        _defaults["tau_min_ms"]        = tau_min_ms
+        _defaults["tau_max_ms"]        = tau_max_ms
+        _defaults["corr_type"]         = corr_type
+        _defaults["method"]            = method
+        _defaults["segment"]           = segment
+        _defaults["gate"]              = use_gate
+        _defaults["points_per_decade"] = ppd
+        _defaults["thin_factor"]       = thin_factor
 
         dialog.destroy()
 
         tau_min_s = tau_min_ms * 1e-3
-        tau_edges = build_tau_edges(tau_min_s, tau_max_s)
+        tau_edges = build_tau_edges(tau_min_s, tau_max_s, ppd)
         n_bins    = len(tau_edges) - 1
 
         # ── Photon stream selection (with optional gating) ───────────────────
-        # Assign macrotimes and microtimes; apply gate if requested.
-        # ch1_times_s / ch2_times_s are computed properties — assign once.
         times_ch1 = fcs_data.ch1_times_s
         times_ch2 = fcs_data.ch2_times_s
 
         if use_gate:
             gate = fcs_lifetime.select_gate(fcs_data)
             if gate is None:
-                return   # user cancelled the gate window
+                return
             gate_min_ns, gate_max_ns = gate
             times_ch1 = apply_time_gate(
                 times_ch1, fcs_data.ch1_micro_ns, gate_min_ns, gate_max_ns)
@@ -1180,6 +1292,11 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
                 return
         else:
             gate_min_ns = gate_max_ns = None
+
+        # ── Photon thinning ──────────────────────────────────────────────────
+        if thin_factor > 1:
+            times_ch1 = thin_photons(times_ch1, thin_factor)
+            times_ch2 = thin_photons(times_ch2, thin_factor)
 
         # ── Compute total progress steps ─────────────────────────────────────
         N = max(len(times_ch1), len(times_ch2))
@@ -1199,7 +1316,7 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False):
 
         # ── Progress window ──────────────────────────────────────────────────
         pw = _ProgressWindow(
-            None,   # None → tkinter uses the default root window
+            None,
             total_steps,
             title="Computing correlation…",
         )
