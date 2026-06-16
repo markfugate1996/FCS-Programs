@@ -27,7 +27,6 @@ import fcs_corr
 import fcs_pch
 import fcs_fit
 import fcs_calib
-import fcs_brightness
 
 
 # ── Global workspace state ────────────────────────────────────────────────────
@@ -404,14 +403,6 @@ def task_calibrate():
     fcs_calib.run_calibration_dialog(parent=root, init_dir=init_dir)
 
 
-def task_brightness():
-    """Compare molecular brightness (CPSM) across selected workspace files."""
-    if not workspace:
-        _no_active_file_warning()
-        return
-    fcs_brightness.run_brightness_dialog(workspace, parent=root)
-
-
 # ── Tasks panel (right) ───────────────────────────────────────────────────────
 tasks = [
     ("Plot Intensity",              task_plot_intensity),
@@ -419,7 +410,6 @@ tasks = [
     ("Compute Correlation",         task_correlation),
     ("Photon Counting Histogram",   task_pch),
     ("Model Data",                  task_model),
-    ("Compare Brightness (CPSM)",   task_brightness),
     ("Calibrate Volume (⟨N⟩ vs C)", task_calibrate),
 ]
 

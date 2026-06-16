@@ -367,13 +367,289 @@ MODELS: Dict[str, FCSModel] = {
 }
 
 
+# ── Lifetime (TCSPC tail-fit) models ──────────────────────────────────────────
+#
+# These reuse the same FCSModel/Param machinery as the correlation models, but
+# the independent variable is the photon arrival time WITHIN the laser period
+# (microtime), measured in nanoseconds from the start of the fit window, and the
+# dependent variable is photon counts per bin.  They are tail fits: a sum of
+# exponentials plus a constant background, with NO instrument-response
+# reconvolution.  Fit only the decaying tail (from at/after the peak), and
+# exclude the first and last microtime bins, which are time-tagger catch-all
+# artifacts rather than fluorescence (see fcs_lifetime_fit for the data prep).
+# They live in a SEPARATE registry (LIFETIME_MODELS) so they never appear in the
+# correlation model chooser.
+
+def _decay_1exp(t_ns, A, tau, offset):
+    """
+    Single-exponential decay (tail fit).
+
+        I(t) = A · exp(−t/τ) + offset
+
+    t is the arrival time in ns measured from the start of the fit window, so
+    A is the (background-subtracted) count level at the window start and τ is
+    the fluorescence lifetime.
+    """
+    t_ns = np.asarray(t_ns, dtype=np.float64)
+    return A * np.exp(-t_ns / tau) + offset
+
+
+def _decay_2exp(t_ns, A1, tau1, A2, tau2, offset):
+    """
+    Two-exponential decay (tail fit).
+
+        I(t) = A1·exp(−t/τ1) + A2·exp(−t/τ2) + offset
+
+    By convention component 1 is the faster (shorter τ).  The amplitude-weighted
+    mean lifetime ⟨τ⟩ = (A1·τ1 + A2·τ2)/(A1 + A2) is reported as a derived
+    quantity by the fitter.
+    """
+    t_ns = np.asarray(t_ns, dtype=np.float64)
+    return A1 * np.exp(-t_ns / tau1) + A2 * np.exp(-t_ns / tau2) + offset
+
+
+_LIFETIME_1EXP = FCSModel(
+    key="lifetime_1exp",
+    name="Lifetime — single exponential (tail)",
+    description=(
+        "Single-exponential fluorescence decay, fitted to the tail of the "
+        "TCSPC histogram (no IRF reconvolution).\n\n"
+        "    I(t) = A · exp(−t/τ) + offset\n\n"
+        "    A       count level at the start of the fit window\n"
+        "    τ       fluorescence lifetime (ns)\n"
+        "    offset  constant background (dark counts, scatter)\n\n"
+        "t is measured in nanoseconds from the start of the fit window.  Choose "
+        "the window to start at or just after the decay peak and to stop before "
+        "the final bin; the fitter additionally drops the first and last "
+        "microtime bins, which are time-tagger edge artifacts.  Counts are "
+        "Poisson-distributed, so the fit is weighted by σ = √counts and the "
+        "reduced χ² is meaningful (≈ 1 for a good fit).\n\n"
+        "A tail fit is accurate when τ is large compared with the instrument "
+        "response width; for τ comparable to the IRF, use a reconvolution fit "
+        "instead (not implemented here)."
+    ),
+    formula="A·exp(−t/τ) + offset",
+    params=[
+        Param("A",      1000.0, 0.0,  np.inf, "counts", "amplitude at fit-window start"),
+        Param("tau",    3.0,    1e-3, 1e3,    "ns",     "fluorescence lifetime"),
+        Param("offset", 0.0,    0.0,  np.inf, "counts", "constant background"),
+    ],
+    func=_decay_1exp,
+)
+
+_LIFETIME_2EXP = FCSModel(
+    key="lifetime_2exp",
+    name="Lifetime — two exponentials (tail)",
+    description=(
+        "Two-component (bi-exponential) fluorescence decay, fitted to the tail "
+        "of the TCSPC histogram (no IRF reconvolution).\n\n"
+        "    I(t) = A1·exp(−t/τ1) + A2·exp(−t/τ2) + offset\n\n"
+        "    A1, τ1  amplitude and lifetime of component 1 (faster)\n"
+        "    A2, τ2  amplitude and lifetime of component 2 (slower)\n"
+        "    offset  constant background\n\n"
+        "The amplitude-weighted mean lifetime ⟨τ⟩ = (A1·τ1 + A2·τ2)/(A1 + A2) "
+        "is reported alongside the parameters.  Two lifetimes are only "
+        "resolvable when they differ by roughly a factor of two or more and the "
+        "decay has enough counts; if the data are truly single-exponential the "
+        "fit will tend to drive τ1 → τ2 and the reduced χ² will not improve over "
+        "the single-exponential model.  As with the single-exponential model, "
+        "fit the tail only and let the fitter drop the edge bins; the weighting "
+        "is Poisson (σ = √counts)."
+    ),
+    formula="A1·exp(−t/τ1) + A2·exp(−t/τ2) + offset",
+    params=[
+        Param("A1",     700.0, 0.0,  np.inf, "counts", "amplitude of component 1 (fast)"),
+        Param("tau1",   1.5,   1e-3, 1e3,    "ns",     "lifetime of component 1 (fast)"),
+        Param("A2",     300.0, 0.0,  np.inf, "counts", "amplitude of component 2 (slow)"),
+        Param("tau2",   5.0,   1e-3, 1e3,    "ns",     "lifetime of component 2 (slow)"),
+        Param("offset", 0.0,   0.0,  np.inf, "counts", "constant background"),
+    ],
+    func=_decay_2exp,
+)
+
+LIFETIME_MODELS: Dict[str, FCSModel] = {
+    _LIFETIME_1EXP.key: _LIFETIME_1EXP,
+    _LIFETIME_2EXP.key: _LIFETIME_2EXP,
+}
+
+
+# ── PCH (photon counting histogram) models ────────────────────────────────────
+#
+# The single-species photon counting histogram for a 3D Gaussian PSF (Chen,
+# Müller, So & Gratton, Biophys J 1999, 77:553).  Two parameters per species:
+#
+#     N        mean number of molecules in the observation volume
+#     epsilon  molecular brightness = detected counts per molecule per bin
+#
+# Moment relations (used for the initial guess): <k> = N·epsilon and the Mandel
+# parameter Q = Var(k)/<k> − 1 = gamma2·epsilon, with gamma2 = 2^(−3/2) for the
+# 3D Gaussian.  Multiple species combine by convolution (their generating-
+# function exponents add), so the two-species PCH is built from the same
+# single-species kernel.  This is the ideal single-bin-time PCH: it does NOT
+# include detector dead-time or the diffusion blur that matters when the bin
+# time is not small compared with the diffusion time.
+#
+# Unlike the correlation and lifetime model functions, evaluating a PCH requires
+# a numerical spatial integral plus an FFT, so the kernel is implemented here
+# rather than as a one-line closed form.  ``func(k, **params)`` returns the
+# probability Pi(k) at the requested integer counts; the fitter scales by the
+# number of sampled bins to compare with the measured histogram.
+
+from scipy.stats import poisson as _poisson           # noqa: E402
+from numpy.fft import fft as _fft, ifft as _ifft       # noqa: E402
+
+_PCH_GAMMA2 = 2.0 ** -1.5    # 2nd-order gamma factor for a 3D Gaussian PSF
+
+
+def _pch_single_molecule_bk(epsilon: float, K: int, n_s: int = 2500) -> np.ndarray:
+    """
+    Reduced single-molecule PCH coefficients b_k for k = 1..K (3D Gaussian PSF).
+
+        b_k = (2/√π) ∫_0^∞ Poisson(k; ε·e^{-s}) · √s ds
+
+    These satisfy Σ_k k·b_k = ε and Σ_k k(k−1)·b_k = ε²·gamma2, so that an
+    occupation N gives <k> = N·ε and Q = gamma2·ε.
+    """
+    eps = max(float(epsilon), 1e-12)
+    s_max = max(25.0, np.log(eps) + 30.0)
+    s = np.linspace(0.0, s_max, n_s)
+    mu = eps * np.exp(-s)
+    sq = np.sqrt(s)
+    ks = np.arange(1, K + 1)[:, None]
+    pmf = _poisson.pmf(ks, mu[None, :])               # (K, n_s)
+    integ = np.trapezoid(pmf * sq[None, :], s, axis=1)
+    return (2.0 / np.sqrt(np.pi)) * integ
+
+
+def _pch_pmf(K: int, species) -> np.ndarray:
+    """
+    PCH probability vector Pi(0..K) for a list of (N, epsilon) species.
+
+    The compound-Poisson generating function G(ξ) = exp(Σ_k a_k (ξ^k − 1)) with
+    a_k = Σ_species N·b_k(ε) is inverted by FFT.  Multiple species simply add
+    their a_k (equivalent to convolving their PCHs).
+    """
+    a = np.zeros(K + 1)
+    for (N, eps) in species:
+        a[1:] += float(N) * _pch_single_molecule_bk(eps, K)
+    L = 1
+    while L < 4 * (K + 1):
+        L *= 2
+    a_pad = np.zeros(L)
+    a_pad[:K + 1] = a
+    Pi = np.real(_ifft(np.exp(_fft(a_pad)))) * np.exp(-a.sum())
+    return np.clip(Pi[:K + 1], 0.0, None)
+
+
+def _pch_eval(k, species) -> np.ndarray:
+    """Evaluate the PCH probability at the integer counts ``k`` (array)."""
+    k = np.asarray(k)
+    kmax = int(np.max(k)) if k.size else 0
+    Pi = _pch_pmf(kmax + 16, species)        # build with headroom to avoid FFT aliasing
+    idx = np.clip(k.astype(int), 0, len(Pi) - 1)
+    return Pi[idx]
+
+
+def _pch_1species(k, N, epsilon):
+    """Single-species 3D-Gaussian PCH probability Pi(k)."""
+    return _pch_eval(k, [(N, epsilon)])
+
+
+def _pch_2species(k, N1, epsilon1, N2, epsilon2):
+    """Two-species 3D-Gaussian PCH probability Pi(k) = conv(species1, species2)."""
+    return _pch_eval(k, [(N1, epsilon1), (N2, epsilon2)])
+
+
+_PCH_1SPECIES = FCSModel(
+    key="pch_1species",
+    name="PCH — single species (3D Gaussian)",
+    description=(
+        "Photon counting histogram for one diffusing species in a 3D Gaussian "
+        "observation volume (Chen et al. 1999).\n\n"
+        "    Π(k) = single-species 3DG PCH(N, ε)\n\n"
+        "    N        mean number of molecules in the observation volume\n"
+        "    ε        molecular brightness = counts per molecule per bin\n\n"
+        "Moments: ⟨k⟩ = N·ε and the Mandel parameter Q = Var(k)/⟨k⟩ − 1 = "
+        "γ₂·ε, with γ₂ = 2^(−3/2) ≈ 0.354 for the 3D Gaussian.  N and ε are "
+        "separated by the super-Poissonian shape: ε controls the excess width "
+        "(Q), N then sets the mean.  When the data are essentially Poisson "
+        "(Q ≈ 0, e.g. very dim molecules), ε and N become poorly separable.\n\n"
+        "This is the ideal single-bin-time PCH (no detector dead-time and no "
+        "diffusion-during-the-bin correction); choose a bin time small compared "
+        "with the diffusion time.  The fit is weighted by the Poisson error of "
+        "each histogram bin (σ = √counts)."
+    ),
+    formula="Π(k) = 3DG-PCH(N, ε)",
+    params=[
+        Param("N",       1.0, 1e-6, np.inf, "",            "mean molecules in observation volume"),
+        Param("epsilon", 1.0, 1e-4, np.inf, "cnts/mol/bin", "molecular brightness"),
+    ],
+    func=_pch_1species,
+)
+
+_PCH_2SPECIES = FCSModel(
+    key="pch_2species",
+    name="PCH — two species (3D Gaussian)",
+    description=(
+        "Photon counting histogram for two independent species in a 3D Gaussian "
+        "observation volume.  The two-species PCH is the convolution of the two "
+        "single-species histograms (their generating-function exponents add):\n\n"
+        "    Π(k) = conv( 3DG-PCH(N1, ε1), 3DG-PCH(N2, ε2) )\n\n"
+        "    N1, ε1   occupation and brightness of species 1\n"
+        "    N2, ε2   occupation and brightness of species 2\n\n"
+        "The total mean is ⟨k⟩ = N1·ε1 + N2·ε2.  Two species are only "
+        "resolvable when their brightnesses ε differ appreciably (a brightness "
+        "ratio of roughly two or more) and the histogram has enough counts in "
+        "its tail; PCH separates species by brightness, not by diffusion time. "
+        "If the data are really single-species the fit tends to drive the two "
+        "brightnesses together and the reduced χ² will not improve over the "
+        "single-species model.  Reported derived quantities include the number "
+        "fraction f1 = N1/(N1 + N2).  Same ideal single-bin-time assumptions and "
+        "Poisson weighting as the single-species model."
+    ),
+    formula="Π(k) = conv(PCH(N1,ε1), PCH(N2,ε2))",
+    params=[
+        Param("N1",       1.0, 1e-6, np.inf, "",            "occupation of species 1"),
+        Param("epsilon1", 1.5, 1e-4, np.inf, "cnts/mol/bin", "brightness of species 1 (brighter)"),
+        Param("N2",       1.0, 1e-6, np.inf, "",            "occupation of species 2"),
+        Param("epsilon2", 0.5, 1e-4, np.inf, "cnts/mol/bin", "brightness of species 2 (dimmer)"),
+    ],
+    func=_pch_2species,
+)
+
+PCH_MODELS: Dict[str, FCSModel] = {
+    _PCH_1SPECIES.key: _PCH_1SPECIES,
+    _PCH_2SPECIES.key: _PCH_2SPECIES,
+}
+
+
 # ── Accessors ─────────────────────────────────────────────────────────────────
 
 def list_models() -> List[FCSModel]:
-    """All registered models, in registry order."""
+    """All registered correlation models, in registry order."""
     return list(MODELS.values())
 
 
 def get_model(key: str) -> FCSModel:
-    """Look up a model by key."""
+    """Look up a correlation model by key."""
     return MODELS[key]
+
+
+def list_lifetime_models() -> List[FCSModel]:
+    """All registered lifetime (TCSPC tail-fit) models, in registry order."""
+    return list(LIFETIME_MODELS.values())
+
+
+def get_lifetime_model(key: str) -> FCSModel:
+    """Look up a lifetime model by key."""
+    return LIFETIME_MODELS[key]
+
+
+def list_pch_models() -> List[FCSModel]:
+    """All registered PCH models, in registry order."""
+    return list(PCH_MODELS.values())
+
+
+def get_pch_model(key: str) -> FCSModel:
+    """Look up a PCH model by key."""
+    return PCH_MODELS[key]
