@@ -24,28 +24,31 @@ are stored as absolute bin indices.  The four blocks are:
     [Ch0 macrotime differences]  [Ch1 macrotime differences]
     [Ch0 microtimes]             [Ch1 microtimes]
 
-Each block is preceded by a 2-word preamble (a large sentinel marker +
-one zero padding word).  Blocks are located automatically by finding
-uint32 values that exceed a threshold far above any real inter-photon gap.
+Each block is preceded by a 2-word preamble: a length marker giving the
+block size in bytes (= 4 x photon count) followed by one zero pad word.
+The length marker locates each block deterministically, independent of
+count rate.  (Earlier versions scanned for large "sentinel" values, which
+fails at low count rates because ordinary inter-photon macrotime
+differences can exceed any fixed threshold.)
 
 Binary layout
 -------------
 Offset              Content
 ------------------  ----------------------------------------------------------
 0x000–0x3FF         Binary header (1024 bytes)
-0x400               uint32: file marker (sentinel)
+0x400               uint32: 4*n0  (byte length of Ch0 macro block)
 0x404               uint32: 0 (padding)
 0x408               uint32[n0]: Ch0 macrotime differences (laser clock cycles)
-...                 uint32: block marker
+...                 uint32: 4*n1  (byte length of Ch1 macro block)
 ...                 uint32: 0 (padding)
 ...                 uint32[n1]: Ch1 macrotime differences
-...                 uint32: block marker
+...                 uint32: 4*n0  (byte length of Ch0 micro block)
 ...                 uint32: 0 (padding)
 ...                 uint32[n0]: Ch0 microtimes (0–4095)
-...                 uint32: block marker
+...                 uint32: 4*n1  (byte length of Ch1 micro block)
 ...                 uint32: 0 (padding)
 ...                 uint32[n1]: Ch1 microtimes (0–4095)
-...                 UTF-8 metadata block
+...                 footer + UTF-8 metadata block
 
 Key header fields
 -----------------
@@ -111,7 +114,10 @@ _HDR_TRUE_CLOCK_OFF = 0x22       # float64: true measured laser clock frequency 
 # Channel index mapping: the binary file uses 0-based indexing (ch0, ch1).
 # All public-facing attributes use 1-based naming (ch1, ch2) to match
 # the instrument labelling.
-_MARKER_THRESHOLD  = 1_000_000  # uint32 values above this are block sentinels
+# NOTE: Blocks are NOT delimited by magnitude sentinels.  Each block carries
+# an explicit length prefix (4 * photon_count bytes); see _extract_four_blocks.
+# The old _MARKER_THRESHOLD heuristic is removed because real macrotime
+# differences exceed any fixed threshold at low count rates.
 _MICROTIME_BINS    = 4096       # fixed by instrument (MicroTime Resolution)
 
 
@@ -273,7 +279,7 @@ class FCSData:
                 "pandas is required for to_dataframe().  "
                 "Install with:  pip install pandas"
             )
-        t, I0, I1 = self.bin_intensity(bin_width_s)
+        t, I1, I2 = self.bin_intensity(bin_width_s)
         return pd.DataFrame({"time_s": t, "ch1": I1, "ch2": I2})
 
     # ── Display ──────────────────────────────────────────────────────────────
@@ -391,32 +397,84 @@ def read_fcs(path: str | Path, clock_hz: Optional[float] = None) -> FCSData:
 def _extract_four_blocks(words: np.ndarray) -> list[np.ndarray]:
     """
     Extract the four data blocks (Ch0 macro, Ch1 macro, Ch0 micro, Ch1 micro)
-    by scanning for sentinel markers between them.
+    using the explicit length prefix that precedes every block.
 
-    The macrotime blocks (blocks 0 and 1) determine the photon counts n0 and n1.
-    The microtime blocks (blocks 2 and 3) are trimmed to those same lengths,
-    since a small file footer after the last block can otherwise be included.
+    Block structure
+    ---------------
+    Each block is preceded by a 2-word preamble::
+
+        [ length_marker ][ 0 pad ][ block data ... ]
+
+    where ``length_marker`` is the block's size **in bytes** — i.e.
+    ``4 * (number of photons in the block)`` — and the pad word is 0.
+    Reading the marker gives the block length deterministically, so the
+    parser never has to guess boundaries from value magnitudes.  This is
+    essential: at low count rates ordinary inter-photon macrotime
+    differences routinely exceed any fixed magnitude threshold, so the
+    old "scan for words > threshold" approach mis-split the blocks and
+    desynchronised the two channels (a spurious Ch1/Ch2 offset that
+    corrupted cross-correlation).  The length prefix is count-rate
+    independent and recovers n0 and n1 exactly, including the normal case
+    where n0 != n1.
+
+    Layout (4 blocks + trailing footer)::
+
+        [4*n0][0]  Ch0 macrotime diffs  (n0 words)
+        [4*n1][0]  Ch1 macrotime diffs  (n1 words)
+        [4*n0][0]  Ch0 microtimes       (n0 words)
+        [4*n1][0]  Ch1 microtimes       (n1 words)
+        [footer / metadata tag ...]
+
+    Returns the four blocks as copies.  Raises ValueError if the markers
+    are internally inconsistent (e.g. the two macrotime counts do not
+    match the two microtime counts), which would indicate a corrupt file
+    or a layout this reader does not understand.
     """
-    marker_idx = np.where(words > _MARKER_THRESHOLD)[0]
-    blocks = []
-    pos = 2  # skip initial marker + padding
+    blocks: list[np.ndarray] = []
+    pos = 0
+    n = len(words)
 
-    for midx in marker_idx:
-        if midx < pos:
-            continue  # part of preamble, already skipped
-        block = words[pos:midx].copy()
-        blocks.append(block)
-        pos = midx + 2  # skip this marker + its padding word
-        if len(blocks) == 4:
-            break
+    for i in range(4):
+        if pos + 2 > n:
+            raise ValueError(
+                f"Truncated file: ran out of data locating block {i} "
+                f"(offset word {pos} of {n})."
+            )
+        marker = int(words[pos])
+        pad    = int(words[pos + 1])
+        if marker == 0 or marker % 4 != 0:
+            raise ValueError(
+                f"Block {i}: length marker {marker} at word {pos} is not a "
+                f"positive multiple of 4; file is not in the expected "
+                f"length-prefixed format."
+            )
+        if pad != 0:
+            # Non-fatal in principle, but a non-zero pad means our
+            # understanding of the preamble is off — fail loudly rather
+            # than silently misalign the channels.
+            raise ValueError(
+                f"Block {i}: expected 0 pad word after length marker, "
+                f"got {pad} at word {pos + 1}."
+            )
+        count = marker // 4
+        start = pos + 2
+        end   = start + count
+        if end > n:
+            raise ValueError(
+                f"Block {i}: declared length {count} words overruns the "
+                f"data region (need up to word {end}, have {n})."
+            )
+        blocks.append(words[start:end].copy())
+        pos = end
 
-    # Trim microtime blocks to match their macrotime block lengths.
-    # The macrotime counts are authoritative; any trailing footer bytes
-    # that fell below the marker threshold are stripped here.
-    if len(blocks) == 4:
-        n0, n1 = len(blocks[0]), len(blocks[1])
-        blocks[2] = blocks[2][:n0]
-        blocks[3] = blocks[3][:n1]
+    # Integrity check: macro/micro counts must agree per channel.
+    n0_macro, n1_macro, n0_micro, n1_micro = (len(b) for b in blocks)
+    if n0_macro != n0_micro or n1_macro != n1_micro:
+        raise ValueError(
+            f"Inconsistent block lengths: Ch0 macro/micro = "
+            f"{n0_macro}/{n0_micro}, Ch1 macro/micro = {n1_macro}/{n1_micro}. "
+            f"File may be corrupt."
+        )
 
     return blocks
 
