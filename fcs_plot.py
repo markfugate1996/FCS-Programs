@@ -91,6 +91,22 @@ def _format_bin_width(bin_width_s: float) -> str:
         return f"{bin_width_s:.3g} s"
 
 
+# ── User-selectable bin widths (offered in the intensity dialogs) ─────────────
+
+_BIN_WIDTH_OPTIONS = {
+    "1 ms":    1e-3,
+    "5 ms":    5e-3,
+    "10 ms":   10e-3,
+    "50 ms":   50e-3,
+    "100 ms":  100e-3,
+    "250 ms":  250e-3,
+    "500 ms":  500e-3,
+    "1 s":     1.0,
+}
+
+_DEFAULT_BIN_WIDTH_LABEL = "100 ms"
+
+
 # ── Main plotting function ────────────────────────────────────────────────────
 
 def plot_intensity(
@@ -242,6 +258,107 @@ def plot_intensity(
         #plt.show()
         fcs_plottools.show_figure(fig, ax)
 
+    return fig, ax
+
+
+# ── Overlay plotting (batch / combined) ───────────────────────────────────────
+
+def plot_intensity_overlay(
+    datasets,
+    bin_width_s: float = None,
+    show: bool = True,
+    export: bool = False,
+) -> tuple[plt.Figure, plt.Axes]:
+    """
+    Overlay intensity time traces from several files on one set of axes.
+
+    Each file is drawn in its own colour; Ch1 is solid and Ch2 dashed.  If
+    *bin_width_s* is None each file uses its own duration-based default,
+    otherwise the same width is forced for all files.  When *export* is True
+    each file's binned trace is written to its own CSV exactly as in the
+    single-file path.
+
+    Parameters
+    ----------
+    datasets : sequence of FCSData
+        Files to overlay (must be non-empty).
+    bin_width_s : float, optional
+        Common bin width in seconds, or None for per-file auto widths.
+
+    Returns
+    -------
+    fig, ax
+    """
+    datasets = list(datasets)
+    if not datasets:
+        raise ValueError("plot_intensity_overlay requires at least one dataset.")
+
+    colours = fcs_plottools.palette(len(datasets))
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+
+    y_percentiles: list[float] = []
+    t_max = 0.0
+    for d, colour in zip(datasets, colours):
+        bw = bin_width_s if bin_width_s else _choose_bin_width(d.duration_s)
+        time_s, I1_counts, I2_counts = d.bin_intensity(bin_width_s=bw)
+        I1_cps = I1_counts / bw
+        I2_cps = I2_counts / bw
+
+        # Legend row: "file   <Ch1 CPS>, <Ch2 CPS>".  Use the true mean count
+        # rates (total photons / duration) for consistency with the single-file
+        # plot's legend, rather than the mean of the binned trace.
+        cps_label = (f"{d.filepath.name}   "
+                     f"{d.count_rate_ch1_hz:,.0f}, {d.count_rate_ch2_hz:,.0f}")
+        ax.plot(time_s, I1_cps, color=colour, linewidth=0.8, alpha=0.9,
+                label=cps_label)                  # Ch1 — solid, carries file label
+        ax.plot(time_s, I2_cps, color=colour, linewidth=0.8, alpha=0.55,
+                linestyle="--")                    # Ch2 — dashed, no extra legend row
+
+        if len(time_s):
+            t_max = max(t_max, float(time_s[-1]))
+            combined = np.concatenate([I1_cps, I2_cps])
+            if len(combined):
+                y_percentiles.append(float(np.percentile(combined, 99)))
+
+        if export:
+            fcs_export.safe_export(
+                d, "intensity",
+                {
+                    "time_s":     time_s,
+                    "ch1_counts": I1_counts,
+                    "ch2_counts": I2_counts,
+                    "ch1_cps":    I1_cps,
+                    "ch2_cps":    I2_cps,
+                },
+                meta={
+                    "bin_width_s": f"{bw:.6g}",
+                    "duration_s":  f"{d.duration_s:.6g}",
+                    "ch1_photons": len(d.ch1_deltas),
+                    "ch2_photons": len(d.ch2_deltas),
+                },
+            )
+
+    ax.set_xlabel("Time (s)", fontsize=12)
+    ax.set_ylabel("Intensity (CPS)", fontsize=12)
+    bw_str = (f"bin width: {_format_bin_width(bin_width_s)}"
+              if bin_width_s else "bin width: auto (per file)")
+    ax.set_title(
+        f"Intensity overlay — {len(datasets)} files  ·  {bw_str}\n"
+        f"solid = Ch1   ·   dashed = Ch2",
+        fontsize=11,
+    )
+    if t_max > 0:
+        ax.set_xlim(0, t_max)
+    y_upper = max(max(y_percentiles) * 1.25, 1.0) if y_percentiles else 1.0
+    ax.set_ylim(0, y_upper)
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+    ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
+    ax.legend(fontsize=9, framealpha=0.8, loc="upper right",
+              title="File   ·   CPS: Ch1, Ch2")
+
+    fig.tight_layout()
+    if show:
+        fcs_plottools.show_figure(fig, ax)
     return fig, ax
 
 

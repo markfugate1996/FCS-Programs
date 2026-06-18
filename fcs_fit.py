@@ -106,6 +106,64 @@ def load_correlation_csv(
     return tau_s, G, G_std, columns, meta
 
 
+def _cps_from_meta(meta: Optional[dict]) -> Optional[dict]:
+    """
+    Derive measurement CPS (and acquisition time / photon counts) from a
+    correlation CSV's header meta.
+
+    The single "fit CPS" follows the correlation type: for an autocorrelation
+    it is that channel's rate; for a cross-correlation it is the average of the
+    two channels (not a fitted quantity, but a convenient brightness summary).
+
+    Returns a dict with floats (None where a field is absent), or None when the
+    header carries no CPS at all — e.g. a correlation file written before this
+    field existed — so callers can simply skip the section.
+    """
+    if not meta:
+        return None
+
+    def _num(key):
+        v = meta.get(key)
+        if v in (None, ""):
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    cps1 = _num("cps_ch1")
+    cps2 = _num("cps_ch2")
+    if cps1 is None and cps2 is None:
+        return None   # not a CPS-aware correlation export
+
+    ctype = (meta.get("type") or "cross").strip()
+    if ctype == "auto_ch1":
+        cps_fit, label = cps1, "Ch1"
+    elif ctype == "auto_ch2":
+        cps_fit, label = cps2, "Ch2"
+    else:   # cross (or unknown) → average of the available channels
+        present = [c for c in (cps1, cps2) if c is not None]
+        cps_fit = (sum(present) / len(present)) if present else None
+        label = "mean(Ch1, Ch2)"
+
+    return {
+        "cps_ch1":       cps1,
+        "cps_ch2":       cps2,
+        "cps_fit":       cps_fit,
+        "cps_label":     label,
+        "acq_time_s":    _num("acquisition_time_s"),
+        "n_photons_ch1": _num("n_photons_ch1"),
+        "n_photons_ch2": _num("n_photons_ch2"),
+    }
+
+
+def _fmt_cps(x: Optional[float]) -> str:
+    """Format a CPS / photon count for a report (thousands-separated)."""
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        return "n/a"
+    return f"{x:,.0f}"
+
+
 # ── Initial-guess heuristics ──────────────────────────────────────────────────
 
 def auto_guess(model: FCSModel, tau_s: np.ndarray, G: np.ndarray) -> Dict[str, float]:
@@ -388,6 +446,24 @@ def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
         L.append(f"  chi^2      : {result['chi2']:.6g}")
         L.append(f"  red. chi^2 : {result['red_chi2']:.6g}")
     L.append("")
+
+    # ── Measurement summary (from the correlation file header) ────────────────
+    cps = _cps_from_meta(result.get("source_meta"))
+    if cps is not None:
+        fit_note = ("mean of Ch1, Ch2" if cps["cps_label"].startswith("mean")
+                    else cps["cps_label"])
+        L.append("Measurement (from correlation header)")
+        L.append("-" * 60)
+        L.append(f"  {'CPS Ch1':<18}: {_fmt_cps(cps['cps_ch1'])}")
+        L.append(f"  {'CPS Ch2':<18}: {_fmt_cps(cps['cps_ch2'])}")
+        L.append(f"  {'CPS for fit':<18}: {_fmt_cps(cps['cps_fit'])}   ({fit_note})")
+        if cps["acq_time_s"] is not None:
+            L.append(f"  {'acquisition time':<18}: {cps['acq_time_s']:.6g} s")
+        if cps["n_photons_ch1"] is not None:
+            L.append(f"  {'photons Ch1':<18}: {_fmt_cps(cps['n_photons_ch1'])}")
+        if cps["n_photons_ch2"] is not None:
+            L.append(f"  {'photons Ch2':<18}: {_fmt_cps(cps['n_photons_ch2'])}")
+        L.append("")
     report_path.write_text("\n".join(L), encoding="utf-8")
 
     # ── Curve CSV ─────────────────────────────────────────────────────────────
@@ -406,6 +482,10 @@ def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
         fh.write(f"# FCS fit curve — {model.key}\n")
         fh.write(f"# source : {source_path.name}\n")
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
+        if cps is not None:
+            fh.write(f"# cps_ch1 : {_fmt_cps(cps['cps_ch1'])}\n")
+            fh.write(f"# cps_ch2 : {_fmt_cps(cps['cps_ch2'])}\n")
+            fh.write(f"# cps_fit ({cps['cps_label']}) : {_fmt_cps(cps['cps_fit'])}\n")
         fh.write(",".join(names) + "\n")
         for row in zip(*(cols[n] for n in names)):
             fh.write(",".join(f"{v:.10g}" for v in row) + "\n")
@@ -481,7 +561,8 @@ def fit_global(
         s = s[m] if s is not None else None
         if len(t) < 2:
             raise ValueError(f"Dataset '{ds['name']}' has too few finite points to fit.")
-        prepped.append({"name": ds["name"], "tau": t, "G": y, "sigma": s})
+        prepped.append({"name": ds["name"], "tau": t, "G": y, "sigma": s,
+                        "meta": ds.get("meta", {})})
 
     D = len(prepped)
     if D == 0:
@@ -563,6 +644,7 @@ def fit_global(
             "Gfit": mvals, "resid": resid, "sigma": pp["sigma"],
             "values": vals, "errors": errs, "r2": r2,
             "ss_res": ss_res, "n_points": len(pp["tau"]),
+            "meta": pp.get("meta", {}),
         })
 
     full_res = residuals(theta)
@@ -710,6 +792,11 @@ def export_global_fit(result: dict, out_source: str | Path,
     L.append("-" * 64)
     for ds in result["datasets"]:
         L.append(f"[{ds['name']}]   points: {ds['n_points']}   R² = {ds['r2']:.5f}")
+        cps = _cps_from_meta(ds.get("meta"))
+        if cps is not None:
+            L.append(f"    CPS      : Ch1 {_fmt_cps(cps['cps_ch1'])}   "
+                     f"Ch2 {_fmt_cps(cps['cps_ch2'])}   "
+                     f"{cps['cps_label']} {_fmt_cps(cps['cps_fit'])}")
         for n in result["names"]:
             if result["linked"].get(n):
                 continue  # already reported above
@@ -775,6 +862,10 @@ def export_global_fit(result: dict, out_source: str | Path,
     has_bg = bool(bg_factors) and has_N
     if has_bg:
         p_header += ["bg_factor", "N_corr", "N_corr_err"]
+    has_cps = any(_cps_from_meta(ds.get("meta")) is not None
+                  for ds in result["datasets"])
+    if has_cps:
+        p_header += ["cps_ch1", "cps_ch2", "cps_fit", "acq_time_s"]
     p_header += ["r2", "n_points"]
 
     def _join_csv(items):
@@ -799,6 +890,10 @@ def export_global_fit(result: dict, out_source: str | Path,
                 fh.write(f"# background_window_ns : {win[0]:.3f} - {win[1]:.3f}\n")
             fh.write("# note : N_corr = N * bg_factor "
                      "(background-corrected occupancy)\n")
+        if has_cps:
+            fh.write("# note : cps_* are mean count rates (Hz) from the "
+                     "correlation headers; cps_fit = that channel (auto) "
+                     "or the Ch1/Ch2 average (cross)\n")
         fh.write(_join_csv(p_header) + "\n")
         for ds in result["datasets"]:
             row = [ds["name"]]
@@ -822,6 +917,11 @@ def export_global_fit(result: dict, out_source: str | Path,
                 row.append(f"{factor:.10g}")
                 row.append(f"{N_corr:.10g}")
                 row.append(f"{N_corr_err:.10g}")
+            if has_cps:
+                cps = _cps_from_meta(ds.get("meta")) or {}
+                for key in ("cps_ch1", "cps_ch2", "cps_fit", "acq_time_s"):
+                    v = cps.get(key)
+                    row.append(f"{v:.10g}" if v is not None else "nan")
             row.append(f"{ds['r2']:.10g}")
             row.append(str(ds["n_points"]))
             fh.write(_join_csv(row) + "\n")
@@ -935,13 +1035,16 @@ def compute_background_factors(datasets: list,
 
 # ── GUI workflow ──────────────────────────────────────────────────────────────
 
-def run_model_dialog(fcs_data, parent=None):
+def run_model_dialog(fcs_data, parent=None, workspace_order=None):
     """
     Top-level entry: choose which data type to model, then dispatch.
 
-    Correlation runs the fit workflow in this module; Lifetime runs the tail-fit
-    workflow in fcs_lifetime_fit; PCH runs the photon-counting-histogram fit in
-    fcs_pch_fit.
+    Correlation runs the fit workflow implemented in this module.  Lifetime
+    and PCH are placeholders for now (disabled), to be filled in later.
+
+    ``workspace_order`` is an optional list of source .fcs file names in
+    workspace order; when given, discovered correlation datasets are listed
+    and reported in that order instead of alphabetically.
     """
     import tkinter as tk
 
@@ -961,24 +1064,15 @@ def run_model_dialog(fcs_data, parent=None):
 
     def _correlation():
         win.destroy()
-        run_global_fit_dialog(fcs_data, parent=parent)
-
-    def _lifetime():
-        win.destroy()
-        import fcs_lifetime_fit
-        fcs_lifetime_fit.run_lifetime_fit_dialog(fcs_data, parent=parent)
-
-    def _pch():
-        win.destroy()
-        import fcs_pch_fit
-        fcs_pch_fit.run_pch_fit_dialog(fcs_data, parent=parent)
+        run_global_fit_dialog(fcs_data, parent=parent,
+                              workspace_order=workspace_order)
 
     tk.Button(btns, text="Correlation", width=26, pady=6,
               command=_correlation).pack(pady=4)
-    tk.Button(btns, text="Lifetime", width=26, pady=6,
-              command=_lifetime).pack(pady=4)
-    tk.Button(btns, text="PCH", width=26, pady=6,
-              command=_pch).pack(pady=4)
+    tk.Button(btns, text="Lifetime  (coming soon)", width=26, pady=6,
+              state="disabled").pack(pady=4)
+    tk.Button(btns, text="PCH  (coming soon)", width=26, pady=6,
+              state="disabled").pack(pady=4)
 
     tk.Button(win, text="Cancel", width=10, command=win.destroy,
               pady=4).pack(pady=(0, 10))
@@ -986,13 +1080,14 @@ def run_model_dialog(fcs_data, parent=None):
     win.wait_window()
 
 
-def run_global_fit_dialog(fcs_data, parent=None):
+def run_global_fit_dialog(fcs_data, parent=None, workspace_order=None):
     """
     Entry point for correlation modelling: select datasets, choose a model,
     set linking / guesses / bounds, then fit, plot and export.
 
     Works for one dataset (a plain single-curve fit) or many (global fit with
-    linked parameters).
+    linked parameters).  ``workspace_order`` (source .fcs file names in
+    workspace order) orders the dataset list and the output rows to match.
     """
     start_dir = fcs_data.filepath.parent
     analysis  = start_dir / "analysis"
@@ -1003,7 +1098,8 @@ def run_global_fit_dialog(fcs_data, parent=None):
             _global_setup_dialog(parent, model, loaded, fcs_data.filepath)
         _select_model_dialog(parent, _after_model)
 
-    _select_datasets_dialog(parent, init_dir, _after_datasets)
+    _select_datasets_dialog(parent, init_dir, _after_datasets,
+                            order=workspace_order)
 
 
 def _discover_correlation_csvs(folder: Path) -> list:
@@ -1023,13 +1119,41 @@ def _discover_correlation_csvs(folder: Path) -> list:
     return found
 
 
-def _select_datasets_dialog(parent, init_dir, on_done):
+def _source_name_of_csv(path: Path) -> str:
+    """Return the originating .fcs file name recorded in a correlation CSV header."""
+    try:
+        _, _, _, _, meta = load_correlation_csv(path)
+        return (meta.get("source file") or meta.get("source") or "").strip()
+    except Exception:
+        return ""
+
+
+def _order_paths_by_workspace(paths: list, order_names: list) -> list:
+    """
+    Sort correlation CSV *paths* to match the workspace file order.
+
+    Each CSV is matched to its source .fcs (via the 'source file' header) and
+    ordered by that file's position in *order_names*.  Datasets whose source
+    is not in the workspace (e.g. files added by hand) are kept after the
+    workspace ones, ordered alphabetically.
+    """
+    order_index = {name: i for i, name in enumerate(order_names)}
+    src = {p: _source_name_of_csv(p) for p in paths}
+    return sorted(
+        paths,
+        key=lambda p: (order_index.get(src[p], len(order_names)), p.name.lower()),
+    )
+
+
+def _select_datasets_dialog(parent, init_dir, on_done, order=None):
     """Screen — include/exclude correlation CSVs (auto-discovered + add more)."""
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
     init_dir = Path(init_dir)
     path_list = _discover_correlation_csvs(init_dir)
+    if order:
+        path_list = _order_paths_by_workspace(path_list, order)
 
     win = tk.Toplevel(parent)
     win.title("Select correlation datasets")
@@ -1349,7 +1473,7 @@ def run_fit_dialog(fcs_data, parent=None):
     # ── 2. Model selection -> 3. Fit setup ────────────────────────────────────
     def _after_model(model: FCSModel):
         _fit_setup_dialog(parent, model, csv_path, tau_s, G,
-                          G_std if has_sigma else None)
+                          G_std if has_sigma else None, meta=_meta)
 
     _select_model_dialog(parent, _after_model)
 
@@ -1405,7 +1529,7 @@ def _select_model_dialog(parent, on_choose):
     win.wait_window()
 
 
-def _fit_setup_dialog(parent, model, csv_path, tau_s, G, sigma):
+def _fit_setup_dialog(parent, model, csv_path, tau_s, G, sigma, meta=None):
     """Screen 2 — initial guesses, bounds and fixed flags, then fit."""
     import tkinter as tk
     from tkinter import messagebox
@@ -1501,6 +1625,8 @@ def _fit_setup_dialog(parent, model, csv_path, tau_s, G, sigma):
         except Exception as e:
             messagebox.showerror("Fit failed", str(e), parent=win)
             return
+
+        result["source_meta"] = meta or {}
 
         win.destroy()
 

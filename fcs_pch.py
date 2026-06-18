@@ -108,6 +108,37 @@ def compute_pch(
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
+def _export_pch(
+    fcs_data: FCSData,
+    channels_data: Dict[str, Tuple[np.ndarray, np.ndarray, float, float, str]],
+    bin_width_s: float,
+) -> None:
+    """
+    Write the plotted PCH series for one file to a CSV.
+
+    Each series has its own contiguous k = 0..k_last; every series' p(k) is
+    padded onto a common k axis (0..max) with zeros so they share one table.
+    """
+    if not channels_data:
+        return
+    k_max  = max(int(np.asarray(k)[-1]) for (k, *_rest) in channels_data.values())
+    k_full = np.arange(0, k_max + 1)
+    cols: Dict[str, np.ndarray] = {"k": k_full}
+    meta: Dict[str, object] = {"bin_width_s": f"{bin_width_s:.6g}"}
+    for label, (k, pk, mean, var, _colour) in channels_data.items():
+        pk_full = np.zeros(k_max + 1, dtype=float)
+        pk_full[np.asarray(k, dtype=int)] = pk
+        cols[f"pk_{label}"] = pk_full
+        meta[f"{label}_mean"]          = f"{mean:.6g}"
+        meta[f"{label}_var"]           = f"{var:.6g}"
+        meta[f"{label}_var_over_mean"] = f"{var / mean:.6g}" if mean > 0 else "nan"
+    ch_tag = "_".join(channels_data.keys())
+    bw_tag = f"{bin_width_s * 1e6:.0f}us"
+    fcs_export.safe_export(
+        fcs_data, "pch", cols, meta=meta, suffix=f"{ch_tag}_{bw_tag}",
+    )
+
+
 def plot_pch(
     channels_data: Dict[str, Tuple[np.ndarray, np.ndarray, float, float, str]],
     bin_width_s: float,
@@ -135,25 +166,8 @@ def plot_pch(
     fig, ax
     """
     # ── Optional CSV export of the plotted data ───────────────────────────────
-    # Each series has its own contiguous k = 0..k_last.  We pad every series'
-    # p(k) onto a common k axis (0..max) with zeros so they share one table.
-    if export and channels_data:
-        k_max  = max(int(np.asarray(k)[-1]) for (k, *_rest) in channels_data.values())
-        k_full = np.arange(0, k_max + 1)
-        cols: Dict[str, np.ndarray] = {"k": k_full}
-        meta: Dict[str, object] = {"bin_width_s": f"{bin_width_s:.6g}"}
-        for label, (k, pk, mean, var, _colour) in channels_data.items():
-            pk_full = np.zeros(k_max + 1, dtype=float)
-            pk_full[np.asarray(k, dtype=int)] = pk
-            cols[f"pk_{label}"] = pk_full
-            meta[f"{label}_mean"]          = f"{mean:.6g}"
-            meta[f"{label}_var"]           = f"{var:.6g}"
-            meta[f"{label}_var_over_mean"] = f"{var / mean:.6g}" if mean > 0 else "nan"
-        ch_tag = "_".join(channels_data.keys())
-        bw_tag = f"{bin_width_s * 1e6:.0f}us"
-        fcs_export.safe_export(
-            fcs_data, "pch", cols, meta=meta, suffix=f"{ch_tag}_{bw_tag}",
-        )
+    if export:
+        _export_pch(fcs_data, channels_data, bin_width_s)
 
     fig, ax = plt.subplots(figsize=(9, 5))
 
@@ -227,6 +241,125 @@ def _format_bin_width(bin_width_s: float) -> str:
     elif bin_width_s < 1:
         return f"{bin_width_s * 1e3:.3g} ms"
     return f"{bin_width_s:.3g} s"
+
+
+# ── Per-file helpers (shared by dialog, batch, and overlay) ───────────────────
+
+def _build_channels_data(
+    fcs_data: FCSData,
+    channel_choice: str,
+    bin_width_s: float,
+) -> Dict[str, Tuple[np.ndarray, np.ndarray, float, float, str]]:
+    """
+    Compute the per-series ``{label: (k, pk, mean, var, colour)}`` dict for a
+    single file given a channel choice ('ch1', 'ch2', 'both', or 'combined').
+    """
+    channels_data: Dict[str, Tuple] = {}
+    if channel_choice in ("ch1", "both"):
+        k, pk, mean, var = compute_pch(fcs_data.ch1_times_s, bin_width_s)
+        channels_data["Ch1"] = (k, pk, mean, var, _CH_COLOUR[1])
+    if channel_choice in ("ch2", "both"):
+        k, pk, mean, var = compute_pch(fcs_data.ch2_times_s, bin_width_s)
+        channels_data["Ch2"] = (k, pk, mean, var, _CH_COLOUR[2])
+    if channel_choice == "combined":
+        t = np.sort(np.concatenate([fcs_data.ch1_times_s, fcs_data.ch2_times_s]))
+        k, pk, mean, var = compute_pch(t, bin_width_s)
+        channels_data["Ch1+Ch2"] = (k, pk, mean, var, _CH_COLOUR["both"])
+    return channels_data
+
+
+def plot_pch_single(
+    fcs_data: FCSData,
+    channel_choice: str,
+    bin_width_s: float,
+    show: bool = True,
+    export: bool = False,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """Compute and plot the PCH for one file in its own figure."""
+    channels_data = _build_channels_data(fcs_data, channel_choice, bin_width_s)
+    return plot_pch(channels_data, bin_width_s, fcs_data, show=show, export=export)
+
+
+# ── Overlay plotting (batch / combined) ───────────────────────────────────────
+
+# Marker per series, so files (colour) and channels (marker) stay readable
+# when several PCHs share one axes.
+_SERIES_MARKER = {"Ch1": "o", "Ch2": "s", "Ch1+Ch2": "o"}
+
+
+def plot_pch_overlay(
+    datasets,
+    channel_choice: str,
+    bin_width_s: float,
+    show: bool = True,
+    export: bool = False,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """
+    Overlay photon counting histograms from several files on one log-y axes.
+
+    Each file is drawn in its own colour.  When ``channel_choice == "both"``
+    Ch1 uses circle markers and Ch2 square markers within the file's colour.
+    The per-channel Poisson reference curves drawn in the single-file plot are
+    omitted here to keep a multi-file overlay readable.  When *export* is True
+    each file's series are written to their own CSV exactly as in the
+    single-file path.
+
+    Parameters
+    ----------
+    datasets : sequence of FCSData
+        Files to overlay (must be non-empty).
+    channel_choice : str
+        'ch1', 'ch2', 'both', or 'combined'; applied to every file.
+    bin_width_s : float
+        Bin width in seconds, shared by all files.
+
+    Returns
+    -------
+    fig, ax
+    """
+    datasets = list(datasets)
+    if not datasets:
+        raise ValueError("plot_pch_overlay requires at least one dataset.")
+
+    colours = fcs_plottools.palette(len(datasets))
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    multi_channel = channel_choice == "both"
+    for d, colour in zip(datasets, colours):
+        channels_data = _build_channels_data(d, channel_choice, bin_width_s)
+        first = True
+        for label, (k, pk, mean, var, _c) in channels_data.items():
+            ax.plot(
+                k, pk, color=colour, linewidth=1.2,
+                marker=_SERIES_MARKER.get(label, "o"), markersize=3.5,
+                alpha=0.9,
+                label=d.filepath.name if first else None,
+            )
+            first = False
+        if export:
+            _export_pch(d, channels_data, bin_width_s)
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Photons per bin  k", fontsize=12)
+    ax.set_ylabel("Probability  p(k)", fontsize=12)
+
+    bw_str   = _format_bin_width(bin_width_s)
+    ch_note  = "   ·   circles = Ch1   ·   squares = Ch2" if multi_channel else ""
+    ax.set_title(
+        f"PCH overlay — {len(datasets)} files  ·  bin width: {bw_str}{ch_note}",
+        fontsize=10,
+    )
+    ax.yaxis.set_major_formatter(
+        ticker.FuncFormatter(lambda x, _: f"{x:.0e}" if x < 1e-2 else f"{x:.3f}")
+    )
+    ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
+    ax.grid(True, which="minor", linestyle=":",  linewidth=0.3, alpha=0.3)
+    ax.legend(fontsize=9, framealpha=0.85, loc="upper right", title="File")
+
+    fig.tight_layout()
+    if show:
+        fcs_plottools.show_figure(fig, ax)
+    return fig, ax
 
 
 # ── Dialog ────────────────────────────────────────────────────────────────────
@@ -321,28 +454,9 @@ def run_pch_dialog(fcs_data: FCSData, export: bool = False):
         dialog.destroy()
 
         # Build the dict of (k, pk, mean, var, colour) per series
-        channels_data: Dict[str, Tuple] = {}
-
         try:
-            if channel_choice in ("ch1", "both"):
-                t = fcs_data.ch1_times_s
-                k, pk, mean, var = compute_pch(t, bin_width_s)
-                channels_data["Ch1"] = (k, pk, mean, var, _CH_COLOUR[1])
-
-            if channel_choice in ("ch2", "both"):
-                t = fcs_data.ch2_times_s
-                k, pk, mean, var = compute_pch(t, bin_width_s)
-                channels_data["Ch2"] = (k, pk, mean, var, _CH_COLOUR[2])
-
-            if channel_choice == "combined":
-                # Merge both channels into a single arrival-time array
-                t = np.sort(np.concatenate([
-                    fcs_data.ch1_times_s,
-                    fcs_data.ch2_times_s,
-                ]))
-                k, pk, mean, var = compute_pch(t, bin_width_s)
-                channels_data["Ch1+Ch2"] = (k, pk, mean, var, _CH_COLOUR["both"])
-
+            channels_data = _build_channels_data(
+                fcs_data, channel_choice, bin_width_s)
         except Exception as e:
             from tkinter import messagebox
             messagebox.showerror("Computation error", str(e))

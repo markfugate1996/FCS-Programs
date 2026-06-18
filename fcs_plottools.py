@@ -56,6 +56,25 @@ import matplotlib.pyplot as plt
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def palette(n: int) -> list:
+    """
+    Return *n* visually distinct colours for overlaying multiple datasets.
+
+    Up to 10 datasets use matplotlib's categorical ``tab10`` map (highly
+    distinguishable); beyond that a continuous map is sampled so arbitrarily
+    many files still get unique colours.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    n = max(1, int(n))
+    if n <= 10:
+        cmap = plt.get_cmap("tab10")
+        return [cmap(i) for i in range(n)]
+    cmap = plt.get_cmap("turbo")
+    return [cmap(x) for x in np.linspace(0.05, 0.95, n)]
+
+
 def show_figure(
     fig: plt.Figure,
     axes=None,
@@ -328,13 +347,22 @@ def _build_legend_section(
     """
     Add the "Legend" LabelFrame to *panel*, if the main axis has a legend.
 
-    Rebuilds the legend at the chosen position while preserving its handles,
-    labels, font size, and frame alpha.
+    Offers three controls:
+      * Show legend — a checkbox to hide/show it (useful when an overlay of
+        many datasets produces an enormous legend).
+      * Position — dropdown to move it.
+      * Text size — slider to shrink or grow it.
+
+    Position and size changes rebuild the legend from a snapshot of its
+    handles/labels captured when the panel is built; the snapshot is taken
+    from the legend object itself (not the axes), so custom entries such as
+    the intensity plot's "Mean Ch1/Ch2 CPS" rows are preserved.
     """
     import tkinter as tk
 
-    ax = axes_list[0]
-    if ax.get_legend() is None:
+    ax  = axes_list[0]
+    leg = ax.get_legend()
+    if leg is None:
         return
 
     _LOC_NAMES = [
@@ -353,19 +381,73 @@ def _build_legend_section(
     }
     _INT_LOC = {v: k for k, v in _LOC_INT.items()}
 
-    # Detect current location (falls back to "best" if unreadable)
-    try:
-        current = _INT_LOC.get(ax.get_legend()._loc, "best")
-    except Exception:
-        current = "best"
+    # ── Snapshot the legend so rebuilds preserve every entry ──────────────────
+    # legend_handles keeps custom proxy artists (e.g. the invisible Patches the
+    # intensity plot uses for its mean-CPS rows); ax.get_legend_handles_labels()
+    # would drop them.  Fall back to the axes handles if unavailable.
+    handles = getattr(leg, "legend_handles", None)
+    if handles is None:
+        handles = getattr(leg, "legendHandles", None)
+    labels = [t.get_text() for t in leg.get_texts()]
+    if not handles:
+        handles, labels = ax.get_legend_handles_labels()
 
-    loc_var = tk.StringVar(master=panel, value=current)
+    title_artist = leg.get_title()
+    title_text   = title_artist.get_text() if title_artist is not None else ""
+    title_text   = title_text or None
+
+    try:
+        framealpha = leg.get_frame().get_alpha()
+        if framealpha is None:
+            framealpha = 0.85
+    except Exception:
+        framealpha = 0.85
+
+    try:
+        current_loc = _INT_LOC.get(leg._loc, "best")
+    except Exception:
+        current_loc = "best"
+
+    try:
+        current_size = int(round(leg.prop.get_size()))
+    except Exception:
+        current_size = 10
+    current_size = min(20, max(4, current_size))
+
+    show_var = tk.BooleanVar(master=panel, value=True)
+    loc_var  = tk.StringVar(master=panel, value=current_loc)
+    size_var = tk.IntVar(master=panel, value=current_size)
 
     lf = tk.LabelFrame(panel, text="Legend", padx=10, pady=6)
     lf.pack(fill="x", padx=10, pady=4)
 
+    def _apply_legend(*_):
+        if not handles:
+            return
+        new = ax.legend(
+            handles, labels,
+            loc=loc_var.get(),
+            fontsize=size_var.get(),
+            title=title_text,
+            title_fontsize=size_var.get(),
+            framealpha=framealpha,
+        )
+        new.set_visible(show_var.get())
+        try:
+            fig.canvas.draw()
+        except Exception:
+            pass
+
+    # ── Show / hide ───────────────────────────────────────────────────────────
+    show_cb = tk.Checkbutton(
+        lf, text="Show legend", variable=show_var,
+        command=_apply_legend, anchor="w", font=("Helvetica", 9),
+    )
+    show_cb.pack(fill="x")
+
+    # ── Position ──────────────────────────────────────────────────────────────
     row = tk.Frame(lf)
-    row.pack(fill="x")
+    row.pack(fill="x", pady=(4, 0))
     tk.Label(row, text="Position:", width=9, anchor="e",
              font=("Helvetica", 9)).pack(side="left")
     om = tk.OptionMenu(row, loc_var, *_LOC_NAMES)
@@ -373,31 +455,18 @@ def _build_legend_section(
     om["menu"].config(font=("Helvetica", 9))
     om.pack(side="left", padx=4)
 
-    def _move_legend(*_):
-        leg = ax.get_legend()
-        if leg is None:
-            return
-        handles, labels = ax.get_legend_handles_labels()
-        if not handles:
-            return
-        try:
-            fontsize = leg.prop.get_size()
-        except Exception:
-            fontsize = 10
-        try:
-            framealpha = leg.get_frame().get_alpha()
-            if framealpha is None:
-                framealpha = 0.85
-        except Exception:
-            framealpha = 0.85
-        ax.legend(handles, labels, loc=loc_var.get(),
-                  fontsize=fontsize, framealpha=framealpha)
-        try:
-            fig.canvas.draw()
-        except Exception:
-            pass
+    # ── Text size ─────────────────────────────────────────────────────────────
+    size_row = tk.Frame(lf)
+    size_row.pack(fill="x", pady=(4, 0))
+    tk.Label(size_row, text="Text size:", width=9, anchor="e",
+             font=("Helvetica", 9)).pack(side="left")
+    tk.Scale(
+        size_row, from_=4, to=20, orient="horizontal",
+        variable=size_var, command=_apply_legend,
+        showvalue=True, length=130, font=("Helvetica", 8),
+    ).pack(side="left", padx=4, fill="x", expand=True)
 
-    loc_var.trace_add("write", _move_legend)
+    loc_var.trace_add("write", _apply_legend)
 
 
 def _build_label_section(

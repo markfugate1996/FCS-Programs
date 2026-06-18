@@ -475,6 +475,121 @@ def _draw_histogram(
     return peak_counts
 
 
+# ── Overlay plotting (batch / combined) ───────────────────────────────────────
+
+# Marker per channel, so files (colour) and channels (marker) stay readable
+# when several decays share one axes.
+_CH_MARKER = {1: ".", 2: "x"}
+
+
+def plot_lifetime_overlay(
+    datasets,
+    n_bins: int = 4096,
+    channels: tuple[int, ...] = (1, 2),
+    show: bool = True,
+    export: bool = False,
+) -> tuple[plt.Figure, plt.Axes]:
+    """
+    Overlay TCSPC decay histograms from several files on one log-y axes.
+
+    Each file is drawn in its own colour; channels are distinguished by
+    marker (Ch1 = dot, Ch2 = cross).  All files share *n_bins*.  When
+    *export* is True each file's histogram is written to its own CSV exactly
+    as in the single-file path.
+
+    Parameters
+    ----------
+    datasets : sequence of FCSData
+        Files to overlay (must be non-empty).
+    n_bins : int
+        Histogram bins (must be in _VALID_N_BINS); shared by all files.
+    channels : tuple of int
+        Channels to draw for every file.
+
+    Returns
+    -------
+    fig, ax
+    """
+    datasets = list(datasets)
+    if not datasets:
+        raise ValueError("plot_lifetime_overlay requires at least one dataset.")
+    if n_bins not in _VALID_N_BINS:
+        raise ValueError(f"n_bins must be one of {_VALID_N_BINS}; got {n_bins}.")
+    if not channels or not all(c in (1, 2) for c in channels):
+        raise ValueError("channels must be a non-empty tuple containing 1, 2, or both.")
+
+    colours = fcs_plottools.palette(len(datasets))
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+
+    peak_counts: list[int] = []
+    nonzero_mins: list[float] = []
+    period_max = 0.0
+
+    for d, colour in zip(datasets, colours):
+        period_max = max(period_max, d.laser_period_ns)
+        first = True
+        time_ns_export = None
+        export_cols: dict[str, np.ndarray] = {}
+
+        for ch in channels:
+            bin_times_ns, counts = d.lifetime_histogram(channel=ch, n_bins=n_bins)
+            if time_ns_export is None:
+                time_ns_export = bin_times_ns
+            export_cols[f"ch{ch}_counts"] = counts
+            if counts.sum() == 0:
+                continue
+            peak_counts.append(int(counts.max()))
+            nz = counts[counts > 0]
+            if len(nz):
+                nonzero_mins.append(float(nz.min()))
+            ax.plot(
+                bin_times_ns, counts,
+                linestyle="none", marker=_CH_MARKER.get(ch, "."), markersize=2.5,
+                color=colour, alpha=0.9,
+                label=d.filepath.name if first else None,
+            )
+            first = False
+
+        if export and time_ns_export is not None:
+            fcs_export.safe_export(
+                d, "lifetime",
+                {"time_ns": time_ns_export, **export_cols},
+                meta={
+                    "n_bins":          n_bins,
+                    "bin_width_ps":    f"{d.laser_period_ns / n_bins * 1000:.4f}",
+                    "laser_period_ns": f"{d.laser_period_ns:.4f}",
+                    "channels":        "+".join(f"Ch{c}" for c in channels),
+                },
+                suffix=f"{n_bins}bins",
+            )
+
+    ax.set_yscale("log")
+    if peak_counts:
+        y_min = (min(nonzero_mins) * 0.5) if nonzero_mins else 0.5
+        ax.set_ylim(y_min, max(peak_counts) * 1.5)
+    ax.set_xlim(0, period_max if period_max > 0 else 1.0)
+    ax.set_xlabel("Arrival time within laser cycle (ns)", fontsize=12)
+    ax.set_ylabel("Photon counts", fontsize=12)
+
+    ch_note = "   ·   ".join(
+        f"{_CH_MARKER[c]} = Ch{c}" for c in channels if c in _CH_MARKER
+    )
+    ax.set_title(
+        f"TCSPC decay overlay — {len(datasets)} files  ·  {_format_n_bins(n_bins)}\n"
+        f"{ch_note}",
+        fontsize=11,
+    )
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
+    ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
+    ax.grid(True, which="minor", linestyle=":",  linewidth=0.3, alpha=0.3)
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.85, title="File")
+
+    fig.tight_layout()
+    if show:
+        fcs_plottools.show_figure(fig, ax)
+    return fig, ax
+
+
 # ── CLI: run directly to plot a file ─────────────────────────────────────────
 
 if __name__ == "__main__":
