@@ -37,6 +37,8 @@ import fcs_models
 from fcs_models import FCSModel
 from fcs_reader import read_fcs, FCSData
 import fcs_lifetime
+import fcs_lifetime_fit
+import fcs_pch_fit
 
 
 # ── CSV loading ───────────────────────────────────────────────────────────────
@@ -1039,8 +1041,9 @@ def run_model_dialog(fcs_data, parent=None, workspace_order=None):
     """
     Top-level entry: choose which data type to model, then dispatch.
 
-    Correlation runs the fit workflow implemented in this module.  Lifetime
-    and PCH are placeholders for now (disabled), to be filled in later.
+    Correlation runs the fit workflow implemented in this module; Lifetime and
+    PCH dispatch to run_lifetime_fit_dialog / run_pch_fit_dialog in the
+    fcs_lifetime_fit and fcs_pch_fit modules respectively.
 
     ``workspace_order`` is an optional list of source .fcs file names in
     workspace order; when given, discovered correlation datasets are listed
@@ -1067,12 +1070,20 @@ def run_model_dialog(fcs_data, parent=None, workspace_order=None):
         run_global_fit_dialog(fcs_data, parent=parent,
                               workspace_order=workspace_order)
 
+    def _lifetime():
+        win.destroy()
+        fcs_lifetime_fit.run_lifetime_fit_dialog(fcs_data, parent=parent)
+
+    def _pch():
+        win.destroy()
+        fcs_pch_fit.run_pch_fit_dialog(fcs_data, parent=parent)
+
     tk.Button(btns, text="Correlation", width=26, pady=6,
               command=_correlation).pack(pady=4)
-    tk.Button(btns, text="Lifetime  (coming soon)", width=26, pady=6,
-              state="disabled").pack(pady=4)
-    tk.Button(btns, text="PCH  (coming soon)", width=26, pady=6,
-              state="disabled").pack(pady=4)
+    tk.Button(btns, text="Lifetime", width=26, pady=6,
+              command=_lifetime).pack(pady=4)
+    tk.Button(btns, text="PCH", width=26, pady=6,
+              command=_pch).pack(pady=4)
 
     tk.Button(win, text="Cancel", width=10, command=win.destroy,
               pady=4).pack(pady=(0, 10))
