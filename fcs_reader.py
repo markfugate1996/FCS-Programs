@@ -27,9 +27,7 @@ are stored as absolute bin indices.  The four blocks are:
 Each block is preceded by a 2-word preamble: a length marker giving the
 block size in bytes (= 4 x photon count) followed by one zero pad word.
 The length marker locates each block deterministically, independent of
-count rate.  (Earlier versions scanned for large "sentinel" values, which
-fails at low count rates because ordinary inter-photon macrotime
-differences can exceed any fixed threshold.)
+count rate.
 
 Binary layout
 -------------
@@ -391,6 +389,27 @@ def read_fcs(path: str | Path, clock_hz: Optional[float] = None) -> FCSData:
         ch2_micro  = ch1_micro,
     )
 
+def load_dataset(path: str | Path):
+    """
+    Load any supported dataset file and return the matching container.
+    Added 24 june 2026
+    Dispatches by file type:
+      * ISS time-domain lifetime decays (``.ifx``)  -> fcs_ifx.LifetimeData
+        (an already-binned decay + IRF)
+      * binary photon-record files (``.fcs``, default) -> FCSData
+
+    This is the single entry point the GUI uses when adding a file to the
+    workspace, so a new file type only has to be wired in here.
+    """
+    p = Path(path)
+    # Lazy import keeps fcs_ifx optional and avoids any import-time coupling.
+    try:
+        import fcs_ifx
+    except Exception:
+        fcs_ifx = None
+    if fcs_ifx is not None and fcs_ifx.is_ifx_file(p):
+        return fcs_ifx.read_ifx(p)
+    return read_fcs(p)
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 

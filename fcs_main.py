@@ -20,9 +20,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from fcs_reader import read_fcs, FCSData
+from fcs_reader import read_fcs, load_dataset, FCSData
 import fcs_plot
 import fcs_lifetime
+import fcs_lifetime_fit
+import fcs_lifetime_recon
 import fcs_corr
 import fcs_pch
 import fcs_fit
@@ -53,8 +55,11 @@ def _unique_key(path: Path) -> str:
 
 def _add_file(path: Path) -> str:
     key = _unique_key(path)
+    #if key not in workspace:
+    #    workspace[key] = read_fcs(path)
+    # changed 20260624
     if key not in workspace:
-        workspace[key] = read_fcs(path)
+        workspace[key] = load_dataset(path)
     return key
 
 
@@ -79,7 +84,28 @@ def _active_data() -> FCSData | None:
     return None
 
 
-def _file_summary(d: FCSData) -> str:
+#def _file_summary(d: FCSData) -> str:
+#    return (
+#        f"{d.filepath.name}\n"
+#        f"  Duration : {d.duration_s:.2f} s\n"
+#        f"  Ch1      : {len(d.ch1_deltas):,} photons  "
+#        f"({d.count_rate_ch1_hz:,.0f} CPS)\n"
+#        f"  Ch2      : {len(d.ch2_deltas):,} photons  "
+#        f"({d.count_rate_ch2_hz:,.0f} CPS)"
+#    )
+
+def _file_summary(d) -> str:
+    # Lifetime-decay datasets (.ifx) carry no photon-record fields; summarise
+    # them by their decay/IRF shape instead.
+    if getattr(d, "kind", None) == "lifetime_decay":
+        title = d.params.get("title") or d.filepath.stem
+        return (
+            f"{d.filepath.name}\n"
+            f"  Type     : lifetime decay (.ifx)\n"
+            f"  Title    : {title}\n"
+            f"  Bins     : {d.n_bins}  (laser period {d.laser_period_ns:.3f} ns)\n"
+            f"  IRF      : {'present' if d.has_irf else 'none'}"
+        )
     return (
         f"{d.filepath.name}\n"
         f"  Duration : {d.duration_s:.2f} s\n"
@@ -88,6 +114,7 @@ def _file_summary(d: FCSData) -> str:
         f"  Ch2      : {len(d.ch2_deltas):,} photons  "
         f"({d.count_rate_ch2_hz:,.0f} CPS)"
     )
+
 
 
 # ── Status bar ────────────────────────────────────────────────────────────────
@@ -306,6 +333,11 @@ def task_plot_lifetime():
     d = _active_data()
     if d is None:
         _no_active_file_warning()
+        return
+
+    # .ifx decays are already binned — no bin chooser; plot directly.
+    if getattr(d, "kind", None) == "lifetime_decay":
+        fcs_lifetime.plot_lifetime(d, export=export_var.get())
         return
 
     dialog = tk.Toplevel(root)
@@ -765,17 +797,63 @@ def task_pch():
         return
     fcs_pch.run_pch_dialog(d, export=export_var.get())
 
-
 def task_model():
-    """Open the data-type chooser, then the matching modelling workflow."""
+    """Open the matching modelling workflow for the active dataset.
+
+    Photon data (.fcs) → the correlation / lifetime / PCH chooser in fcs_fit.
+    Lifetime decays (.ifx) → a tail-fit vs IRF-reconvolution chooser, since
+    correlation and PCH need photon records an .ifx file does not carry.
+    """
     d = _active_data()
     if d is None:
         _no_active_file_warning()
+        return
+    if getattr(d, "kind", None) == "lifetime_decay":
+        _lifetime_method_dialog(d)
         return
     # Pass the workspace file order so global-fit datasets/rows follow it
     # instead of being listed alphabetically.
     order = [fd.filepath.name for fd in workspace.values()]
     fcs_fit.run_model_dialog(d, parent=root, workspace_order=order)
+
+
+def _lifetime_method_dialog(d):
+    """Choose tail fit (default) vs IRF reconvolution for an .ifx decay."""
+    dialog = tk.Toplevel(root)
+    dialog.title("Model lifetime decay")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+
+    tk.Label(dialog, text="Model lifetime decay",
+             font=("Helvetica", 12, "bold"), pady=8).pack()
+    tk.Label(dialog, text=d.filepath.name,
+             font=("Helvetica", 9), fg="grey").pack()
+
+    has_irf = bool(getattr(d, "has_irf", False))
+    method_var = tk.StringVar(value="tail")
+
+    frame = tk.LabelFrame(dialog, text="Method", padx=12, pady=8)
+    frame.pack(fill="x", padx=14, pady=8)
+    tk.Radiobutton(frame, text="Tail fit  (sum of exponentials, no IRF)",
+                   variable=method_var, value="tail", anchor="w").pack(fill="x")
+    recon_label = ("IRF reconvolution" if has_irf
+                   else "IRF reconvolution  (no IRF in this file)")
+    tk.Radiobutton(frame, text=recon_label,
+                   variable=method_var, value="recon", anchor="w",
+                   state=("normal" if has_irf else "disabled")).pack(fill="x")
+
+    def _go():
+        method = method_var.get()
+        dialog.destroy()
+        if method == "recon":
+            fcs_lifetime_recon.run_reconv_fit_dialog(d, parent=root)
+        else:
+            fcs_lifetime_fit.run_lifetime_fit_dialog(d, parent=root)
+
+    btns = tk.Frame(dialog)
+    btns.pack(pady=10)
+    tk.Button(btns, text="Next →", width=12, command=_go, pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=dialog.destroy, pady=4).pack(side="left", padx=6)
 
 
 def task_calibrate():

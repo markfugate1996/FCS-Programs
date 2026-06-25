@@ -43,7 +43,7 @@ import matplotlib.ticker as ticker
 import fcs_plottools
 import numpy as np
 
-from fcs_reader import FCSData, read_fcs
+from fcs_reader import FCSData, read_fcs, load_dataset
 import fcs_export
 
 # ── Type alias ────────────────────────────────────────────────────────────────
@@ -64,12 +64,12 @@ _GATE_SHADE_ALPHA = 0.10
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _load(data: DataOrPath) -> FCSData:
-    if isinstance(data, FCSData):
-        return data
-    return read_fcs(data)
-
+def _load(data: DataOrPath):
+    # Bare paths get dispatched by type (.ifx → LifetimeData, .fcs → FCSData);
+    # anything already loaded (FCSData, LifetimeData, …) passes straight through.
+    if isinstance(data, (str, Path)):
+        return load_dataset(data)
+    return data
 
 def _format_n_bins(n_bins: int, n_raw: int = 4096) -> str:
     """Human-readable description of the binning."""
@@ -150,10 +150,22 @@ def plot_lifetime(
     if not channels or not all(c in (1, 2) for c in channels):
         raise ValueError("channels must be a non-empty tuple containing 1, 2, or both.")
 
+    #d   = _load(data)
+    #fig, ax = plt.subplots(figsize=(9, 4))
+    #_draw_histogram(ax, d, n_bins, channels)
+    #fig.tight_layout()
+
     d   = _load(data)
+
+    # ISS .ifx lifetime decay (already binned) → dedicated draw path; the
+    # channel / n_bins histogram logic below applies only to photon (.fcs) data.
+    if getattr(d, "kind", None) == "lifetime_decay":
+        return _plot_decay_ifx(d, show=show, export=export)
+
     fig, ax = plt.subplots(figsize=(9, 4))
     _draw_histogram(ax, d, n_bins, channels)
-    fig.tight_layout()
+
+
 
     # ── Optional CSV export of the plotted data ───────────────────────────────
     # The time axis is identical across channels (same n_bins / range), so a
@@ -185,7 +197,54 @@ def plot_lifetime(
         fcs_plottools.show_figure(fig, ax)
     return fig, ax
 
+def _plot_decay_ifx(d, rebin: int = 1, show: bool = True, export: bool = False):
+    """
+    Draw an ISS .ifx lifetime decay (counts vs ns) on a log-y axis, with the
+    measured IRF overlaid (scaled to the decay peak) when present.
+    added 20260624
+    """
+    t, intensity, irf = d.decay_curve(rebin=max(1, int(rebin)))
 
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(t, intensity, color="steelblue", lw=1.2, label="Decay")
+    if d.has_irf and irf is not None and irf.max() > 0:
+        # Scale IRF to the decay peak purely for visual comparison.
+        irf_scaled = irf * (intensity.max() / irf.max())
+        ax.plot(t, irf_scaled, color="grey", lw=1.0, alpha=0.7, label="IRF (scaled)")
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Time (ns)")
+    ax.set_ylabel("Photon counts")
+    title = d.params.get("title") or d.filepath.stem
+    rebin_note = "" if rebin <= 1 else f"  (rebin ×{int(rebin)})"
+    ax.set_title(f"Lifetime decay — {title}{rebin_note}")
+    ax.legend(loc="upper right", fontsize=9)
+
+    finite_pos = intensity[intensity > 0]
+    if finite_pos.size:
+        ax.set_ylim(bottom=max(0.5, finite_pos.min() * 0.5))
+    fig.tight_layout()
+
+    if export:
+        cols = {"time_ns": t, "intensity": intensity}
+        if d.has_irf and irf is not None:
+            cols["irf"] = irf
+        fcs_export.safe_export(
+            d, "lifetime", cols,
+            meta={
+                "n_bins":        len(t),
+                "rebin":         int(rebin),
+                "bin_width_ns":  f"{(t[1]-t[0]):.5f}" if len(t) > 1 else "n/a",
+                "pulse_rate_hz": f"{d.pulse_rate_hz:.1f}" if d.pulse_rate_hz else "n/a",
+                "has_irf":       d.has_irf,
+            },
+            suffix="decay" if rebin <= 1 else f"decay_rebin{int(rebin)}",
+        )
+
+    if show:
+        fcs_plottools.show_figure(fig, ax)
+    return fig, ax
+    
 # ── Interactive gate selection ────────────────────────────────────────────────
 
 def select_gate(

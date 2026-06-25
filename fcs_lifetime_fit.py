@@ -470,6 +470,11 @@ def _parse_bound(text: str, default: float) -> float:
 
 # ── GUI: entry point and dialogs ──────────────────────────────────────────────
 
+# Remembers the most recently used fit window (ns), so fitting a family of
+# datasets over the same range doesn't require re-typing it each time.  Module-
+# level → persists across files for the session.
+_last_fit_window: dict = {"start": None, "end": None}
+
 def run_lifetime_fit_dialog(fcs_data: FCSData, parent=None):
     """
     Full GUI flow for lifetime modelling: choose channel / resolution / window,
@@ -483,11 +488,22 @@ def run_lifetime_fit_dialog(fcs_data: FCSData, parent=None):
 
     _lifetime_data_dialog(parent, fcs_data, _after_data)
 
+def _lifetime_data_dialog(parent, fcs_data, on_done):
+    """Screen 1 — channel, histogram resolution, and fit window.
 
-def _lifetime_data_dialog(parent, fcs_data: FCSData, on_done):
-    """Screen 1 — channel, histogram resolution, and fit window."""
+    Accepts photon data (FCSData) or an already-binned lifetime decay
+    (fcs_ifx.LifetimeData).  For a decay there is a single curve and a fixed
+    native resolution, so the channel and bin controls are hidden.
+    """
     import tkinter as tk
     from tkinter import messagebox
+
+    is_lt = getattr(fcs_data, "kind", None) == "lifetime_decay"
+
+    # .ifx is already binned → fit at native resolution (n_bins=None); .fcs uses
+    # the chosen histogram resolution.
+    def _nbins():
+        return None if is_lt else bin_var.get()
 
     win = tk.Toplevel(parent)
     win.title("Lifetime fit — data")
@@ -502,18 +518,22 @@ def _lifetime_data_dialog(parent, fcs_data: FCSData, on_done):
     body = tk.Frame(win, padx=14, pady=8)
     body.pack(fill="x")
 
-    # Channel
-    tk.Label(body, text="Channel:", anchor="w").grid(row=0, column=0, sticky="w", pady=3)
+    # Channel — photon data has Ch1/Ch2; an .ifx decay is a single curve.
     ch_var = tk.IntVar(value=1)
-    ch_frame = tk.Frame(body)
-    ch_frame.grid(row=0, column=1, sticky="w")
-    tk.Radiobutton(ch_frame, text="Ch1", variable=ch_var, value=1).pack(side="left")
-    tk.Radiobutton(ch_frame, text="Ch2", variable=ch_var, value=2).pack(side="left")
+    tk.Label(body, text="Channel:", anchor="w").grid(row=0, column=0, sticky="w", pady=3)
+    if is_lt:
+        tk.Label(body, text="decay (.ifx)", anchor="w").grid(row=0, column=1, sticky="w")
+    else:
+        ch_frame = tk.Frame(body)
+        ch_frame.grid(row=0, column=1, sticky="w")
+        tk.Radiobutton(ch_frame, text="Ch1", variable=ch_var, value=1).pack(side="left")
+        tk.Radiobutton(ch_frame, text="Ch2", variable=ch_var, value=2).pack(side="left")
 
-    # Bins
-    tk.Label(body, text="Histogram bins:", anchor="w").grid(row=1, column=0, sticky="w", pady=3)
+    # Bins — only meaningful for photon data; an .ifx decay is already binned.
     bin_var = tk.IntVar(value=4096)
-    tk.OptionMenu(body, bin_var, *fcs_lifetime._VALID_N_BINS).grid(row=1, column=1, sticky="w")
+    if not is_lt:
+        tk.Label(body, text="Histogram bins:", anchor="w").grid(row=1, column=0, sticky="w", pady=3)
+        tk.OptionMenu(body, bin_var, *fcs_lifetime._VALID_N_BINS).grid(row=1, column=1, sticky="w")
 
     # Window entries
     tk.Label(body, text="Fit start (ns):", anchor="w").grid(row=2, column=0, sticky="w", pady=3)
@@ -525,15 +545,27 @@ def _lifetime_data_dialog(parent, fcs_data: FCSData, on_done):
 
     def _set_default_window(*_):
         try:
-            lo, hi = default_window(fcs_data, ch_var.get(), bin_var.get())
+            lo, hi = default_window(fcs_data, ch_var.get(), _nbins())
             start_var.set(f"{lo:.2f}")
             end_var.set(f"{hi:.2f}")
         except Exception:
             pass
 
-    _set_default_window()
+    # Pre-fill with the last-used window if we have one; otherwise compute the
+    # per-file default (peak → end).
+    if _last_fit_window["start"] is not None and _last_fit_window["end"] is not None:
+        start_var.set(f"{_last_fit_window['start']:.2f}")
+        end_var.set(f"{_last_fit_window['end']:.2f}")
+    else:
+        _set_default_window()
     ch_var.trace_add("write", _set_default_window)
     bin_var.trace_add("write", _set_default_window)
+
+    def _current_window():
+        try:
+            return (float(start_var.get()), float(end_var.get()))
+        except ValueError:
+            return None
 
     def _pick_on_hist():
         gate = fcs_lifetime.select_gate(
@@ -547,16 +579,10 @@ def _lifetime_data_dialog(parent, fcs_data: FCSData, on_done):
             start_var.set(f"{gate[0]:.2f}")
             end_var.set(f"{gate[1]:.2f}")
 
-    def _current_window():
-        try:
-            return (float(start_var.get()), float(end_var.get()))
-        except ValueError:
-            return None
-
     tk.Button(win, text="Pick window on histogram…", command=_pick_on_hist,
               pady=3).pack(pady=(0, 4))
 
-    tk.Label(win, text="The first and last microtime bins (edge artifacts)\n"
+    tk.Label(win, text="The first and last bins (edge artifacts)\n"
                        "are always excluded from the fit.",
              font=("Helvetica", 9), fg="grey", justify="center").pack()
 
@@ -574,8 +600,11 @@ def _lifetime_data_dialog(parent, fcs_data: FCSData, on_done):
             messagebox.showerror("Invalid window",
                                  "Fit end must be greater than fit start.", parent=win)
             return
+        # Remember this window so the next dataset opens pre-filled with it.
+        _last_fit_window["start"], _last_fit_window["end"] = lo, hi
         channel = ch_var.get()
-        n_bins  = bin_var.get()
+        
+        n_bins  = _nbins()
         t_ns, counts = fcs_data.lifetime_histogram(channel=channel, n_bins=n_bins)
         win.destroy()
         on_done(channel, n_bins, t_ns, counts, lo, hi)
