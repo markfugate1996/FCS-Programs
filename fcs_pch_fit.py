@@ -371,6 +371,18 @@ def _fits_dir(source_path: Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     return out
 
+def _new_fit_dir(source_path: Path) -> Path:
+    """Fresh timestamped subfolder inside 'fits' for one recon-fit export."""
+    fits = _fits_dir(source_path)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out = fits / stamp
+    n = 2
+    while out.exists():
+        out = fits / f"{stamp}_{n}"
+        n += 1
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
 
 def _fmt(x: float) -> str:
     if x == np.inf:
@@ -384,13 +396,14 @@ def export_pch_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     """Write a .txt report and a .csv of the fitted PCH to the 'fits' folder."""
     source_path = Path(source_path)
     model = result["model"]
-    out_dir = _fits_dir(source_path)
+    
+    out_dir = _new_fit_dir(source_path)
     ch = result.get("channel")
     ch_tag = f"_{ch}" if ch else ""
-    stem = f"{source_path.stem}_pchfit{ch_tag}_{model.key}"
+    report_path = out_dir / "lifetime_fit_report.txt"
+    curve_path  = out_dir / "lifetime_fit_curve.csv"
 
-    report_path = out_dir / f"{stem}.txt"
-    curve_path  = out_dir / f"{stem}_curve.csv"
+
 
     L: list[str] = []
     L.append("PCH fit report")

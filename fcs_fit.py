@@ -395,6 +395,23 @@ def _fits_dir(source_path: Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     return out
 
+def _new_fit_dir(source_path: Path) -> Path:
+    """
+    Create and return a fresh, uniquely-named subfolder inside the shared
+    'fits' directory for ONE export.  The folder name is just the export
+    timestamp; sample, model and parameter detail lives inside the files.
+    """
+    fits = _fits_dir(source_path)                    # the shared 'fits' dir
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out = fits / stamp
+    n = 2
+    while out.exists():                              # avoid same-second clashes
+        out = fits / f"{stamp}_{n}"
+        n += 1
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 
 def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     """
@@ -406,11 +423,18 @@ def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     """
     source_path = Path(source_path)
     model = result["model"]
-    out_dir = _fits_dir(source_path)
-    stem = f"{source_path.stem}_fit_{model.key}"
+    # out_dir = _fits_dir(source_path)
+    # stem = f"{source_path.stem}_fit_{model.key}"
 
-    report_path = out_dir / f"{stem}.txt"
-    curve_path  = out_dir / f"{stem}_curve.csv"
+    # report_path = out_dir / f"{stem}.txt"
+    # curve_path  = out_dir / f"{stem}_curve.csv"
+
+
+    out_dir = _new_fit_dir(source_path)
+    report_path = out_dir / "fit_report.txt"
+    curve_path  = out_dir / "fit_curve.csv"
+
+
 
     # ── Report ────────────────────────────────────────────────────────────────
     L: list[str] = []
@@ -480,7 +504,7 @@ def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     if result["weighted"]:
         cols["sigma"] = result["sigma"]
     names = list(cols.keys())
-    with curve_path.open("w", encoding="utf-8", newline="") as fh:
+    with curve_path.open("w", encoding="utf-8-sig", newline="") as fh:   # was "utf-8"
         fh.write(f"# FCS fit curve — {model.key}\n")
         fh.write(f"# source : {source_path.name}\n")
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
@@ -495,6 +519,60 @@ def export_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     print(f"[fit] wrote {report_path}")
     print(f"[fit] wrote {curve_path}")
     return report_path, curve_path
+
+def _write_params_xlsx(path: Path, comments: list, header: list,
+                        rows: list) -> Optional[Path]:
+    """
+    Mirror the parameter table as a real .xlsx for convenient viewing in Excel.
+    Numbers are written as numbers (so Excel sorts/formats them natively) and no
+    text-encoding step is involved, so there's no mojibake.  The .csv remains
+    the machine-readable copy that 'Calibrate Volume' reads; this .xlsx is
+    purely for the human.  Requires openpyxl; if it's missing this is a no-op
+    and the .csv is unaffected.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("[globalfit] openpyxl not installed — wrote .csv only "
+              "(pip install openpyxl to also get .xlsx).")
+        return None
+
+    import math
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "fit parameters"
+    grey = Font(color="808080", italic=True)
+    bold = Font(bold=True)
+
+    r = 1
+    for line in comments:
+        ws.cell(row=r, column=1, value=line).font = grey
+        r += 1
+    for j, h in enumerate(header, start=1):
+        ws.cell(row=r, column=j, value=h).font = bold
+    header_row = r
+    r += 1
+    for row in rows:
+        for j, v in enumerate(row, start=1):
+            if isinstance(v, float) and not math.isfinite(v):
+                v = None                              # NaN/inf -> blank cell
+            ws.cell(row=r, column=j, value=v)
+        r += 1
+
+    for j, h in enumerate(header, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = max(len(str(h)) + 2, 12)
+    ws.freeze_panes = f"A{header_row + 1}"
+
+    try:
+        wb.save(path)
+    except Exception as e:
+        print(f"[globalfit] could not write .xlsx ({e}); .csv is unaffected.")
+        return None
+    print(f"[globalfit] wrote {path}")
+    return path
+
 
 
 def _fmt(x: float) -> str:
@@ -751,10 +829,10 @@ def export_global_fit(result: dict, out_source: str | Path,
     """
     out_source = Path(out_source)
     model = result["model"]
-    out_dir = _fits_dir(out_source)
-    stem = f"{out_source.stem}_globalfit_{model.key}"
-    report_path = out_dir / f"{stem}.txt"
-    curve_path  = out_dir / f"{stem}_curves.csv"
+    out_dir = _new_fit_dir(out_source)
+    report_path = out_dir / "globalfit_report.txt"
+    curve_path  = out_dir / "globalfit_curves.csv"
+
 
     L: list[str] = []
     L.append("FCS global fit report")
@@ -831,7 +909,7 @@ def export_global_fit(result: dict, out_source: str | Path,
     header = ["dataset", "tau_s", "tau_ms", "G_data", "G_fit", "residual"]
     if weighted:
         header.append("sigma")
-    with curve_path.open("w", encoding="utf-8", newline="") as fh:
+    with curve_path.open("w", encoding="utf-8-sig", newline="") as fh:
         fh.write(f"# FCS global fit curves — {model.key}\n")
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
         fh.write(",".join(header) + "\n")
@@ -851,7 +929,10 @@ def export_global_fit(result: dict, out_source: str | Path,
     # ── Wide parameter table (one row per dataset) for spreadsheets ───────────
     # Designed for downstream "parameter vs variable" plots (e.g. tau_D vs
     # concentration): each dataset is a row, each parameter a value+error pair.
-    params_path = out_dir / f"{stem}_params.csv"
+    # ── Wide parameter table (one row per dataset) for spreadsheets ───────────
+    # Calibrate Volume reads the .csv; the .xlsx is the convenient view.
+    params_path = out_dir / "globalfit_params.csv"
+    xlsx_path   = out_dir / "globalfit_params.xlsx"
     linked_names = [n for n in result["names"] if result["linked"].get(n)]
     fixed_names  = [n for n in result["names"] if result["fixed"].get(n)]
 
@@ -860,7 +941,7 @@ def export_global_fit(result: dict, out_source: str | Path,
         p_header += [n, f"{n}_err"]
     has_N = "G0" in result["names"]
     if has_N:
-        p_header += ["N", "N_err"]      # <N> = 1/G0, with propagated error
+        p_header += ["N", "N_err"]                 # <N> = 1/G0, propagated error
     has_bg = bool(bg_factors) and has_N
     if has_bg:
         p_header += ["bg_factor", "N_corr", "N_corr_err"]
@@ -870,65 +951,73 @@ def export_global_fit(result: dict, out_source: str | Path,
         p_header += ["cps_ch1", "cps_ch2", "cps_fit", "acq_time_s"]
     p_header += ["r2", "n_points"]
 
-    def _join_csv(items):
-        return ",".join(items)
+    # Build native-typed rows ONCE, then render to both .csv and .xlsx.
+    data_rows: list[list] = []
+    for ds in result["datasets"]:
+        row: list = [ds["name"]]
+        for n in result["names"]:
+            row.append(float(ds["values"][n]))
+            row.append(float(ds["errors"][n]))
+        N = N_err = float("nan")
+        if has_N:
+            g0  = ds["values"]["G0"]
+            g0e = ds["errors"]["G0"]
+            if g0 > 0:
+                N     = 1.0 / g0
+                N_err = g0e / (g0 * g0)             # σ_N = σ_G0 / G0²
+            row.append(float(N))
+            row.append(float(N_err))
+        if has_bg:
+            bg = bg_factors.get(ds["name"], {})
+            factor = bg.get("factor", float("nan"))
+            row.append(float(factor))
+            row.append(float(N * factor))
+            row.append(float(N_err * factor))       # factor treated as exact
+        if has_cps:
+            cps = _cps_from_meta(ds.get("meta")) or {}
+            for key in ("cps_ch1", "cps_ch2", "cps_fit", "acq_time_s"):
+                v = cps.get(key)
+                row.append(float(v) if v is not None else float("nan"))
+        row.append(float(ds["r2"]))
+        row.append(int(ds["n_points"]))
+        data_rows.append(row)
+
+    # Comment/header block (no em-dash → no mojibake; Calibrate Volume ignores
+    # these '#' lines except for the '# key : value' metadata it parses).
+    comments: list[str] = []
+    comments.append("FCS global fit - parameter table")
+    comments.append(f"model : {model.name} [{model.key}]")
+    comments.append(f"exported : {datetime.now().isoformat(timespec='seconds')}")
+    comments.append(f"weighted : {'yes' if result['weighted'] else 'no'}")
+    comments.append(f"linked : {', '.join(linked_names) if linked_names else '(none)'}")
+    comments.append(f"fixed : {', '.join(fixed_names) if fixed_names else '(none)'}")
+    if result["weighted"]:
+        comments.append(f"global_red_chi2 : {result['red_chi2']:.6g}")
+    comments.append("units : tau_D in seconds")
+    if has_N:
+        comments.append("note : N = 1/G0 (geometric factor 1); N_err = G0_err / G0^2")
+    if has_bg:
+        win = bg_factors.get("_window_ns")
+        if win:
+            comments.append(f"background_window_ns : {win[0]:.3f} - {win[1]:.3f}")
+        comments.append("note : N_corr = N * bg_factor (background-corrected occupancy)")
+    if has_cps:
+        comments.append("note : cps_* are mean count rates (Hz) from the correlation "
+                        "headers; cps_fit = that channel (auto) or the Ch1/Ch2 average (cross)")
+
+    def _csv_cell(v) -> str:
+        return f"{v:.10g}" if isinstance(v, float) else str(v)
 
     with params_path.open("w", encoding="utf-8", newline="") as fh:
-        fh.write("# FCS global fit — parameter table\n")
-        fh.write(f"# model : {model.name} [{model.key}]\n")
-        fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
-        fh.write(f"# weighted : {'yes' if result['weighted'] else 'no'}\n")
-        fh.write(f"# linked : {', '.join(linked_names) if linked_names else '(none)'}\n")
-        fh.write(f"# fixed : {', '.join(fixed_names) if fixed_names else '(none)'}\n")
-        if result["weighted"]:
-            fh.write(f"# global_red_chi2 : {result['red_chi2']:.6g}\n")
-        fh.write(f"# units : tau_D in seconds\n")
-        if has_N:
-            fh.write("# note : N = 1/G0 (geometric factor 1); "
-                     "N_err = G0_err / G0^2\n")
-        if has_bg:
-            win = bg_factors.get("_window_ns")
-            if win:
-                fh.write(f"# background_window_ns : {win[0]:.3f} - {win[1]:.3f}\n")
-            fh.write("# note : N_corr = N * bg_factor "
-                     "(background-corrected occupancy)\n")
-        if has_cps:
-            fh.write("# note : cps_* are mean count rates (Hz) from the "
-                     "correlation headers; cps_fit = that channel (auto) "
-                     "or the Ch1/Ch2 average (cross)\n")
-        fh.write(_join_csv(p_header) + "\n")
-        for ds in result["datasets"]:
-            row = [ds["name"]]
-            for n in result["names"]:
-                row.append(f"{ds['values'][n]:.10g}")
-                row.append(f"{ds['errors'][n]:.10g}")
-            N = N_err = float("nan")
-            if has_N:
-                g0  = ds["values"]["G0"]
-                g0e = ds["errors"]["G0"]
-                if g0 > 0:
-                    N    = 1.0 / g0
-                    N_err = g0e / (g0 * g0)        # σ_N = σ_G0 / G0²
-                row.append(f"{N:.10g}")
-                row.append(f"{N_err:.10g}")
-            if has_bg:
-                bg = bg_factors.get(ds["name"], {})
-                factor = bg.get("factor", float("nan"))
-                N_corr = N * factor
-                N_corr_err = N_err * factor       # factor treated as exact
-                row.append(f"{factor:.10g}")
-                row.append(f"{N_corr:.10g}")
-                row.append(f"{N_corr_err:.10g}")
-            if has_cps:
-                cps = _cps_from_meta(ds.get("meta")) or {}
-                for key in ("cps_ch1", "cps_ch2", "cps_fit", "acq_time_s"):
-                    v = cps.get(key)
-                    row.append(f"{v:.10g}" if v is not None else "nan")
-            row.append(f"{ds['r2']:.10g}")
-            row.append(str(ds["n_points"]))
-            fh.write(_join_csv(row) + "\n")
-
+        for line in comments:
+            fh.write(f"# {line}\n")
+        fh.write(",".join(p_header) + "\n")
+        for row in data_rows:
+            fh.write(",".join(_csv_cell(v) for v in row) + "\n")
     print(f"[globalfit] wrote {params_path}")
+
+    _write_params_xlsx(xlsx_path, comments, p_header, data_rows)
+
     return report_path, curve_path, params_path
 
 

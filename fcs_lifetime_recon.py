@@ -487,6 +487,18 @@ def _fits_dir(source_path: Path) -> Path:
     out = base / "fits"
     out.mkdir(parents=True, exist_ok=True)
     return out
+    
+def _new_fit_dir(source_path: Path) -> Path:
+    """Fresh timestamped subfolder inside 'fits' for one recon-fit export."""
+    fits = _fits_dir(source_path)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out = fits / stamp
+    n = 2
+    while out.exists():
+        out = fits / f"{stamp}_{n}"
+        n += 1
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
 
 def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
@@ -497,10 +509,10 @@ def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Pa
     """
     source_path = Path(source_path)
     model = result["model"]
-    out_dir = _fits_dir(source_path)
-    stem = f"{source_path.stem}_lifetimefit_{model.key}"
-    report_path = out_dir / f"{stem}.txt"
-    curve_path = out_dir / f"{stem}_curve.csv"
+    out_dir = _new_fit_dir(source_path)
+    report_path = out_dir / "lifetime_fit_report.txt"
+    curve_path  = out_dir / "lifetime_fit_curve.csv"
+
 
     der = result["derived"]
     L: list[str] = []
@@ -557,7 +569,7 @@ def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Pa
         "resid_sigma": result["wresid"],
     }
     names = list(cols.keys())
-    with curve_path.open("w", encoding="utf-8", newline="") as fh:
+    with curve_path.open("w", encoding="utf-8-sig", newline="") as fh:
         fh.write(f"# Lifetime fit curve — {model.key}\n")
         fh.write(f"# source : {source_path.name}\n")
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
