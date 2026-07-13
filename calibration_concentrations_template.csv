@@ -1,0 +1,15 @@
+﻿# FCS volume-calibration concentrations — template
+# Edit the values, save, then use "Import concentrations from file...".
+#
+# Format: one row per dataset, mapped by the dataset name (order-independent).
+#   - 'dataset' must match the names shown in the calibration dialog.
+#   - datasets you leave out are simply left blank to fill in by hand.
+#   - repeated concentrations across datasets are fine; they are aggregated.
+# The '# unit :' line below sets the unit dropdown (pM, nM, uM, mM, M).
+# unit : nM
+dataset,concentration
+g2_correlation_cross,36.45
+g3_correlation_cross,12.15
+g4_correlation_cross,4.05
+g5_correlation_cross,1.35
+g6_correlation_cross,0.45

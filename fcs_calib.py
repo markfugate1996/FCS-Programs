@@ -104,6 +104,94 @@ def load_params_csv(path) -> Tuple[List[dict], Dict[str, str]]:
     return out, meta
 
 
+def load_concentrations(path, names) -> Tuple[np.ndarray, Optional[str], str]:
+    """
+    Read known concentrations for a calibration from a file and align them to
+    the dataset ``names`` shown in the dialog.
+
+    Accepted layouts (delimiter may be comma, tab, or whitespace):
+      * a table with a ``dataset`` column and a concentration column — mapped by
+        dataset name, so order does not matter and extra/missing rows are OK;
+      * a single column of numbers (or ``name value`` pairs), one per dataset in
+        the displayed order.
+
+    Lines starting with '#' are comments; a '# unit : X' line, if present, sets
+    the returned unit (when it names a known unit).
+
+    Returns (conc, unit, note): ``conc`` is a float array aligned to ``names``
+    (NaN where unknown), ``unit`` is a recognised unit string or None, and
+    ``note`` summarises how the mapping went.
+    """
+    path = Path(path)
+    meta: Dict[str, str] = {}
+    rows: List[List[str]] = []
+    with path.open("r", encoding="utf-8-sig") as fh:
+        for line in fh:
+            if line.lstrip().startswith("#"):
+                body = line.strip().lstrip("#").strip()
+                if ":" in body:
+                    k, v = body.split(":", 1)
+                    meta[k.strip().lower()] = v.strip()
+                continue
+            if not line.strip():
+                continue
+            if "," in line:
+                cells = [c.strip() for c in line.rstrip("\n").split(",")]
+            elif "\t" in line:
+                cells = [c.strip() for c in line.rstrip("\n").split("\t")]
+            else:
+                cells = line.split()
+            rows.append(cells)
+
+    if not rows:
+        raise ValueError(f"No data found in {path.name}.")
+
+    unit = meta.get("unit")
+    if unit is not None and unit not in _CONC_FACTOR:
+        unit = None
+
+    def _num(s):
+        try:
+            return float(s)
+        except (ValueError, TypeError):
+            return float("nan")
+
+    conc = np.full(len(names), np.nan, float)
+    lower0 = [c.lower() for c in rows[0]]
+
+    if "dataset" in lower0:                      # map by dataset name
+        header = lower0
+        d_idx = header.index("dataset")
+        conc_names = ("concentration", "conc", "c", "known", "value",
+                      "nm", "µm", "um", "mm", "pm", "m")
+        c_idx = next((header.index(h) for h in conc_names if h in header), None)
+        if c_idx is None:
+            c_idx = next((k for k in range(len(header)) if k != d_idx), None)
+        if c_idx is None:
+            raise ValueError("File has a 'dataset' column but no value column.")
+        mapping = {r[d_idx].strip(): _num(r[c_idx])
+                   for r in rows[1:] if len(r) > max(d_idx, c_idx)}
+        matched = 0
+        for i, nm in enumerate(names):
+            if nm in mapping:
+                conc[i] = mapping[nm]
+                matched += 1
+        note = f"matched {matched}/{len(names)} datasets by name"
+        n_missing = sum(1 for nm in names if nm not in mapping)
+        if n_missing:
+            note += f"; {n_missing} left blank"
+    else:                                        # positional (displayed order)
+        vals = []
+        for r in rows:
+            nums = [x for x in (_num(c) for c in r) if np.isfinite(x)]
+            vals.append(nums[-1] if nums else float("nan"))
+        for i in range(min(len(names), len(vals))):
+            conc[i] = vals[i]
+        note = f"loaded {len(vals)} value(s) by position (need {len(names)})"
+
+    return conc, unit, note
+
+
 # ── Line fits ─────────────────────────────────────────────────────────────────
 
 def fit_through_origin(x, y, yerr=None) -> Tuple[float, float, float]:
@@ -775,6 +863,34 @@ def run_calibration_dialog(parent=None, init_dir=None):
     unit_var = tk.StringVar(value="nM")
     tk.OptionMenu(top, unit_var, "pM", "nM", "µM", "uM", "mM", "M").pack(side="left", padx=6)
 
+    imp = tk.Frame(win, padx=12)
+    imp.pack(fill="x", pady=(2, 0))
+
+    def _import_conc():
+        fpath = filedialog.askopenfilename(
+            title="Import known concentrations",
+            initialdir=str(csv_path.parent),
+            filetypes=[("CSV / text", "*.csv *.txt *.tsv"), ("All files", "*.*")],
+            parent=win,
+        )
+        if not fpath:
+            return
+        try:
+            vals, funit, note = load_concentrations(fpath, names)
+        except Exception as e:
+            messagebox.showerror("Import failed", str(e), parent=win)
+            return
+        for cv, v in zip(conc_vars, vals):
+            cv.set("" if not np.isfinite(v) else f"{v:g}")
+        if funit in ("pM", "nM", "µM", "uM", "mM", "M"):
+            unit_var.set(funit)
+        messagebox.showinfo("Concentrations imported", note, parent=win)
+
+    tk.Button(imp, text="Import concentrations from file…",
+              command=_import_conc).pack(side="left")
+    tk.Label(imp, text="  (dataset,concentration  —  or one value per row)",
+             font=("Helvetica", 8), fg="grey").pack(side="left")
+
     table = tk.Frame(win, padx=12, pady=4)
     table.pack(fill="x")
     tk.Label(table, text="dataset", font=("Helvetica", 10, "bold")).grid(
@@ -897,15 +1013,22 @@ if __name__ == "__main__":
     import sys
     #So, the cmd line arguments are stored in "sys.argv"
     if len(sys.argv) < 3:
-        print("Usage: python fcs_calib.py <params.csv> <c1,c2,...> [unit]")
-        print("  concentrations: one per dataset row, comma-separated")
+        print("Usage: python fcs_calib.py <params.csv> <c1,c2,...|conc_file> [unit]")
+        print("  concentrations: one per dataset row, comma-separated, or a file")
         sys.exit(1)
     rows, _ = load_params_csv(sys.argv[1])
     names = [r["dataset"] for r in rows]
     N = np.array([r.get("N", np.nan) for r in rows], float)
     N_err = np.array([r.get("N_err", np.nan) for r in rows], float)
-    conc = np.array([float(x) for x in sys.argv[2].split(",")], float)
+    arg2 = sys.argv[2]
     unit = sys.argv[3] if len(sys.argv) > 3 else "nM"
+    if Path(arg2).exists():
+        conc, funit, note = load_concentrations(arg2, names)
+        print(f"[calib] {note}")
+        if funit and len(sys.argv) <= 3:
+            unit = funit
+    else:
+        conc = np.array([float(x) for x in arg2.split(",")], float)
     res = calibrate(names, N, N_err if np.all(np.isfinite(N_err)) else None,
                     conc, unit=unit)
     export_calibration(res, Path(sys.argv[1]))
