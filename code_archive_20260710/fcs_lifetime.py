@@ -43,7 +43,7 @@ import matplotlib.ticker as ticker
 import fcs_plottools
 import numpy as np
 
-from fcs_reader import FCSData, load_dataset
+from fcs_reader import FCSData, read_fcs, load_dataset
 import fcs_export
 
 # ── Type alias ────────────────────────────────────────────────────────────────

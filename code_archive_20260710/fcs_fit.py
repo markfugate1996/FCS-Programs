@@ -5,13 +5,13 @@ Fit saved correlation curves to an FCS model.
 
 Workflow (launched from the main window)
 ----------------------------------------
-    1. Pick correlation CSV(s)  (defaults to the active file's analysis folder;
+    1. Pick a correlation CSV  (defaults to the active file's analysis folder;
        these are the files written by the "Export plotted data to CSV" option).
     2. Choose a model               -> _select_model_dialog
     3. Set guesses / bounds / fixed -> _global_setup_dialog
     4. Fit, plot data + fit + residuals, and write results to a 'fits' folder.
 
-The numerical core (load_correlation_csv, auto_guess) has no
+The numerical core (load_correlation_csv, auto_guess, fit_correlation) has no
 GUI dependency and can be reused for batch / multi-dataset fitting later.
 
 Models come from fcs_models.MODELS — see that file to add or edit models.
@@ -31,7 +31,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import fcs_plottools
-from scipy.optimize import least_squares
+from scipy.optimize import curve_fit, least_squares
 
 import fcs_models
 from fcs_models import FCSModel
@@ -41,13 +41,6 @@ import fcs_lifetime_fit
 import fcs_pch_fit
 import fcs_fisher
 import fcs_noise
-
-from fcs_fitcommon import (
-    fits_dir as _fits_dir,
-    new_fit_dir as _new_fit_dir,
-    fmt_bound as _fmt,
-    parse_bound as _parse_bound,
-)
 
 # ── CSV loading ───────────────────────────────────────────────────────────────
 
@@ -151,16 +144,11 @@ def _cps_from_meta(meta: Optional[dict]) -> Optional[dict]:
         cps_fit, label = cps1, "Ch1"
     elif ctype == "auto_ch2":
         cps_fit, label = cps2, "Ch2"
-    else:   # cross (or unknown) → geometric mean, so R² = R1·R2 exactly,
-            # matching the correlator's rateA·rateB normalisation
+    else:   # cross (or unknown) → average of the available channels
         present = [c for c in (cps1, cps2) if c is not None]
-        if cps1 and cps2:
-            cps_fit = float(np.sqrt(cps1 * cps2))
-            label = "sqrt(Ch1·Ch2)"
-        else:
-            cps_fit = present[0] if present else None
-            label = "Ch1" if cps1 else ("Ch2" if cps2 else "n/a")
-            
+        cps_fit = (sum(present) / len(present)) if present else None
+        label = "mean(Ch1, Ch2)"
+
     return {
         "cps_ch1":       cps1,
         "cps_ch2":       cps2,
@@ -227,6 +215,39 @@ def auto_guess(model: FCSModel, tau_s: np.ndarray, G: np.ndarray) -> Dict[str, f
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
+def _fits_dir(source_path: Path) -> Path:
+    """
+    Return (creating if needed) a 'fits' folder beside the original data file.
+
+    Correlation CSVs normally live in '<datadir>/analysis/', so the fits
+    folder is placed as a sibling: '<datadir>/fits/'.  If the source is not
+    inside an 'analysis' folder, 'fits' is created next to it instead.
+    """
+    base = source_path.parent
+    if base.name.lower() == "analysis":
+        base = base.parent
+    out = base / "fits"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+def _new_fit_dir(source_path: Path) -> Path:
+    """
+    Create and return a fresh, uniquely-named subfolder inside the shared
+    'fits' directory for ONE export.  The folder name is just the export
+    timestamp; sample, model and parameter detail lives inside the files.
+    """
+    fits = _fits_dir(source_path)                    # the shared 'fits' dir
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out = fits / stamp
+    n = 2
+    while out.exists():                              # avoid same-second clashes
+        out = fits / f"{stamp}_{n}"
+        n += 1
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+
 def _write_params_xlsx(path: Path, comments: list, header: list,
                         rows: list) -> Optional[Path]:
     """
@@ -279,6 +300,15 @@ def _write_params_xlsx(path: Path, comments: list, header: list,
         return None
     print(f"[globalfit] wrote {path}")
     return path
+
+
+
+def _fmt(x: float) -> str:
+    if x == np.inf:
+        return "inf"
+    if x == -np.inf:
+        return "-inf"
+    return f"{x:.4g}"
 
 
 # ── Global / linked fitting ───────────────────────────────────────────────────
@@ -528,7 +558,7 @@ def _grand_ss_tot(dsets) -> float:
 
 
 def export_global_fit(result: dict, out_source: str | Path,
-                      bg_factors: Optional[dict] = None) -> Tuple[Path, Path, Path]:
+                      bg_factors: Optional[dict] = None) -> Tuple[Path, Path]:
     """
     Write a global-fit report (.txt) and a combined long-format curve CSV.
     ``out_source`` provides the folder (its 'fits' sibling) and filename stem.
@@ -637,6 +667,10 @@ def export_global_fit(result: dict, out_source: str | Path,
                 L.append(f"  not available — {type(e).__name__}: {e}")
         L.append("")
 
+    report_path.write_text("\n".join(L), encoding="utf-8")
+    
+    
+    
     report_path.write_text("\n".join(L), encoding="utf-8")
 
     # Combined long-format curve CSV
@@ -1321,6 +1355,16 @@ def _select_model_dialog(parent, on_choose):
     win.wait_window()
 
 
+def _parse_bound(text: str, default: float) -> float:
+    """Parse a bound entry, accepting blank, 'inf', '-inf'."""
+    t = text.strip().lower()
+    if t in ("", "inf", "+inf", "infinity"):
+        return np.inf if t != "" else default
+    if t in ("-inf", "-infinity"):
+        return -np.inf
+    return float(t)
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1341,13 +1385,8 @@ if __name__ == "__main__":
     lowers = {p.name: p.lower for p in model.params}
     uppers = {p.name: p.upper for p in model.params}
     fixed  = {p.name: p.fixed for p in model.params}
-    linked = {p.name: False for p in model.params}          # single dataset: nothing to link
-
-    weighted = G_std is not None and np.isfinite(G_std).any()
-    datasets = [{"name": path.stem, "path": path, "meta": _meta or {},
-                 "tau": tau_s, "G": G, "sigma": G_std}]
 
     result = fit_global(model, datasets, linked, guesses,
-                        lowers, uppers, fixed, weighted=weighted)
+                                lowers, uppers, fixed, weighted=weighted)
     export_global_fit(result, path)
-    plot_global_fit(result)
+    plot_global_fit(result, path.name)

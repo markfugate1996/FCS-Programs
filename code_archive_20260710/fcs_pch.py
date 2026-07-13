@@ -25,7 +25,7 @@ Public API
 
 from __future__ import annotations
 
-from typing import Tuple, Dict
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 import matplotlib.pyplot as plt

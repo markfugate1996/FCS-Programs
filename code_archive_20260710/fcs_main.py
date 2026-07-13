@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from fcs_reader import load_dataset, FCSData
+from fcs_reader import read_fcs, load_dataset, FCSData
 import fcs_plot
 import fcs_lifetime
 import fcs_lifetime_fit

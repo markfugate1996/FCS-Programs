@@ -49,6 +49,7 @@ For multi-axes figures pass the axes array::
 
 from __future__ import annotations
 
+from typing import Union
 import numpy as np
 import matplotlib.pyplot as plt
 

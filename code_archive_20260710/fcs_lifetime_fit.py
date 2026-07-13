@@ -54,12 +54,6 @@ from fcs_reader import FCSData
 import fcs_lifetime
 import fcs_fisher
 
-from fcs_fitcommon import (
-    fits_dir as _fits_dir,
-    new_fit_dir as _new_fit_dir,
-    fmt_bound as _fmt,
-    parse_bound as _parse_bound,
-)
 
 # ── Data preparation ──────────────────────────────────────────────────────────
 
@@ -200,7 +194,7 @@ def fit_lifetime(
     σ = √max(counts, 1) and parameter errors are absolute, so the reduced χ²
     is meaningful.
 
-    Returns a result dict(values, 1σ errors,
+    Returns a result dict mirroring fcs_fit.fit_correlation (values, 1σ errors,
     masked data, fit curve, residuals, R², χ², reduced χ²), plus lifetime
     extras: the absolute and relative time axes, the channel / n_bins / window,
     and — for the two-exponential model — the amplitude-weighted mean lifetime.
@@ -356,6 +350,38 @@ def plot_lifetime_fit(
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
+def _fits_dir(source_path: Path) -> Path:
+    """
+    Return (creating if needed) a 'fits' folder beside the original data file.
+    Mirrors fcs_fit._fits_dir so lifetime and correlation fits land together.
+    """
+    base = source_path.parent
+    if base.name.lower() == "analysis":
+        base = base.parent
+    out = base / "fits"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+def _new_fit_dir(source_path: Path) -> Path:
+    """Fresh timestamped subfolder inside 'fits' for one lifetime-fit export."""
+    fits = _fits_dir(source_path)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out = fits / stamp
+    n = 2
+    while out.exists():
+        out = fits / f"{stamp}_{n}"
+        n += 1
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+def _fmt(x: float) -> str:
+    if x == np.inf:
+        return "inf"
+    if x == -np.inf:
+        return "-inf"
+    return f"{x:.4g}"
+
+
 def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     """
     Write a human-readable .txt report plus a .csv of the fitted curve to the
@@ -446,6 +472,17 @@ def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Pa
     print(f"[lifetime fit] wrote {report_path}")
     print(f"[lifetime fit] wrote {curve_path}")
     return report_path, curve_path
+
+
+def _parse_bound(text: str, default: float) -> float:
+    """Parse a bound entry, accepting blank, 'inf', '-inf'."""
+    t = text.strip().lower()
+    if t in ("", "inf", "+inf", "infinity"):
+        return np.inf if t != "" else default
+    if t in ("-inf", "-infinity"):
+        return -np.inf
+    return float(t)
+
 
 # ── GUI: entry point and dialogs ──────────────────────────────────────────────
 

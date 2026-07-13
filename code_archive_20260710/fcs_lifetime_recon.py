@@ -52,12 +52,6 @@ import fcs_lifetime_models
 from fcs_lifetime_models import LifetimeModel
 from fcs_ifx import LifetimeData
 
-from fcs_fitcommon import (
-    fits_dir as _fits_dir,
-    new_fit_dir as _new_fit_dir,
-    fmt_bound as _fmt,
-    parse_bound as _parse_bound,
-)
 
 # ── IRF preparation ───────────────────────────────────────────────────────────
 
@@ -485,6 +479,28 @@ def plot_lifetime_fit(
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
+def _fits_dir(source_path: Path) -> Path:
+    """Return (creating if needed) a 'fits' folder beside the source file."""
+    base = source_path.parent
+    if base.name.lower() in ("analysis", "fits"):
+        base = base.parent
+    out = base / "fits"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+    
+def _new_fit_dir(source_path: Path) -> Path:
+    """Fresh timestamped subfolder inside 'fits' for one recon-fit export."""
+    fits = _fits_dir(source_path)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out = fits / stamp
+    n = 2
+    while out.exists():
+        out = fits / f"{stamp}_{n}"
+        n += 1
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
     """
     Write a human-readable .txt report plus a .csv of the fitted curve.
@@ -680,6 +696,13 @@ def _lifetime_setup_dialog(parent, model: LifetimeModel, data: LifetimeData):
     upper_vars: Dict[str, tk.StringVar] = {}
     fixed_vars: Dict[str, tk.BooleanVar] = {}
 
+    def _fmt(x: float) -> str:
+        if x == np.inf:
+            return "inf"
+        if x == -np.inf:
+            return "-inf"
+        return f"{x:.4g}"
+
     for r, p in enumerate(model.params, start=1):
         label = f"{p.name}" + (f" ({p.unit})" if p.unit else "")
         tk.Label(table, text=label, anchor="w", width=12).grid(
@@ -729,7 +752,15 @@ def _lifetime_setup_dialog(parent, model: LifetimeModel, data: LifetimeData):
 
     btns = tk.Frame(win)
     btns.pack(pady=10)
-    
+
+    def _parse_bound(text: str, default: float) -> float:
+        s = text.strip().lower()
+        if s in ("", "inf", "+inf", "infinity"):
+            return np.inf if s != "" else default
+        if s in ("-inf", "-infinity"):
+            return -np.inf
+        return float(s)
+
     def _do_fit():
         try:
             guesses = {n: float(guess_vars[n].get()) for n in guess_vars}

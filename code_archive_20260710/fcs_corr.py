@@ -26,6 +26,7 @@ Three computation backends
 
 Public API
 ----------
+    segment_times(times_s, seg_duration_s)         -> list[np.ndarray]
     compute_segmented(timesA_s, timesB_s,
                       tau_edges, method)            -> (tau, G_mean, G_std, n_seg)
     compute_crosscorr(timesA_s, timesB_s,
@@ -299,6 +300,51 @@ def thin_photons(times_s: np.ndarray, keep_every: int) -> np.ndarray:
     if k == 1:
         return times_s
     return times_s[::k]
+
+
+# ── Segmentation ──────────────────────────────────────────────────────────────
+
+def segment_times(
+    times_s: np.ndarray,
+    seg_duration_s: float,
+) -> List[np.ndarray]:
+    """
+    Split a sorted photon arrival time array into non-overlapping segments
+    of exactly seg_duration_s seconds.
+
+    Photons in any trailing partial segment (shorter than seg_duration_s)
+    are discarded so that every segment has the same duration and the
+    (T − τ) normalisation factor is identical across segments.
+
+    Parameters
+    ----------
+    times_s : np.ndarray
+        Sorted photon arrival times in seconds.
+    seg_duration_s : float
+        Duration of each segment in seconds.
+
+    Returns
+    -------
+    list of np.ndarray
+        Each element is a time array with times re-zeroed to the start of
+        that segment (so normalisation is computed correctly per segment).
+    """
+    t_start = times_s[0]
+    t_end   = times_s[-1]
+    total   = t_end - t_start
+    n_segs  = int(total // seg_duration_s)
+
+    segments = []
+    for k in range(n_segs):
+        lo = t_start + k * seg_duration_s
+        hi = lo + seg_duration_s
+        mask = (times_s >= lo) & (times_s < hi)
+        seg  = times_s[mask] - lo   # re-zero to segment start
+        if len(seg) > 1:
+            segments.append(seg)
+
+    return segments
+
 
 # ── Correlator backends ───────────────────────────────────────────────────────
 
@@ -691,58 +737,6 @@ def compute_crosscorr(
         timesA_s, timesB_s, tau_edges, method, segment, progress_cb)
 
 
-def compute_crosscorr_symmetric(
-    timesA_s: np.ndarray,
-    timesB_s: np.ndarray,
-    tau_edges: np.ndarray,
-    method: Method = "perbin",
-    segment: bool = False,
-    progress_cb=None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """
-    Symmetric cross-correlation ½[G_AB(τ) + G_BA(τ)].
-
-    Averages the forward (A→B) and reverse (B→A) directed cross-correlations.
-    For a time-symmetric process the two directions estimate the same G(τ);
-    averaging them halves the variance of the cross term (to the extent the
-    two directed estimates are independent) and removes any small asymmetry
-    bias.  This matches the (Ch1×Ch2 + Ch2×Ch1)/2 convention used by ISS
-    VistaVision and most commercial correlators.
-
-    The two directions are averaged at the level of the *normalised* G(τ),
-    not the raw counts, since each direction carries its own normalisation.
-
-    Returns
-    -------
-    tau, G_mean, G_std, n_segments
-    """
-    # Forward A→B occupies the first half of the progress budget, reverse B→A
-    # the second half, so the existing progress window stays monotonic.
-    fwd_cb = rev_cb = None
-    if progress_cb is not None:
-        # crude split: each direction reports into its own half
-        def fwd_cb(completed, label):
-            progress_cb(completed, f"A→B  —  {label}")
-        def rev_cb(completed, label):
-            progress_cb(completed, f"B→A  —  {label}")
-
-    tau, G_ab, std_ab, n_ab = compute_segmented(
-        timesA_s, timesB_s, tau_edges, method, segment, fwd_cb)
-    _,   G_ba, std_ba, n_ba = compute_segmented(
-        timesB_s, timesA_s, tau_edges, method, segment, rev_cb)
-
-    G_mean = 0.5 * (G_ab + G_ba)
-
-    # Combine uncertainties. In the unsegmented case both stds are NaN, so the
-    # result is NaN (no error bars), matching the directed behaviour. In the
-    # segmented case, average the two independent estimates: the SD of the mean
-    # of two independent estimates each with SD s is sqrt(s_ab² + s_ba²)/2.
-    with np.errstate(invalid="ignore"):
-        G_std = np.sqrt(std_ab**2 + std_ba**2) / 2.0
-
-    return tau, G_mean, G_std, max(n_ab, n_ba)
-
-
 def compute_autocorr(
     times_s: np.ndarray,
     tau_edges: np.ndarray,
@@ -766,81 +760,13 @@ def compute_autocorr(
 _CORR_LABEL = {
     "auto_ch1": "Autocorr Ch1",
     "auto_ch2": "Autocorr Ch2",
-    "cross":    "Ch1xCh2",
+    "cross":    "Cross-corr Ch1→Ch2",
 }
 _METHOD_LABEL = {
     "perbin":          "per-bin searchsorted",
     "twopointer":      "two-pointer (Wahl)",
     "wiener_khinchin": "Wiener–Khinchin",
 }
-
-def _cps_meta(n1: int, n2: int, T: float) -> dict:
-    """
-    CPS / acquisition-time header fields, consumed by fcs_fit._cps_from_meta
-    (and hence fcs_noise's shot-noise term).
-
-    Counts and T must describe the photons ACTUALLY correlated — i.e. after
-    microtime gating and thinning — and T must be computed the same way the
-    correlator computes it (span of the filtered arrays), so that the shot-noise
-    pair count matches the estimator's own rateA·rateB·(T−τ)·Δτ normalisation.
-    Returns {} when the fields cannot be trusted, so the fit report says
-    "not available" rather than reporting a wrong rate.
-    """
-    if T <= 0 or (n1 == 0 and n2 == 0):
-        return {}
-    return {
-        "acquisition_time_s": f"{T:.6g}",
-        "n_photons_ch1": n1,
-        "n_photons_ch2": n2,
-        "cps_ch1": f"{n1 / T:.6g}",
-        "cps_ch2": f"{n2 / T:.6g}",
-    }
-
-def _export_correlation(
-    fcs_data: FCSData,
-    tau: np.ndarray,
-    G_mean: np.ndarray,
-    G_std: np.ndarray,
-    corr_type: str,
-    method: Method,
-    tau_min_s: float,
-    tau_max_s: float,
-    n_segs: int,
-    gate_min_ns: Optional[float] = None,
-    gate_max_ns: Optional[float] = None,
-    n_used_ch1: Optional[int] = None,
-    n_used_ch2: Optional[int] = None,
-    T_used: Optional[float] = None,
-) -> None:
-    """
-    Write one file's plotted correlation curve to a CSV.
-
-    Mirrors the inline export in :func:`plot_correlation` so single-file and
-    batch/overlay exports use an identical column and metadata layout.
-    """
-    cols: dict = {
-        "tau_s":  tau,
-        "tau_ms": tau * 1e3,
-        "G":      G_mean,
-    }
-    if np.isfinite(G_std).any():
-        cols["G_std"] = G_std
-    meta = {
-        "type":       corr_type,
-        "method":     method,
-        "tau_min_s":  f"{tau_min_s:.6g}",
-        "tau_max_s":  f"{tau_max_s:.6g}",
-        "n_segments": n_segs,
-    }
-    if None not in (n_used_ch1, n_used_ch2, T_used):
-            meta.update(_cps_meta(n_used_ch1, n_used_ch2, T_used))
-    
-    if gate_min_ns is not None:
-        meta["gate_min_ns"] = f"{gate_min_ns:.3f}"
-        meta["gate_max_ns"] = f"{gate_max_ns:.3f}"
-    fcs_export.safe_export(
-        fcs_data, "correlation", cols, meta=meta, suffix=corr_type,
-    )
 
 
 def plot_correlation(
@@ -857,9 +783,6 @@ def plot_correlation(
     gate_max_ns: Optional[float] = None,
     show: bool = True,
     export: bool = False,
-    n_used_ch1: Optional[int] = None,
-    n_used_ch2: Optional[int] = None,
-    T_used: Optional[float] = None,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """
     Plot a segmented correlation function with uncertainty bounds.
@@ -886,12 +809,37 @@ def plot_correlation(
     """
     # ── Optional CSV export of the plotted data ───────────────────────────────
     if export:
-        _export_correlation(
-            fcs_data, tau, G_mean, G_std, corr_type, method,
-            tau_min_s, tau_max_s, n_segs, gate_min_ns, gate_max_ns,
-            n_used_ch1=n_used_ch1, n_used_ch2=n_used_ch2, T_used=T_used,
+        cols: dict = {
+            "tau_s":  tau,
+            "tau_ms": tau * 1e3,
+            "G":      G_mean,
+        }
+        if np.isfinite(G_std).any():
+            cols["G_std"] = G_std
+        meta = {
+            "type":      corr_type,
+            "method":    method,
+            "tau_min_s": f"{tau_min_s:.6g}",
+            "tau_max_s": f"{tau_max_s:.6g}",
+            "n_segments": n_segs,
+        }
+        t1 = fcs_data.ch1_times_s
+        t2 = fcs_data.ch2_times_s
+        T  = max(t1[-1] if len(t1) else 0.0, t2[-1] if len(t2) else 0.0) \
+           - min(t1[0]  if len(t1) else 0.0, t2[0]  if len(t2) else 0.0)
+        if T > 0:
+            meta["acquisition_time_s"] = f"{T:.6g}"
+            meta["n_photons_ch1"] = len(t1)
+            meta["n_photons_ch2"] = len(t2)
+            meta["cps_ch1"] = f"{len(t1) / T:.6g}"
+            meta["cps_ch2"] = f"{len(t2) / T:.6g}"         
+        
+        if gate_min_ns is not None:
+            meta["gate_min_ns"] = f"{gate_min_ns:.3f}"
+            meta["gate_max_ns"] = f"{gate_max_ns:.3f}"
+        fcs_export.safe_export(
+            fcs_data, "correlation", cols, meta=meta, suffix=corr_type,
         )
-
 
     fig, ax = plt.subplots(figsize=(9, 4.5))
 
@@ -1017,6 +965,56 @@ def apply_time_gate(
 
 # ── Per-file compute + overlay (batch / combined) ─────────────────────────────
 
+def _export_correlation(
+    fcs_data: FCSData,
+    tau: np.ndarray,
+    G_mean: np.ndarray,
+    G_std: np.ndarray,
+    corr_type: str,
+    method: Method,
+    tau_min_s: float,
+    tau_max_s: float,
+    n_segs: int,
+    gate_min_ns: Optional[float] = None,
+    gate_max_ns: Optional[float] = None,
+) -> None:
+    """
+    Write one file's plotted correlation curve to a CSV.
+
+    Mirrors the inline export in :func:`plot_correlation` so single-file and
+    batch/overlay exports use an identical column and metadata layout.
+    """
+    cols: dict = {
+        "tau_s":  tau,
+        "tau_ms": tau * 1e3,
+        "G":      G_mean,
+    }
+    if np.isfinite(G_std).any():
+        cols["G_std"] = G_std
+    meta = {
+        "type":       corr_type,
+        "method":     method,
+        "tau_min_s":  f"{tau_min_s:.6g}",
+        "tau_max_s":  f"{tau_max_s:.6g}",
+        "n_segments": n_segs,
+    }
+    t1 = fcs_data.ch1_times_s
+    t2 = fcs_data.ch2_times_s
+    T  = max(t1[-1] if len(t1) else 0.0, t2[-1] if len(t2) else 0.0) \
+       - min(t1[0]  if len(t1) else 0.0, t2[0]  if len(t2) else 0.0)
+    if T > 0:
+        meta["acquisition_time_s"] = f"{T:.6g}"
+        meta["n_photons_ch1"] = len(t1)
+        meta["n_photons_ch2"] = len(t2)
+        meta["cps_ch1"] = f"{len(t1) / T:.6g}"
+        meta["cps_ch2"] = f"{len(t2) / T:.6g}"
+    
+    if gate_min_ns is not None:
+        meta["gate_min_ns"] = f"{gate_min_ns:.3f}"
+        meta["gate_max_ns"] = f"{gate_max_ns:.3f}"
+    fcs_export.safe_export(
+        fcs_data, "correlation", cols, meta=meta, suffix=corr_type,
+    )
 
 
 def compute_correlation_for(
@@ -1132,9 +1130,9 @@ def compute_correlation_for(
 
     try:
         if corr_type == "cross":
-            tau, G_mean, G_std, n_segs = compute_crosscorr_symmetric(
+            tau, G_mean, G_std, n_segs = compute_crosscorr(
                 times_ch1, times_ch2, tau_edges, method, segment,
-                progress_cb=progress_cb)                                                                                                       
+                progress_cb=progress_cb)
         elif corr_type == "auto_ch1":
             tau, G_mean, G_std, n_segs = compute_autocorr(
                 times_ch1, tau_edges, method, segment, progress_cb=progress_cb)
@@ -1164,9 +1162,6 @@ def compute_correlation_for(
         "tau": tau, "G_mean": G_mean, "G_std": G_std, "n_segs": n_segs,
         "tau_min_s": tau_min_s, "tau_max_s": tau_max_s,
         "gate_min_ns": gate_min_ns, "gate_max_ns": gate_max_ns,
-        "n_used_ch1": len(times_ch1), "n_used_ch2": len(times_ch2),
-        "T_used": float(max(times_ch1[-1], times_ch2[-1])
-                        - min(times_ch1[0], times_ch2[0])),
     }
 
 
@@ -1235,10 +1230,7 @@ def plot_correlation_overlay(
                 d, tau, G_mean, res["G_std"], corr_type, method,
                 res["tau_min_s"], res["tau_max_s"], res["n_segs"],
                 res["gate_min_ns"], res["gate_max_ns"],
-                n_used_ch1=res["n_used_ch1"], n_used_ch2=res["n_used_ch2"],
-                T_used=res["T_used"],
             )
-
 
     ax.axhline(0, color="grey", linewidth=0.6, linestyle="--")
     ax.set_xlabel("Lag time τ (ms)", fontsize=12)
@@ -1713,12 +1705,6 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
 
         pw.close()
 
-
-        _n1, _n2 = len(times_ch1), len(times_ch2)
-        _starts = [t[0]  for t in (times_ch1, times_ch2) if len(t)]
-        _stops  = [t[-1] for t in (times_ch1, times_ch2) if len(t)]
-        _T = (max(_stops) - min(_starts)) if _starts else 0.0
-
         plot_correlation(
             tau, G_mean, G_std,
             corr_type=corr_type,
@@ -1729,7 +1715,7 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
             method=method,
             gate_min_ns=gate_min_ns,
             gate_max_ns=gate_max_ns,
-            export=export,n_used_ch1=_n1, n_used_ch2=_n2, T_used=_T
+            export=export,
         )
 
     tk.Button(btn_frame, text="Compute", width=12,

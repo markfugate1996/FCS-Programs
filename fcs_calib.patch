@@ -1,0 +1,407 @@
+diff --git a/fcs_calib.py b/fcs_calib.py
+index a2331f3..715cd9e 100644
+--- a/fcs_calib.py
++++ b/fcs_calib.py
+@@ -41,6 +41,12 @@ import numpy as np
+ import matplotlib.pyplot as plt
+ import fcs_plottools
+ 
++try:
++    from scipy.stats import chi2 as _chi2dist
++    _HAVE_SCIPY = True
++except Exception:                       # scipy is a suite dependency; degrade
++    _HAVE_SCIPY = False                 # gracefully (GOF metric just disabled)
++
+ # <N> = f(unit) · C · Veff[µm³].  (Veff in µm³ = 1e-15 L, N_A = 6.022e23 /mol)
+ _CONC_FACTOR = {
+     "M":  6.022e8,
+@@ -136,6 +142,152 @@ def fit_through_origin(x, y, yerr=None) -> Tuple[float, float, float]:
+     return float(s), s_err, r2
+ 
+ 
++def _through_origin_stats(x, y, yerr=None) -> dict:
++    """
++    Weighted through-origin fit with full goodness-of-fit statistics for one
++    candidate window.  Returns a dict with:
++
++        n, slope, s_err_int, s_err_ext, chi2, dof, red_chi2, gof_Q, Sxx
++
++    ``s_err_int`` is the statistical (internal) slope error assuming the given
++    sigma are correct absolute errors; ``s_err_ext`` is the Birge-scaled
++    (external) error = s_err_int * sqrt(chi2_red).  When ``yerr`` is None the
++    weights are uniform and the scale is taken from the residual scatter, so
++    red_chi2 is 1 by construction and gof_Q is undefined.
++    """
++    x = np.asarray(x, float)
++    y = np.asarray(y, float)
++    weighted = yerr is not None
++    if weighted:
++        yerr = np.asarray(yerr, float)
++        w = np.where(yerr > 0, 1.0 / np.square(yerr), np.nan)
++    else:
++        w = np.ones_like(x)
++    m = np.isfinite(x) & np.isfinite(y) & np.isfinite(w) & (w > 0)
++    x, y, w = x[m], y[m], w[m]
++    n = int(x.size)
++    out = {"n": n, "slope": float("nan"), "s_err_int": float("nan"),
++           "s_err_ext": float("nan"), "chi2": float("nan"),
++           "dof": max(0, n - 1), "red_chi2": float("nan"),
++           "gof_Q": float("nan"), "Sxx": float("nan")}
++    if n < 1:
++        return out
++    Sxx = float(np.sum(w * x * x))
++    Sxy = float(np.sum(w * x * y))
++    if Sxx <= 0:
++        return out
++    s = Sxy / Sxx
++    resid = y - s * x
++    dof = max(1, n - 1)
++    if weighted:
++        chi2 = float(np.sum(w * resid * resid))
++        red = chi2 / dof
++        s_err_int = float(np.sqrt(1.0 / Sxx))
++        s_err_ext = float(np.sqrt(max(red, 0.0) / Sxx))
++        Q = (float(_chi2dist.sf(chi2, dof))
++             if (_HAVE_SCIPY and dof > 0) else float("nan"))
++    else:
++        ssr = float(np.sum(resid * resid))          # unweighted
++        sigma2 = ssr / dof                          # residual variance
++        chi2 = ssr
++        red = 1.0                                   # by construction
++        s_err_int = s_err_ext = float(np.sqrt(sigma2 / Sxx))
++        Q = float("nan")
++    out.update({"slope": float(s), "s_err_int": s_err_int,
++                "s_err_ext": s_err_ext, "chi2": chi2, "dof": dof,
++                "red_chi2": red, "gof_Q": Q, "Sxx": Sxx})
++    return out
++
++
++def select_linear_subset(conc, N, N_err, use_weights: bool = True,
++                         metric: str = "veff_err", n_min: int = 3,
++                         alpha: float = 0.05) -> dict:
++    """
++    Choose the contiguous concentration window that best represents the linear
++    calibration regime.
++
++    Points are ordered by concentration; every contiguous window of at least
++    ``n_min`` points is fit to <N> = s.C through the origin and scored by
++    ``metric``:
++
++      "veff_err" : minimise the *relative* external uncertainty of the
++                   calibration constant,  sqrt(chi2_red / Sxx) / |s|.
++                   Rewards more / higher-leverage points (larger Sxx), penalises
++                   non-linear points via chi2_red, needs no tuning constant, and
++                   is invariant to a global rescaling of the error bars.
++
++      "gof"      : take the LARGEST window whose reduced chi-square is
++                   statistically acceptable (survival Q >= alpha), tie-broken by
++                   the largest Q.  Falls back to the window closest to
++                   chi2_red = 1 if nothing passes.  Requires real error bars.
++
++    Returns a dict:
++        used     : boolean mask in the ORIGINAL point order (True = keep)
++        order    : original indices sorted by concentration
++        table    : per-window stat dicts (for the report / plot)
++        best     : the chosen window record (or None)
++        metric, n_min, alpha, fallback, weighted
++    """
++    conc = np.asarray(conc, float)
++    N = np.asarray(N, float)
++    have_err = (N_err is not None and np.all(np.isfinite(N_err))
++                and np.all(np.asarray(N_err) > 0))
++    weighted = bool(have_err and use_weights)
++    N_err_arr = np.asarray(N_err, float) if have_err else None
++
++    valid = np.isfinite(conc) & np.isfinite(N)
++    idx_valid = np.nonzero(valid)[0]
++    m = idx_valid.size
++    n_min = max(2, int(n_min))
++
++    table: List[dict] = []
++    result = {"used": valid.copy(), "order": idx_valid, "table": table,
++              "metric": metric, "n_min": n_min, "alpha": float(alpha),
++              "best": None, "fallback": False, "weighted": weighted}
++
++    if m < max(n_min, 2):               # too few points to trim: keep them all
++        return result
++    if metric == "gof" and not weighted:
++        metric = "veff_err"             # GOF needs real error bars
++        result["metric"] = metric
++
++    order = idx_valid[np.argsort(conc[idx_valid])]
++    for i in range(m):
++        for j in range(i + n_min - 1, m):
++            win = order[i:j + 1]
++            yee = (N_err_arr[win] if weighted else None)
++            st = _through_origin_stats(conc[win], N[win], yee)
++            if not np.isfinite(st["slope"]) or st["slope"] <= 0:
++                continue
++            table.append({
++                "i": int(i), "j": int(j), "n": int(win.size), "idx": win.copy(),
++                "c_lo": float(conc[win].min()), "c_hi": float(conc[win].max()),
++                "slope": st["slope"], "red_chi2": st["red_chi2"],
++                "gof_Q": st["gof_Q"], "s_err_ext": st["s_err_ext"],
++                "veff_err_rel": st["s_err_ext"] / st["slope"],
++            })
++
++    if not table:
++        return result
++
++    if metric == "gof":
++        accepted = [r for r in table
++                    if np.isfinite(r["gof_Q"]) and r["gof_Q"] >= alpha]
++        if accepted:
++            best = max(accepted, key=lambda r: (r["n"], r["gof_Q"]))
++        else:
++            result["fallback"] = True
++            best = min(table, key=lambda r: abs(r["red_chi2"] - 1.0))
++    else:                               # "veff_err"
++        best = min(table, key=lambda r: r["veff_err_rel"])
++
++    used = np.zeros_like(valid, dtype=bool)
++    used[best["idx"]] = True
++    result["used"] = used
++    result["best"] = best
++    return result
++
++
+ def fit_with_intercept(x, y, yerr=None) -> Tuple[float, float]:
+     """Diagnostic free-intercept fit. Returns (slope, intercept)."""
+     x = np.asarray(x, float)
+@@ -169,6 +321,10 @@ def calibrate(
+     unit: str = "nM",
+     use_weights: bool = True,
+     corrected: bool = False,
++    select: str = "auto",
++    select_metric: str = "veff_err",
++    n_min: int = 3,
++    alpha_gof: float = 0.05,
+ ) -> dict:
+     """
+     Fit <N> = s·C through the origin and derive alpha (C = alpha·<N>) and,
+@@ -180,10 +336,29 @@ def calibrate(
+     N = np.asarray(N, float)
+     conc = np.asarray(conc, float)
+     have_err = (N_err is not None and np.all(np.isfinite(N_err)) and np.all(N_err > 0))
+-    yerr = N_err if (have_err and use_weights) else None
+ 
+-    s, s_err, r2 = fit_through_origin(conc, N, yerr)
+-    slope_free, intercept = fit_with_intercept(conc, N, yerr)
++    # ── Linear-range selection ────────────────────────────────────────────────
++    valid = np.isfinite(conc) & np.isfinite(N)
++    sel = None
++    if select == "auto":
++        sel = select_linear_subset(
++            conc, N, (N_err if have_err else None),
++            use_weights=use_weights, metric=select_metric,
++            n_min=n_min, alpha=alpha_gof,
++        )
++        used = np.asarray(sel["used"], bool)
++    else:
++        used = valid.copy()
++    if used.sum() < 1:                  # never fit on nothing
++        used = valid.copy()
++
++    xu  = conc[used]
++    yu  = N[used]
++    yeru = (N_err[used] if (have_err and use_weights) else None)
++
++    s, s_err, r2 = fit_through_origin(xu, yu, yeru)
++    slope_free, intercept = fit_with_intercept(xu, yu, yeru)
++    st = _through_origin_stats(xu, yu, yeru)     # red_chi2 / GOF on the subset
+ 
+     alpha = 1.0 / s
+     alpha_err = s_err / (s * s)
+@@ -193,13 +368,22 @@ def calibrate(
+     if f:
+         veff = s / f                    # µm³
+ 
++    excluded = [names[i] for i in range(len(names)) if not used[i]]
++
+     return {
+         "names": names, "N": N, "N_err": N_err, "conc": conc, "unit": unit,
++        "used": used, "excluded": excluded,
++        "n_used": int(used.sum()), "n_total": int(valid.sum()),
+         "slope": s, "slope_err": s_err, "r2": r2,
+         "alpha": alpha, "alpha_err": alpha_err,
+         "intercept": intercept, "slope_free": slope_free,
+-        "veff_um3": veff, "weighted": yerr is not None,
++        "veff_um3": veff, "weighted": yeru is not None,
+         "corrected": corrected,
++        "red_chi2": st["red_chi2"], "gof_Q": st["gof_Q"],
++        "slope_err_ext": st["s_err_ext"],
++        "select": select,
++        "select_metric": (sel["metric"] if sel else None),
++        "selection": sel,
+     }
+ 
+ 
+@@ -213,12 +397,31 @@ def plot_calibration(result: dict, show: bool = True):
+ 
+     fig, ax = plt.subplots(figsize=(7.5, 5.5), layout="constrained")
+ 
+-    if N_err is not None and np.all(np.isfinite(N_err)):
+-        ax.errorbar(conc, N, yerr=N_err, fmt="o", color="steelblue",
+-                    capsize=3, markersize=5, label="data", zorder=3)
+-    else:
+-        ax.plot(conc, N, "o", color="steelblue", markersize=5,
+-                label="data", zorder=3)
++    used = np.asarray(result.get("used", np.ones(len(conc), bool)), bool)
++    excl = (~used) & np.isfinite(conc) & np.isfinite(N)
++    have_err = N_err is not None and np.all(np.isfinite(N_err))
++
++    # Shade the trimmed low-/high-C regions.
++    if excl.any() and used.any():
++        lo, hi = float(conc[used].min()), float(conc[used].max())
++        if conc[excl].min() < lo:
++            ax.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0)
++        if conc[excl].max() > hi:
++            ax.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5, zorder=0)
++
++    def _pts(mask, **kw):
++        if not mask.any():
++            return
++        fmt = kw.pop("fmt", "o")
++        if have_err:
++            ax.errorbar(conc[mask], N[mask], yerr=N_err[mask], fmt=fmt,
++                        capsize=3, markersize=5, zorder=3, **kw)
++        else:
++            ax.plot(conc[mask], N[mask], fmt, markersize=5, zorder=3, **kw)
++
++    _pts(used, color="steelblue",
++         label=("data (fit)" if excl.any() else "data"))
++    _pts(excl, color="0.6", markerfacecolor="none", label="excluded")
+ 
+     xline = np.linspace(0, conc.max() * 1.05, 100)
+     ax.plot(xline, result["slope"] * xline, color="tomato", linewidth=1.6,
+@@ -233,6 +436,12 @@ def plot_calibration(result: dict, show: bool = True):
+     if result["veff_um3"] is not None:
+         box.append(f"V_eff = {result['veff_um3']:.4g} µm³")
+     box.append(f"R²    = {result['r2']:.5f}")
++    if np.isfinite(result.get("red_chi2", float("nan"))):
++        qline = (f"   (Q={result['gof_Q']:.2g})"
++                 if np.isfinite(result.get("gof_Q", float("nan"))) else "")
++        box.append(f"χ²_red = {result['red_chi2']:.3g}{qline}")
++    if result.get("n_used") is not None:
++        box.append(f"points used = {result['n_used']}/{result['n_total']}")
+     box.append(f"intercept (free) = {result['intercept']:.3g}")
+     ax.text(0.03, 0.97, "\n".join(box), transform=ax.transAxes,
+             ha="left", va="top", fontsize=9, family="monospace",
+@@ -291,6 +500,38 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
+     L.append(f"  R^2            = {result['r2']:.6f}")
+     L.append(f"  free intercept = {result['intercept']:.6g}   "
+              f"(should be ≈ 0; large values hint at background)")
++    if np.isfinite(result.get("red_chi2", float("nan"))):
++        qtxt = (f"   (GOF Q = {result['gof_Q']:.3g})"
++                if np.isfinite(result.get("gof_Q", float("nan"))) else "")
++        L.append(f"  reduced χ²     = {result['red_chi2']:.4g}{qtxt}")
++    sel = result.get("selection")
++    if result.get("select") == "auto" and sel is not None:
++        L.append("")
++        L.append("Linear-range selection")
++        L.append("-" * 60)
++        L.append(f"metric     : {sel.get('metric')}"
++                 + ("   [fallback: no window met the GOF threshold]"
++                    if sel.get("fallback") else ""))
++        L.append(f"n_min      : {sel.get('n_min')}    "
++                 f"points used: {result['n_used']}/{result['n_total']}")
++        if result["excluded"]:
++            L.append(f"excluded   : {', '.join(result['excluded'])}")
++        tbl = sel.get("table") or []
++        if tbl:
++            best = sel.get("best")
++            L.append("")
++            L.append(f"    {'n':>2}  {'C range':>18}  {'slope':>9}  "
++                     f"{'chi2_red':>9}  {'GOF Q':>8}  {'relErr(s)':>10}")
++            for r in sorted(tbl, key=lambda r: (r["i"], r["j"])):
++                star = " *" if (best is not None and r["i"] == best["i"]
++                                and r["j"] == best["j"]) else "  "
++                q = r["gof_Q"]
++                qs = f"{q:.3g}" if np.isfinite(q) else "—"
++                L.append(f"{star}  {r['n']:>2}  "
++                         f"{r['c_lo']:>8.3g}–{r['c_hi']:<9.3g}  "
++                         f"{r['slope']:>9.4g}  {r['red_chi2']:>9.3g}  "
++                         f"{qs:>8}  {r['veff_err_rel']:>10.3g}")
++            L.append("  (* = selected window)")
+     L.append("")
+     L.append("Points")
+     L.append("-" * 60)
+@@ -300,16 +541,20 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
+         L.append(f"{nm:<24}{result['conc'][i]:>10.4g}{result['N'][i]:>12.4g}{ne:>12.4g}")
+     report_path.write_text("\n".join(L), encoding="utf-8")
+ 
+-    with points_path.open("w", encoding="utf-8", newline="") as fh:
++    used = result.get("used")
++    with points_path.open("w", encoding="utf-8-sig", newline="") as fh:
+         fh.write("# FCS volume calibration points\n")
+         fh.write(f"# unit : {unit}\n")
+         fh.write(f"# C = alpha * <N> ; alpha = {result['alpha']:.6g} {unit}/molecule\n")
+-        fh.write("dataset,concentration,N,N_err,N_fit\n")
++        fh.write(f"# fit uses only rows with used=1 "
++                 f"({result.get('n_used', '?')}/{result.get('n_total', '?')} points)\n")
++        fh.write("dataset,concentration,N,N_err,N_fit,used\n")
+         for i, nm in enumerate(result["names"]):
+             ne = (result["N_err"][i] if result["N_err"] is not None else float("nan"))
+             nfit = result["slope"] * result["conc"][i]
++            u = 1 if (used is None or bool(used[i])) else 0
+             fh.write(f"{nm},{result['conc'][i]:.10g},{result['N'][i]:.10g},"
+-                     f"{ne:.10g},{nfit:.10g}\n")
++                     f"{ne:.10g},{nfit:.10g},{u}\n")
+ 
+     print(f"[calib] wrote {report_path}")
+     print(f"[calib] wrote {points_path}")
+@@ -415,6 +660,21 @@ def run_calibration_dialog(parent=None, init_dir=None):
+         state="normal" if has_err else "disabled",
+     ).pack(fill="x", padx=12, pady=(4, 0))
+ 
++    sel_frame = tk.LabelFrame(win, text="Linear-range selection", padx=12, pady=6)
++    sel_frame.pack(fill="x", padx=12, pady=(8, 0))
++    auto_var = tk.BooleanVar(value=True)
++    tk.Checkbutton(sel_frame, text="Auto-select the linear range",
++                   variable=auto_var, anchor="w").grid(
++        row=0, column=0, columnspan=4, sticky="w")
++    tk.Label(sel_frame, text="metric:").grid(row=1, column=0, sticky="e", pady=(4, 0))
++    metric_var = tk.StringVar(value="veff_err")
++    tk.OptionMenu(sel_frame, metric_var, "veff_err", "gof").grid(
++        row=1, column=1, sticky="w", padx=(4, 12), pady=(4, 0))
++    tk.Label(sel_frame, text="min points:").grid(row=1, column=2, sticky="e", pady=(4, 0))
++    nmin_var = tk.StringVar(value="3")
++    tk.Entry(sel_frame, textvariable=nmin_var, width=5).grid(
++        row=1, column=3, sticky="w", padx=4, pady=(4, 0))
++
+     btns = tk.Frame(win)
+     btns.pack(pady=10)
+ 
+@@ -431,10 +691,16 @@ def run_calibration_dialog(parent=None, init_dir=None):
+                                  "Concentrations must be ≥ 0.", parent=win)
+             return
+         unit = unit_var.get()
++        try:
++            n_min = int(float(nmin_var.get()))
++        except ValueError:
++            n_min = 3
+         try:
+             result = calibrate(names, N, N_err if has_err else None, conc,
+                                unit=unit, use_weights=weight_var.get(),
+-                               corrected=use_corr)
++                               corrected=use_corr,
++                               select=("auto" if auto_var.get() else "none"),
++                               select_metric=metric_var.get(), n_min=n_min)
+         except Exception as e:
+             messagebox.showerror("Calibration failed", str(e), parent=win)
+             return
+@@ -452,7 +718,13 @@ def run_calibration_dialog(parent=None, init_dir=None):
+                f"s = {result['slope']:.4g} ⟨N⟩/{unit}\n")
+         if result["veff_um3"] is not None:
+             msg += f"V_eff = {result['veff_um3']:.4g} µm³\n"
+-        msg += f"R² = {result['r2']:.5f}\n\nSaved to:\n{report_path.parent}"
++        msg += f"R² = {result['r2']:.5f}\n"
++        if result.get("select") == "auto":
++            msg += (f"points used: {result['n_used']}/{result['n_total']}"
++                    f"  (metric: {result.get('select_metric')})\n")
++            if result["excluded"]:
++                msg += f"excluded: {', '.join(result['excluded'])}\n"
++        msg += f"\nSaved to:\n{report_path.parent}"
+         messagebox.showinfo("Calibration complete", msg, parent=parent)
+         #plt.show was the static version; fcs_plottools is dynamic
+         #plt.show()
