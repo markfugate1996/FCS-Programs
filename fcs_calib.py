@@ -288,6 +288,115 @@ def select_linear_subset(conc, N, N_err, use_weights: bool = True,
     return result
 
 
+def _combine_replicates(Nvals, sig) -> dict:
+    """
+    Combine one group of replicate occupancies with the DerSimonian-Laird
+    random-effects estimator (Control Clin Trials 1986;7:177).
+
+    With within-replicate variances σ_i² and fixed-effect weights w_i = 1/σ_i²:
+
+        ybar = Σ w_i y_i / Σ w_i                     (fixed-effect mean)
+        Q    = Σ w_i (y_i - ybar)^2                  (Cochran's Q)
+        τ²   = max{0, (Q-(n-1)) / (Σw_i - Σw_i²/Σw_i)}   (between-replicate var)
+        w*_i = 1 / (σ_i² + τ²)
+        N    = Σ w*_i y_i / Σ w*_i                   (pooled estimate)
+        σ_N  = sqrt(1 / Σ w*_i)                      (its standard error)
+
+    When the replicates agree within their bars (Q <= n-1) τ²=0 and this reduces
+    to the fixed-effect inverse-variance mean.  If a group has no usable
+    intrinsic errors DL is undefined, and the plain mean with standard error
+    s/sqrt(n) is returned instead.
+
+    Returns a dict: N, N_err, sd, tau2, Q, n.
+    """
+    Nvals = np.asarray(Nvals, float)
+    n = int(Nvals.size)
+    sig = (np.asarray(sig, float) if sig is not None else np.full(n, np.nan))
+    fin = np.isfinite(sig) & (sig > 0)
+    sd = float(np.std(Nvals, ddof=1)) if n >= 2 else 0.0
+
+    if n == 1:
+        return {"N": float(Nvals[0]),
+                "N_err": (float(sig[0]) if fin[0] else float("nan")),
+                "sd": 0.0, "tau2": 0.0, "Q": 0.0, "n": 1}
+
+    if fin.all():
+        w = 1.0 / sig ** 2
+        Sw = float(np.sum(w))
+        ybar = float(np.sum(w * Nvals) / Sw)
+        Q = float(np.sum(w * (Nvals - ybar) ** 2))
+        C = Sw - float(np.sum(w ** 2)) / Sw
+        tau2 = max(0.0, (Q - (n - 1)) / C) if C > 0 else 0.0
+        wstar = 1.0 / (sig ** 2 + tau2)
+        Sws = float(np.sum(wstar))
+        return {"N": float(np.sum(wstar * Nvals) / Sws),
+                "N_err": float(np.sqrt(1.0 / Sws)),
+                "sd": sd, "tau2": tau2, "Q": Q, "n": n}
+
+    # No usable intrinsic errors: DL undefined -> plain mean +/- SEM.
+    return {"N": float(np.mean(Nvals)),
+            "N_err": (float(sd / np.sqrt(n)) if n >= 2 else float("nan")),
+            "sd": sd, "tau2": float("nan"), "Q": float("nan"), "n": n}
+
+
+def collapse_replicates(names, N, N_err, conc, rtol: float = 1e-6,
+                        atol: float = 0.0) -> tuple:
+    """
+    Merge points that share the same known concentration into one aggregate
+    point (via :func:`_combine_replicates`), so replicate measurements used to
+    test precision are not treated as independent concentrations by the
+    linear-range finder or the weighted fit.
+
+    Two concentrations are treated as equal when
+    |c_i - c_j| <= atol + rtol*max(|c_i|, |c_j|).  Singletons pass through
+    unchanged.  Groups are returned in first-appearance (workspace) order.
+
+    Returns (names2, N2, N_err2, conc2, groups), where each groups entry is a
+    dict: {conc, members, N, N_err, sd, tau2, Q, n}.
+    """
+    N = np.asarray(N, float)
+    conc = np.asarray(conc, float)
+    have_err = N_err is not None
+    sig_all = (np.asarray(N_err, float) if have_err
+               else np.full(N.shape, np.nan))
+
+    # Cluster by concentration on a sorted axis (single-linkage within tol),
+    # then restore first-appearance order via the earliest member index.
+    order = np.argsort(conc, kind="stable")
+    clusters: List[List[int]] = []
+    for k in order:
+        if clusters and not np.isnan(conc[clusters[-1][-1]]) \
+                and not np.isnan(conc[k]):
+            ref = conc[clusters[-1][-1]]
+            if abs(conc[k] - ref) <= atol + rtol * max(abs(conc[k]), abs(ref)):
+                clusters[-1].append(k)
+                continue
+        clusters.append([k])
+    clusters.sort(key=lambda cl: min(cl))
+
+    names2: List[str] = []
+    N2: List[float] = []
+    Ne2: List[float] = []
+    conc2: List[float] = []
+    groups: List[dict] = []
+    for cl in clusters:
+        idx = np.array(sorted(cl), int)
+        n = int(idx.size)
+        g = _combine_replicates(N[idx], sig_all[idx])
+        members = [names[i] for i in idx]
+        label = members[0] if n == 1 else f"{members[0]} (+{n - 1} rep)"
+        c_agg = float(np.mean(conc[idx]))
+        names2.append(label)
+        N2.append(g["N"])
+        Ne2.append(g["N_err"])
+        conc2.append(c_agg)
+        groups.append({"conc": c_agg, "members": members, **g})
+
+    N_err_out = np.array(Ne2, float) if have_err else None
+    return (names2, np.array(N2, float), N_err_out,
+            np.array(conc2, float), groups)
+
+
 def fit_with_intercept(x, y, yerr=None) -> Tuple[float, float]:
     """Diagnostic free-intercept fit. Returns (slope, intercept)."""
     x = np.asarray(x, float)
@@ -321,6 +430,8 @@ def calibrate(
     unit: str = "nM",
     use_weights: bool = True,
     corrected: bool = False,
+    collapse: bool = True,
+    collapse_rtol: float = 1e-6,
     select: str = "auto",
     select_metric: str = "veff_err",
     n_min: int = 3,
@@ -333,8 +444,16 @@ def calibrate(
     ``corrected`` records whether the supplied <N> is background-corrected
     (for labelling only).
     """
+    n_raw = len(names)
     N = np.asarray(N, float)
     conc = np.asarray(conc, float)
+
+    # ── Collapse replicate concentrations (DerSimonian-Laird) ─────────────────
+    groups = None
+    if collapse:
+        names, N, N_err, conc, groups = collapse_replicates(
+            names, N, N_err, conc, rtol=collapse_rtol)
+
     have_err = (N_err is not None and np.all(np.isfinite(N_err)) and np.all(N_err > 0))
 
     # ── Linear-range selection ────────────────────────────────────────────────
@@ -379,6 +498,7 @@ def calibrate(
         "intercept": intercept, "slope_free": slope_free,
         "veff_um3": veff, "weighted": yeru is not None,
         "corrected": corrected,
+        "groups": groups, "collapsed": bool(collapse), "n_raw": int(n_raw),
         "red_chi2": st["red_chi2"], "gof_Q": st["gof_Q"],
         "slope_err_ext": st["s_err_ext"],
         "select": select,
@@ -532,6 +652,28 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
                          f"{r['slope']:>9.4g}  {r['red_chi2']:>9.3g}  "
                          f"{qs:>8}  {r['veff_err_rel']:>10.3g}")
             L.append("  (* = selected window)")
+    groups = result.get("groups")
+    if result.get("collapsed") and groups and any(g["n"] > 1 for g in groups):
+        L.append("")
+        L.append("Replicate aggregation  (DerSimonian-Laird)")
+        L.append("-" * 60)
+        L.append(f"{result.get('n_raw', '?')} points collapsed to {len(groups)} "
+                 f"by shared concentration")
+        for g in groups:
+            if g["n"] <= 1:
+                continue
+            L.append(f"  {g['conc']:.4g} {unit}   n={g['n']}   "
+                     f"<N> = {g['N']:.4g} ± {g['N_err']:.4g}")
+            if np.isfinite(g.get("Q", float("nan"))):
+                tau = (np.sqrt(g["tau2"]) if np.isfinite(g.get("tau2", np.nan))
+                       else float("nan"))
+                L.append(f"      Q = {g['Q']:.3g} (dof {g['n'] - 1}), "
+                         f"τ² = {g['tau2']:.4g} (τ = {tau:.4g}), "
+                         f"raw SD = {g['sd']:.4g}")
+            else:
+                L.append(f"      plain mean ± SEM (no intrinsic errors), "
+                         f"raw SD = {g['sd']:.4g}")
+            L.append(f"      members: {', '.join(g['members'])}")
     L.append("")
     L.append("Points")
     L.append("-" * 60)
@@ -548,13 +690,15 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
         fh.write(f"# C = alpha * <N> ; alpha = {result['alpha']:.6g} {unit}/molecule\n")
         fh.write(f"# fit uses only rows with used=1 "
                  f"({result.get('n_used', '?')}/{result.get('n_total', '?')} points)\n")
-        fh.write("dataset,concentration,N,N_err,N_fit,used\n")
+        groups = result.get("groups")
+        fh.write("dataset,concentration,N,N_err,N_fit,used,n_rep\n")
         for i, nm in enumerate(result["names"]):
             ne = (result["N_err"][i] if result["N_err"] is not None else float("nan"))
             nfit = result["slope"] * result["conc"][i]
             u = 1 if (used is None or bool(used[i])) else 0
+            nr = groups[i]["n"] if groups else 1
             fh.write(f"{nm},{result['conc'][i]:.10g},{result['N'][i]:.10g},"
-                     f"{ne:.10g},{nfit:.10g},{u}\n")
+                     f"{ne:.10g},{nfit:.10g},{u},{nr}\n")
 
     print(f"[calib] wrote {report_path}")
     print(f"[calib] wrote {points_path}")
@@ -660,6 +804,10 @@ def run_calibration_dialog(parent=None, init_dir=None):
         state="normal" if has_err else "disabled",
     ).pack(fill="x", padx=12, pady=(4, 0))
 
+    collapse_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(win, text="Collapse repeated concentrations (DerSimonian-Laird)",
+                   variable=collapse_var, anchor="w").pack(fill="x", padx=12, pady=(4, 0))
+
     sel_frame = tk.LabelFrame(win, text="Linear-range selection", padx=12, pady=6)
     sel_frame.pack(fill="x", padx=12, pady=(8, 0))
     auto_var = tk.BooleanVar(value=True)
@@ -699,6 +847,7 @@ def run_calibration_dialog(parent=None, init_dir=None):
             result = calibrate(names, N, N_err if has_err else None, conc,
                                unit=unit, use_weights=weight_var.get(),
                                corrected=use_corr,
+                               collapse=collapse_var.get(),
                                select=("auto" if auto_var.get() else "none"),
                                select_metric=metric_var.get(), n_min=n_min)
         except Exception as e:
@@ -719,6 +868,9 @@ def run_calibration_dialog(parent=None, init_dir=None):
         if result["veff_um3"] is not None:
             msg += f"V_eff = {result['veff_um3']:.4g} µm³\n"
         msg += f"R² = {result['r2']:.5f}\n"
+        if result.get("collapsed") and result.get("n_raw") != result.get("n_total"):
+            msg += (f"replicates collapsed: {result['n_raw']} → "
+                    f"{result['n_total']} points\n")
         if result.get("select") == "auto":
             msg += (f"points used: {result['n_used']}/{result['n_total']}"
                     f"  (metric: {result.get('select_metric')})\n")
