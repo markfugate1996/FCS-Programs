@@ -378,53 +378,66 @@ def select_linear_subset(conc, N, N_err, use_weights: bool = True,
 
 def _combine_replicates(Nvals, sig) -> dict:
     """
-    Combine one group of replicate occupancies with the DerSimonian-Laird
-    random-effects estimator (Control Clin Trials 1986;7:177).
+    Combine one group of replicate occupancies with a weighted mean and the
+    two-sided external ("Birge") error.
 
-    With within-replicate variances σ_i² and fixed-effect weights w_i = 1/σ_i²:
+    With within-replicate variances σ_i² and weights w_i = 1/σ_i²:
 
-        ybar = Σ w_i y_i / Σ w_i                     (fixed-effect mean)
-        Q    = Σ w_i (y_i - ybar)^2                  (Cochran's Q)
-        τ²   = max{0, (Q-(n-1)) / (Σw_i - Σw_i²/Σw_i)}   (between-replicate var)
-        w*_i = 1 / (σ_i² + τ²)
-        N    = Σ w*_i y_i / Σ w*_i                   (pooled estimate)
-        σ_N  = sqrt(1 / Σ w*_i)                      (its standard error)
+        ybar     = Σ w_i y_i / Σ w_i                   (weighted mean)
+        Q        = Σ w_i (y_i - ybar)^2                (Cochran's Q)
+        chi2_red = Q / (n - 1)
+        σ_int    = sqrt(1 / Σ w_i)                     (internal error of mean)
+        σ_ext    = σ_int * sqrt(chi2_red)              (external / Birge error)
+        N        = ybar
+        σ_N      = max(σ_ext, s/sqrt(n))               (floored at the raw SEM)
 
-    When the replicates agree within their bars (Q <= n-1) τ²=0 and this reduces
-    to the fixed-effect inverse-variance mean.  If a group has no usable
-    intrinsic errors DL is undefined, and the plain mean with standard error
-    s/sqrt(n) is returned instead.
+    The external error rescales the internal error by the observed scatter: it
+    INFLATES the bar when replicates disagree more than their stated errors
+    (chi2_red > 1) and DEFLATES it when they agree better (chi2_red < 1).  The
+    deflation is the point of this stopgap: while the correlator is noisy the
+    fit-reported N_err is far larger than the replicate reproducibility, so the
+    external error tracks the reproducibility instead of the inflated bar.
 
-    Returns a dict: N, N_err, sd, tau2, Q, n.
+    This supersedes a one-sided random-effects (DerSimonian-Laird) error, which
+    can only inflate and so cannot correct over-large bars.  Caveats: on small n
+    the Birge factor is noisy (hence the SEM floor); a singleton keeps its own
+    error; with no usable intrinsic errors the plain mean ± s/sqrt(n) is used.
+
+    Returns a dict: N, N_err, sd, sig_int, sig_ext, chi2_red, Q, n.
     """
     Nvals = np.asarray(Nvals, float)
     n = int(Nvals.size)
     sig = (np.asarray(sig, float) if sig is not None else np.full(n, np.nan))
     fin = np.isfinite(sig) & (sig > 0)
     sd = float(np.std(Nvals, ddof=1)) if n >= 2 else 0.0
+    nanf = float("nan")
 
     if n == 1:
-        return {"N": float(Nvals[0]),
-                "N_err": (float(sig[0]) if fin[0] else float("nan")),
-                "sd": 0.0, "tau2": 0.0, "Q": 0.0, "n": 1}
+        s0 = float(sig[0]) if fin[0] else nanf
+        return {"N": float(Nvals[0]), "N_err": s0, "sd": 0.0,
+                "sig_int": s0, "sig_ext": s0, "chi2_red": nanf, "Q": nanf, "n": 1}
 
     if fin.all():
         w = 1.0 / sig ** 2
         Sw = float(np.sum(w))
         ybar = float(np.sum(w * Nvals) / Sw)
         Q = float(np.sum(w * (Nvals - ybar) ** 2))
-        C = Sw - float(np.sum(w ** 2)) / Sw
-        tau2 = max(0.0, (Q - (n - 1)) / C) if C > 0 else 0.0
-        wstar = 1.0 / (sig ** 2 + tau2)
-        Sws = float(np.sum(wstar))
-        return {"N": float(np.sum(wstar * Nvals) / Sws),
-                "N_err": float(np.sqrt(1.0 / Sws)),
-                "sd": sd, "tau2": tau2, "Q": Q, "n": n}
+        chi2_red = Q / (n - 1)
+        sig_int = float(np.sqrt(1.0 / Sw))
+        sig_ext = sig_int * float(np.sqrt(chi2_red))
+        sem = sd / np.sqrt(n)
+        sig_N = max(sig_ext, sem)                 # never below the raw SEM
+        if not (sig_N > 0):                       # degenerate: identical reps
+            sig_N = sig_int
+        return {"N": ybar, "N_err": float(sig_N), "sd": sd,
+                "sig_int": sig_int, "sig_ext": float(sig_ext),
+                "chi2_red": float(chi2_red), "Q": Q, "n": n}
 
-    # No usable intrinsic errors: DL undefined -> plain mean +/- SEM.
+    # No usable intrinsic errors: plain mean +/- SEM.
     return {"N": float(np.mean(Nvals)),
-            "N_err": (float(sd / np.sqrt(n)) if n >= 2 else float("nan")),
-            "sd": sd, "tau2": float("nan"), "Q": float("nan"), "n": n}
+            "N_err": (float(sd / np.sqrt(n)) if n >= 2 else nanf),
+            "sd": sd, "sig_int": nanf, "sig_ext": nanf,
+            "chi2_red": nanf, "Q": nanf, "n": n}
 
 
 def collapse_replicates(names, N, N_err, conc, rtol: float = 1e-6,
@@ -440,7 +453,7 @@ def collapse_replicates(names, N, N_err, conc, rtol: float = 1e-6,
     unchanged.  Groups are returned in first-appearance (workspace) order.
 
     Returns (names2, N2, N_err2, conc2, groups), where each groups entry is a
-    dict: {conc, members, N, N_err, sd, tau2, Q, n}.
+    dict: {conc, members, N, N_err, sd, sig_int, sig_ext, chi2_red, Q, n}.
     """
     N = np.asarray(N, float)
     conc = np.asarray(conc, float)
@@ -536,7 +549,7 @@ def calibrate(
     N = np.asarray(N, float)
     conc = np.asarray(conc, float)
 
-    # ── Collapse replicate concentrations (DerSimonian-Laird) ─────────────────
+    # ── Collapse replicate concentrations ─────────────────────────────────────
     groups = None
     if collapse:
         names, N, N_err, conc, groups = collapse_replicates(
@@ -743,7 +756,7 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
     groups = result.get("groups")
     if result.get("collapsed") and groups and any(g["n"] > 1 for g in groups):
         L.append("")
-        L.append("Replicate aggregation  (DerSimonian-Laird)")
+        L.append("Replicate aggregation  (weighted mean, external/Birge error)")
         L.append("-" * 60)
         L.append(f"{result.get('n_raw', '?')} points collapsed to {len(groups)} "
                  f"by shared concentration")
@@ -752,12 +765,11 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
                 continue
             L.append(f"  {g['conc']:.4g} {unit}   n={g['n']}   "
                      f"<N> = {g['N']:.4g} ± {g['N_err']:.4g}")
-            if np.isfinite(g.get("Q", float("nan"))):
-                tau = (np.sqrt(g["tau2"]) if np.isfinite(g.get("tau2", np.nan))
-                       else float("nan"))
+            if np.isfinite(g.get("chi2_red", float("nan"))):
                 L.append(f"      Q = {g['Q']:.3g} (dof {g['n'] - 1}), "
-                         f"τ² = {g['tau2']:.4g} (τ = {tau:.4g}), "
-                         f"raw SD = {g['sd']:.4g}")
+                         f"χ²_red = {g['chi2_red']:.3g};  "
+                         f"err {g['sig_int']:.4g} → {g['N_err']:.4g}  "
+                         f"(raw SD {g['sd']:.4g})")
             else:
                 L.append(f"      plain mean ± SEM (no intrinsic errors), "
                          f"raw SD = {g['sd']:.4g}")
@@ -921,7 +933,7 @@ def run_calibration_dialog(parent=None, init_dir=None):
     ).pack(fill="x", padx=12, pady=(4, 0))
 
     collapse_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(win, text="Collapse repeated concentrations (DerSimonian-Laird)",
+    tk.Checkbutton(win, text="Collapse repeated concentrations",
                    variable=collapse_var, anchor="w").pack(fill="x", padx=12, pady=(4, 0))
 
     sel_frame = tk.LabelFrame(win, text="Linear-range selection", padx=12, pady=6)
