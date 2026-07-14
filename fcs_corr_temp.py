@@ -65,7 +65,7 @@ except ImportError:
     _NUMBA = False
 
 _NUMBA_THRESHOLD = 50_000
-Method = Literal["perbin", "twopointer", "wiener_khinchin", "multitau"]
+Method = Literal["perbin", "twopointer", "wiener_khinchin"]
 
 # ── Segmentation constants ────────────────────────────────────────────────────
 
@@ -813,136 +813,10 @@ _CORR_LABEL = {
     "auto_ch2": "Autocorr Ch2",
     "cross":    "Ch1xCh2",
 }
-def _multitau_curve(a_times, b_times, dt0, m, coarsen, tau_max, T):
-    """One multi-tau pass over a single (sub)trace; returns (tau_s, G)."""
-    nb = int(T / dt0) + 2
-    a = np.bincount((a_times / dt0).astype(np.int64), minlength=nb).astype(np.float64)
-    b = np.bincount((b_times / dt0).astype(np.int64), minlength=nb).astype(np.float64)
-    taus: List[float] = []
-    Gs:   List[float] = []
-    dt = dt0
-    first = True
-    while dt * m <= tau_max and a.size >= 2 * m + 1:
-        k0 = 1 if first else (m // coarsen + 1)
-        for k in range(k0, m + 1):
-            n = a.size - k
-            if n <= 0:
-                continue
-            C  = float(np.dot(a[:n], b[k:k + n]))
-            Sa = float(a[:n].sum())
-            Sb = float(b[k:k + n].sum())
-            Gs.append(C * n / (Sa * Sb) - 1.0 if Sa > 0.0 and Sb > 0.0
-                      else float("nan"))
-            taus.append(k * dt)
-        n_keep = (a.size // coarsen) * coarsen
-        a = a[:n_keep].reshape(-1, coarsen).sum(axis=1)
-        b = b[:n_keep].reshape(-1, coarsen).sum(axis=1)
-        dt *= coarsen
-        first = False
-    order = np.argsort(taus)
-    return np.asarray(taus, float)[order], np.asarray(Gs, float)[order]
-
-
-def compute_multitau(
-    times_a: np.ndarray,
-    times_b: Optional[np.ndarray],
-    base_dt_s: float,
-    tau_max_s: float,
-    m: int = 8,
-    coarsen: int = 8,
-    segment: bool = False,
-    duration_s: Optional[float] = None,
-    progress_cb=None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """
-    Multi-tau correlation on binned intensity with symmetric normalisation.
-
-    The classic Schätzel multi-tau scheme: photons are binned into intensity
-    bins of width ``base_dt_s``; G is evaluated at lags k = 1..m of the current
-    bin width; the intensity is then coarsened by ``coarsen`` and the next
-    octave evaluated, up to ``tau_max_s``.  Symmetric ("delayed-monitor")
-    normalisation is used — the scheme hardware multi-tau correlators (including
-    ISS VistaVision) use — so the output can be compared to theirs directly.
-
-    Because it correlates *binned intensities* it never divides by a continuous
-    log-bin width, so it is immune to the timing-grid normalisation artifact
-    that affects arbitrary log edges (see :func:`build_tau_edges`).
-
-    To reproduce the ISS lag grid, choose ``base_dt_s`` = the ISS base bin
-    (e.g. 1 µs), ``m = 8``, ``coarsen = 8``: lags 1-8 at the base width, then
-    2-8 at 8x, then 2-8 at 64x, and so on.
-
-    Parameters
-    ----------
-    times_a, times_b : np.ndarray
-        Photon arrival times (s).  Pass ``times_b=None`` (or the same array)
-        for an autocorrelation.
-    base_dt_s : float
-        Base intensity-bin width (s) = the shortest lag.
-    tau_max_s : float
-        Largest lag to reach (s).
-    m : int
-        Channels per octave (default 8).
-    coarsen : int
-        Intensity coarsening factor between octaves (default 8).
-    segment : bool
-        If True, split into non-overlapping segments of duration
-        ``_MIN_SEGMENT_FACTOR * tau_max_s`` and return the segment mean and
-        standard deviation; else a single full-trace curve with zero G_std.
-    duration_s : float, optional
-        Measurement duration (s); defaults to the span of the photon times.
-
-    Returns
-    -------
-    (tau_s, G_mean, G_std, n_segs)
-    """
-    if times_b is None:
-        times_b = times_a
-    m = max(2, int(m))
-    coarsen = max(2, int(coarsen))
-    t0 = float(min(times_a[0], times_b[0]))
-    a_all = np.asarray(times_a, float) - t0
-    b_all = np.asarray(times_b, float) - t0
-    T = float(duration_s) if duration_s else float(max(a_all[-1], b_all[-1]))
-
-    if segment:
-        seg_dur = _MIN_SEGMENT_FACTOR * tau_max_s
-        n_segs = max(1, int(T // seg_dur))
-    else:
-        seg_dur = T
-        n_segs = 1
-
-    tau_ref: Optional[np.ndarray] = None
-    rows: List[np.ndarray] = []
-    for s in range(n_segs):
-        lo = s * seg_dur
-        hi = (s + 1) * seg_dur if segment else T
-        aseg = a_all[(a_all >= lo) & (a_all < hi)] - lo
-        bseg = b_all[(b_all >= lo) & (b_all < hi)] - lo
-        if aseg.size >= 2 and bseg.size >= 2:
-            tau, G = _multitau_curve(aseg, bseg, base_dt_s, m, coarsen,
-                                     tau_max_s, hi - lo)
-            if tau_ref is None:
-                tau_ref = tau
-            if tau.size == tau_ref.size:
-                rows.append(G)
-        if progress_cb is not None:
-            progress_cb(s + 1, f"multi-tau segment {s + 1}/{n_segs}")
-
-    if not rows:
-        raise ValueError("Multi-tau produced no valid segments.")
-    stack = np.vstack(rows)
-    G_mean = np.nanmean(stack, axis=0)
-    G_std = (np.nanstd(stack, axis=0, ddof=1) if stack.shape[0] > 1
-             else np.zeros_like(G_mean))
-    return tau_ref, G_mean, G_std, int(stack.shape[0])
-
-
 _METHOD_LABEL = {
     "perbin":          "per-bin searchsorted",
     "twopointer":      "two-pointer (Wahl)",
     "wiener_khinchin": "Wiener–Khinchin",
-    "multitau":        "multi-tau (ISS-style)",
 }
 
 def _cps_meta(n1: int, n2: int, T: float) -> dict:
@@ -1230,19 +1104,13 @@ def compute_correlation_for(
 
     tau_min_s = float(params["tau_min_ms"]) * 1e-3
     tau_max_s = float(params["tau_max_ms"]) * 1e-3
-    is_multitau = (method == "multitau")
-    mt_m        = max(2, int(params.get("mt_channels", 8)))
-    mt_coarsen  = max(2, int(params.get("mt_coarsen", 8)))
-    if is_multitau:
-        tau_edges, n_bins = None, 0
-    else:
-        try:
-            tau_edges = build_tau_edges(tau_min_s, tau_max_s, ppd,
-                                        grid_period_s=fcs_data.macrotime_period_s)
-        except ValueError as e:
-            messagebox.showerror("Invalid range", str(e), parent=parent)
-            return None
-        n_bins = len(tau_edges) - 1
+    try:
+        tau_edges = build_tau_edges(tau_min_s, tau_max_s, ppd,
+                                    grid_period_s=fcs_data.macrotime_period_s)
+    except ValueError as e:
+        messagebox.showerror("Invalid range", str(e), parent=parent)
+        return None
+    n_bins = len(tau_edges) - 1
 
     # ── Photon stream selection (with optional, file-specific gating) ─────────
     times_ch1 = fcs_data.ch1_times_s
@@ -1281,14 +1149,13 @@ def compute_correlation_for(
         n_segs0  = max(1, int(fcs_data.duration_s // seg_dur))
     else:
         n_segs0 = 1
-    if is_multitau:
-        total_steps = n_segs0
-    elif method == "perbin":
+    if method == "perbin":
         total_steps = n_segs0 * n_bins
     else:
         N_per_seg   = max(1, N // n_segs0)
         total_steps = n_segs0 * max(1, (N_per_seg + _TP_CHUNK_SIZE - 1)
                                        // _TP_CHUNK_SIZE)
+
     # ── Optional per-file progress window (fully guarded) ────────────────────
     pw = None
     progress_cb = None
@@ -1310,18 +1177,7 @@ def compute_correlation_for(
             progress_cb = None
 
     try:
-        if is_multitau:
-            if corr_type == "cross":
-                _a, _b = times_ch1, times_ch2
-            elif corr_type == "auto_ch1":
-                _a = _b = times_ch1
-            else:
-                _a = _b = times_ch2
-            tau, G_mean, G_std, n_segs = compute_multitau(
-                _a, _b, tau_min_s, tau_max_s, m=mt_m, coarsen=mt_coarsen,
-                segment=segment, duration_s=fcs_data.duration_s,
-                progress_cb=progress_cb)
-        elif corr_type == "cross":
+        if corr_type == "cross":
             tau, G_mean, G_std, n_segs = compute_crosscorr_symmetric(
                 times_ch1, times_ch2, tau_edges, method, segment,
                 progress_cb=progress_cb)                                                                                                       
@@ -1475,8 +1331,6 @@ _defaults: dict = {
     "gate":             False,
     "points_per_decade": _POINTS_PER_DECADE,
     "thin_factor":      1,
-    "mt_channels":      8,
-    "mt_coarsen":       8,
 }
 
 
@@ -1678,21 +1532,6 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
                    variable=method_var, value="wiener_khinchin",
                    anchor="w", state="disabled", fg="grey").pack(fill="x")
 
-    tk.Radiobutton(method_frame,
-                   text="Multi-tau  (binned intensity; for ISS comparison)",
-                   variable=method_var, value="multitau",
-                   anchor="w").pack(fill="x")
-    mt_row = tk.Frame(method_frame)
-    mt_row.pack(fill="x", padx=(22, 0))
-    tk.Label(mt_row, text="channels/octave:").pack(side="left")
-    mt_m_var = tk.StringVar(value=str(_defaults.get("mt_channels", 8)))
-    tk.Entry(mt_row, textvariable=mt_m_var, width=4).pack(side="left", padx=(3, 10))
-    tk.Label(mt_row, text="coarsen ×:").pack(side="left")
-    mt_coarsen_var = tk.StringVar(value=str(_defaults.get("mt_coarsen", 8)))
-    tk.Entry(mt_row, textvariable=mt_coarsen_var, width=4).pack(side="left", padx=3)
-    tk.Label(mt_row, text="(8 / 8 with tau_min = 1 µs matches ISS)",
-             font=("Helvetica", 8), fg="grey").pack(side="left", padx=8)
-
     # Info label: estimated computation time
     time_est_var = tk.StringVar(value="")
     time_est_label = tk.Label(method_frame, textvariable=time_est_var,
@@ -1771,12 +1610,6 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         method    = method_var.get()
         segment   = segment_var.get()
         use_gate  = gate_var.get()
-        is_multitau = (method == "multitau")
-        try:
-            mt_m       = max(2, int(mt_m_var.get()))
-            mt_coarsen = max(2, int(mt_coarsen_var.get()))
-        except (ValueError, tk.TclError):
-            mt_m, mt_coarsen = 8, 8
 
         # Slow-path warning for two-pointer without numba (single-file only)
         if (not collect_only) and method == "twopointer" and not _NUMBA:
@@ -1820,8 +1653,6 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         _defaults["gate"]              = use_gate
         _defaults["points_per_decade"] = ppd
         _defaults["thin_factor"]       = thin_factor
-        _defaults["mt_channels"]       = mt_m
-        _defaults["mt_coarsen"]        = mt_coarsen
 
         # ── Batch / collect-only mode ────────────────────────────────────────
         # When called by the multi-file batch path, just hand back the chosen
@@ -1837,8 +1668,6 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
                 "gate":              use_gate,
                 "points_per_decade": ppd,
                 "thin_factor":       thin_factor,
-                "mt_channels":       mt_m,
-                "mt_coarsen":        mt_coarsen,
             }
             dialog.destroy()
             return
@@ -1846,12 +1675,9 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         dialog.destroy()
 
         tau_min_s = tau_min_ms * 1e-3
-        if is_multitau:
-            tau_edges, n_bins = None, 0
-        else:
-            tau_edges = build_tau_edges(tau_min_s, tau_max_s, ppd,
-                                        grid_period_s=fcs_data.macrotime_period_s)
-            n_bins    = len(tau_edges) - 1
+        tau_edges = build_tau_edges(tau_min_s, tau_max_s, ppd,
+                                    grid_period_s=fcs_data.macrotime_period_s)
+        n_bins    = len(tau_edges) - 1
 
         # ── Photon stream selection (with optional gating) ───────────────────
         times_ch1 = fcs_data.ch1_times_s
@@ -1891,9 +1717,7 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         else:
             n_segs = 1
 
-        if is_multitau:
-            total_steps = n_segs
-        elif method == "perbin":
+        if method == "perbin":
             total_steps = n_segs * n_bins
         else:
             N_per_seg   = max(1, N // n_segs)
@@ -1917,18 +1741,7 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
             pw.step(completed, label)
 
         try:
-            if is_multitau:
-                if corr_type == "cross":
-                    _a, _b = times_ch1, times_ch2
-                elif corr_type == "auto_ch1":
-                    _a = _b = times_ch1
-                else:
-                    _a = _b = times_ch2
-                tau, G_mean, G_std, n_segs = compute_multitau(
-                    _a, _b, tau_min_s, tau_max_s, m=mt_m, coarsen=mt_coarsen,
-                    segment=segment, duration_s=fcs_data.duration_s,
-                    progress_cb=_progress)
-            elif corr_type == "cross":
+            if corr_type == "cross":
                 tau, G_mean, G_std, n_segs = compute_crosscorr(
                     times_ch1, times_ch2, tau_edges, method, segment,
                     progress_cb=_progress)
@@ -1989,23 +1802,17 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
         print("Usage: python fcs_corr.py <file.fcs> [tau_min_ms] [tau_max_ms] [method]")
-        print("  method: perbin (default) | twopointer | multitau")
+        print("  method: perbin (default) | twopointer")
         sys.exit(1)
     d    = read_fcs(sys.argv[1])
     tmin = float(sys.argv[2]) if len(sys.argv) > 2 else _defaults["tau_min_ms"]
     tmax = float(sys.argv[3]) if len(sys.argv) > 3 else _defaults["tau_max_ms"]
     meth = sys.argv[4]        if len(sys.argv) > 4 else "perbin"
 
-    if meth == "multitau":
-        tau, G_mean, G_std, n_segs = compute_multitau(
-            d.ch1_times_s, d.ch2_times_s, tmin * 1e-3, tmax * 1e-3,
-            m=_defaults["mt_channels"], coarsen=_defaults["mt_coarsen"],
-            duration_s=d.duration_s)
-    else:
-        edges = build_tau_edges(tmin * 1e-3, tmax * 1e-3,
-                                grid_period_s=d.macrotime_period_s)
-        tau, G_mean, G_std, n_segs = compute_crosscorr(
-            d.ch1_times_s, d.ch2_times_s, edges, meth)
+    edges = build_tau_edges(tmin * 1e-3, tmax * 1e-3,
+                            grid_period_s=d.macrotime_period_s)
+    tau, G_mean, G_std, n_segs = compute_crosscorr(
+        d.ch1_times_s, d.ch2_times_s, edges, meth)
     print(f"Segments used: {n_segs}")
     plot_correlation(tau, G_mean, G_std, "cross", d,
                      tmin * 1e-3, tmax * 1e-3, n_segs, method=meth)
