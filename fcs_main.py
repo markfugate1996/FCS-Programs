@@ -803,10 +803,15 @@ def task_model():
     Photon data (.fcs) → the correlation / lifetime / PCH chooser in fcs_fit.
     Lifetime decays (.ifx) → a tail-fit vs IRF-reconvolution chooser, since
     correlation and PCH need photon records an .ifx file does not carry.
+    No active file → the same chooser with only Correlation enabled.  Saved
+    correlation CSVs carry their own metadata, so modelling them needs no .fcs
+    in the workspace — which matters because the .fcs originals are far larger
+    than the exported curves and often are not the copy you have to hand.
+
     """
     d = _active_data()
     if d is None:
-        _no_active_file_warning()
+        fcs_fit.run_model_dialog(None, parent=root)
         return
     if getattr(d, "kind", None) == "lifetime_decay":
         _lifetime_method_dialog(d)
