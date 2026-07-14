@@ -40,6 +40,7 @@ Public API
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal, Optional, Tuple, List
 
 import numpy as np
@@ -71,6 +72,11 @@ Method = Literal["perbin", "twopointer", "wiener_khinchin"]
 # Minimum segment duration as a multiple of tau_max.
 # Below this, the long-lag bins within a segment are poorly sampled.
 _MIN_SEGMENT_FACTOR = 10
+
+# Photon arrival times are quantised to the macrotime (laser) period, so lag
+# times below a few grid periods cannot be resolved without the microtime.
+# Warn when the requested tau_min comes within this many periods of the grid.
+_GRID_WARN_FACTOR = 10
 
 # Warn the user when fewer than this many segments are available.
 _MIN_SEGMENTS = 5
@@ -245,6 +251,7 @@ def build_tau_edges(
     tau_min_s: float,
     tau_max_s: float,
     points_per_decade: int = _POINTS_PER_DECADE,
+    grid_period_s: Optional[float] = None,
 ) -> np.ndarray:
     """
     Build a log-spaced array of lag bin edges.
@@ -260,6 +267,20 @@ def build_tau_edges(
           20  — full resolution (default)
           10  — half the bins; adequate for fitting standard models
            5  — coarse; useful for a quick preview
+    grid_period_s : float, optional
+        Photon-timing grid period in seconds — the macrotime (laser) period.
+        When supplied, every bin edge is snapped to the nearest multiple of this
+        period so each bin spans a whole number of timing-grid points.  This is
+        required for correct normalisation: arrival times are quantised to the
+        macrotime grid, so pair lags fall only on that grid.  Log edges that
+        land between grid points make the continuous bin width disagree with the
+        true number of lag points in the bin, injecting a systematic,
+        reproducible per-bin bias into G(τ) (identical in auto- and
+        cross-correlation, and large enough at short lag to drive G negative).
+        Snapping removes it, because the bin width then equals n_grid·period
+        exactly and the existing normalisation is correct.  Edges that collapse
+        onto the same grid point are merged, so the shortest bins are never
+        narrower than one period.
 
     Returns
     -------
@@ -273,7 +294,31 @@ def build_tau_edges(
     log_min = np.log10(tau_min_s)
     log_max = np.log10(tau_max_s)
     n = max(10, int(round((log_max - log_min) * ppd)) + 1)
-    return np.logspace(log_min, log_max, n)
+    edges = np.logspace(log_min, log_max, n)
+
+    if grid_period_s and grid_period_s > 0:
+        if tau_min_s < _GRID_WARN_FACTOR * grid_period_s:
+            warnings.warn(
+                f"tau_min ({tau_min_s * 1e9:.1f} ns) is within "
+                f"{_GRID_WARN_FACTOR}x the photon-timing grid period "
+                f"({grid_period_s * 1e9:.1f} ns). Lags below "
+                f"~{_GRID_WARN_FACTOR * grid_period_s * 1e9:.0f} ns cannot be "
+                f"resolved without microtime; the shortest bins are unreliable.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        # Snap every edge onto the timing grid; merge any that collapse so no
+        # bin is narrower than one period.
+        edges = np.round(edges / grid_period_s) * grid_period_s
+        edges = np.unique(edges)
+        edges = edges[edges >= grid_period_s]
+        if edges.size < 2:
+            raise ValueError(
+                "After snapping to the timing grid, fewer than two edges "
+                "remain; increase tau_max (or tau_min) relative to the grid "
+                f"period ({grid_period_s * 1e9:.1f} ns)."
+            )
+    return edges
 
 
 def thin_photons(times_s: np.ndarray, keep_every: int) -> np.ndarray:
@@ -1060,7 +1105,8 @@ def compute_correlation_for(
     tau_min_s = float(params["tau_min_ms"]) * 1e-3
     tau_max_s = float(params["tau_max_ms"]) * 1e-3
     try:
-        tau_edges = build_tau_edges(tau_min_s, tau_max_s, ppd)
+        tau_edges = build_tau_edges(tau_min_s, tau_max_s, ppd,
+                                    grid_period_s=fcs_data.macrotime_period_s)
     except ValueError as e:
         messagebox.showerror("Invalid range", str(e), parent=parent)
         return None
@@ -1421,7 +1467,11 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
             tau_max_s_ = float(max_var.get()) * 1e-3
             tau_min_s_ = float(min_var.get()) * 1e-3
             ppd        = max(2, int(ppd_var.get()))
-            edges_     = build_tau_edges(tau_min_s_, tau_max_s_, ppd)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                edges_ = build_tau_edges(
+                    tau_min_s_, tau_max_s_, ppd,
+                    grid_period_s=fcs_data.macrotime_period_s)
             ppd_n_var.set(f"→ {len(edges_) - 1} bins total")
         except (ValueError, tk.TclError):
             ppd_n_var.set("")
@@ -1494,7 +1544,11 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
             tau_max_s  = float(max_var.get()) * 1e-3
             tau_min_s  = float(min_var.get()) * 1e-3
             ppd        = max(2, int(ppd_var.get()))
-            tau_edges_ = build_tau_edges(tau_min_s, tau_max_s, ppd)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tau_edges_ = build_tau_edges(
+                    tau_min_s, tau_max_s, ppd,
+                    grid_period_s=fcs_data.macrotime_period_s)
             n_bins     = len(tau_edges_) - 1
             method     = method_var.get()
             if method == "wiener_khinchin":
@@ -1621,7 +1675,8 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         dialog.destroy()
 
         tau_min_s = tau_min_ms * 1e-3
-        tau_edges = build_tau_edges(tau_min_s, tau_max_s, ppd)
+        tau_edges = build_tau_edges(tau_min_s, tau_max_s, ppd,
+                                    grid_period_s=fcs_data.macrotime_period_s)
         n_bins    = len(tau_edges) - 1
 
         # ── Photon stream selection (with optional gating) ───────────────────
@@ -1754,7 +1809,8 @@ if __name__ == "__main__":
     tmax = float(sys.argv[3]) if len(sys.argv) > 3 else _defaults["tau_max_ms"]
     meth = sys.argv[4]        if len(sys.argv) > 4 else "perbin"
 
-    edges = build_tau_edges(tmin * 1e-3, tmax * 1e-3)
+    edges = build_tau_edges(tmin * 1e-3, tmax * 1e-3,
+                            grid_period_s=d.macrotime_period_s)
     tau, G_mean, G_std, n_segs = compute_crosscorr(
         d.ch1_times_s, d.ch2_times_s, edges, meth)
     print(f"Segments used: {n_segs}")
