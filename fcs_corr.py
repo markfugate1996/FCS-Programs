@@ -3,14 +3,31 @@ fcs_corr.py
 ===========
 Fluorescence Correlation Spectroscopy — correlation functions.
 
-Segmented estimation
---------------------
-The primary computation path divides the photon stream into the maximum
-number of non-overlapping segments whose duration is at least
-_MIN_SEGMENT_FACTOR × tau_max.  Each segment yields an independent G(τ)
-curve; the mean is reported as the correlation and the standard deviation
-as the uncertainty.  A warning is issued when fewer than _MIN_SEGMENTS
-segments are available, since the std estimate becomes unreliable.
+Segment-and-average uncertainty
+-------------------------------
+Segment-and-average is the primary way error bars (G_std) are determined,
+and is on by default.  The photon stream is divided into fixed-duration
+segments of _SEGMENT_DURATION_S (default 1 s).  Any trailing remainder is
+absorbed into the final segment, which is therefore between 1x and 2x the
+nominal duration — no short segment is ever produced, so a stub tail cannot
+contaminate the statistics.
+
+Each segment yields an independent G(τ).  The reported uncertainty is the
+STANDARD ERROR of that ensemble,
+
+    G_std = std(G_segments, ddof=1) / sqrt(n_segs)
+
+i.e. the uncertainty on the reported curve — which is what a fit weight
+needs — not the population spread of a single segment.
+
+By default the reported G(τ) itself is estimated from the FULL trace
+(full_trace_G=True), with the segments used only for G_std; this avoids the
+boundary effects of cutting the stream, at the cost of one extra pass.  Set
+full_trace_G=False to report the mean of the segment curves instead.
+
+Because a segment of duration D only supports lags well below D, a 1 s
+segment gives trustworthy statistics out to roughly 100 ms.  G_std is
+allowed to grow honestly beyond that rather than being capped.
 
 Three computation backends
 --------------------------
@@ -24,13 +41,26 @@ Three computation backends
 
   "wiener_khinchin" Not yet implemented — placeholder in dialog.
 
+Cross-correlation symmetry
+--------------------------
+ALL cross-correlations are symmetrised: G(τ) = ½[G_AB(τ) + G_BA(τ)], matching
+the (Ch1×Ch2 + Ch2×Ch1)/2 convention of ISS VistaVision.  The estimator itself
+is directed, so symmetrisation is a deliberate, explicit step -- performed
+WITHIN each segment, so the across-segment scatter measures the symmetrised
+quantity that is actually reported.
+
 Public API
 ----------
+    segment_bounds(t_start, t_end, seg_duration_s)  -> list[(lo, hi)]
     compute_segmented(timesA_s, timesB_s,
                       tau_edges, method)            -> (tau, G_mean, G_std, n_seg)
     compute_crosscorr(timesA_s, timesB_s,
                       tau_edges, method)            -> (tau, G_mean, G_std, n_seg)
+    compute_crosscorr_symmetric(timesA_s, timesB_s,
+                      tau_edges, method)            -> (tau, G_mean, G_std, n_seg)
     compute_autocorr(times_s, tau_edges, method)   -> (tau, G_mean, G_std, n_seg)
+    multitau_lag_grid(dt0, m, coarsen, tau_max)     -> np.ndarray
+    compute_multitau(times_a, times_b, ...)         -> (tau, G_mean, G_std, n_seg)
     build_tau_edges(tau_min_s, tau_max_s)           -> np.ndarray
     plot_correlation(tau, G_mean, G_std, ...)       -> (fig, ax)
     compute_correlation_for(fcs_data, params)       -> result dict | None
@@ -64,10 +94,46 @@ except ImportError:
         return lambda f: f
     _NUMBA = False
 
+# ── Optional multipletau ──────────────────────────────────────────────────────
+# The multipletau package (Paul Mueller, BSD-3) provides the reference
+# implementation of the Schaetzel multiple-tau algorithm.  It is an optional
+# dependency: if it is missing the "multitau_pkg" method is disabled in the
+# dialog and everything else still runs.
+#
+#   pip install multipletau
+#
+# Verified behaviour of multipletau 0.4.1 (measured, not assumed):
+#   * correlate()/autocorrelate() consume BINNED INTENSITY, not arrival times.
+#   * The lag grid is hard-wired base-2 (measured successive-lag ratio 2.000);
+#     there is no coarsening-factor parameter.  This is why the in-house
+#     compute_multitau (arbitrary `coarsen`, for ISS-grid matching) is kept
+#     alongside rather than replaced.
+#   * `m` = points per octave; level 0 emits lags 0..m, each later octave
+#     emits m/2+1..m at twice the spacing.  m must be an even integer.
+#   * normalize=True ALREADY subtracts the 1: G decays to 0 at large lag,
+#     matching this suite's baseline-0 convention.  Do NOT subtract again.
+#   * Only the positive direction is computed; swap the inputs for the
+#     reverse.  Symmetrisation is therefore ours to do (see `symmetric`).
+#   * The tau=0 row carries the shot-noise spike (G(0) = 1/<k> for a Poisson
+#     trace, ~2000x the neighbouring lags) and is dropped.
+
+try:
+    import multipletau as _multipletau
+    _MULTIPLETAU = True
+except ImportError:
+    _multipletau = None
+    _MULTIPLETAU = False
+
 _NUMBA_THRESHOLD = 50_000
-Method = Literal["perbin", "twopointer", "wiener_khinchin", "multitau"]
+Method = Literal["perbin", "twopointer", "wiener_khinchin",
+                 "multitau", "multitau_pkg"]
 
 # ── Segmentation constants ────────────────────────────────────────────────────
+
+# Default segment duration (s) for the segment-and-average error estimate.
+# The stream is cut into fixed-length segments of this duration; the trailing
+# remainder is absorbed into the final segment rather than forming a short one.
+_SEGMENT_DURATION_S = 1.0
 
 # Minimum segment duration as a multiple of tau_max.
 # Below this, the long-lag bins within a segment are poorly sampled.
@@ -590,6 +656,48 @@ def _normalize(
     return G
 
 
+# ── Segmentation (core) ───────────────────────────────────────────────────────
+
+def segment_bounds(
+    t_start: float,
+    t_end: float,
+    seg_duration_s: float = _SEGMENT_DURATION_S,
+) -> List[Tuple[float, float]]:
+    """
+    Split the span [t_start, t_end) into fixed-duration segments.
+
+    Every segment is exactly *seg_duration_s* long except the final one, which
+    absorbs the remainder and is therefore between 1x and 2x seg_duration_s.
+    No segment is ever shorter than seg_duration_s, so a short trailing tail
+    can never produce a photon-starved G(tau) that would corrupt the across-
+    segment statistics.
+
+    If the span is shorter than one segment, a single segment covering the
+    whole span is returned (the caller is responsible for deciding whether a
+    lone segment is enough to quote an uncertainty).
+
+    Returns
+    -------
+    list of (lo, hi) bounds in seconds; always at least one entry.
+    """
+    total = float(t_end) - float(t_start)
+    if total <= 0:
+        raise ValueError("Empty time span; cannot segment.")
+    if seg_duration_s <= 0:
+        raise ValueError("Segment duration must be positive.")
+
+    n = int(total // seg_duration_s)
+    if n < 1:
+        return [(float(t_start), float(t_end))]
+
+    bounds = [(t_start + k * seg_duration_s,
+               t_start + (k + 1) * seg_duration_s)
+              for k in range(n - 1)]
+    # Final segment runs to t_end, absorbing the remainder.
+    bounds.append((t_start + (n - 1) * seg_duration_s, float(t_end)))
+    return bounds
+
+
 # ── Segmented computation (core) ──────────────────────────────────────────────
 
 def compute_segmented(
@@ -597,21 +705,43 @@ def compute_segmented(
     timesB_s: np.ndarray,
     tau_edges: np.ndarray,
     method: Method = "perbin",
-    segment: bool = False,
+    segment: bool = True,
     progress_cb=None,
+    *,
+    seg_duration_s: float = _SEGMENT_DURATION_S,
+    full_trace_G: bool = True,
+    symmetric: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
-    Compute a cross-correlation, optionally with per-segment uncertainty.
+    Correlate, using segment-and-average for the uncertainty.
 
-    When segment=False (default), the full photon streams are correlated
-    in one pass.  G_std is all-NaN and n_segs=1, so plot_correlation
-    draws only the black dots with no grey uncertainty lines.
+    Segment-and-average is the primary uncertainty estimator.  The stream is
+    cut into fixed-duration segments (see :func:`segment_bounds`); each yields
+    an independent G(tau).  The scatter across those independent estimates is
+    the empirical uncertainty of the mean:
 
-    When segment=True, the streams are divided into the maximum number of
-    non-overlapping segments of duration >= _MIN_SEGMENT_FACTOR x tau_max.
-    Each segment yields an independent G(tau); the mean and standard
-    deviation across segments are returned.  Retained for future use but
-    should be interpreted with caution -- see module docstring.
+        G_std = std(G_segments, ddof=1) / sqrt(n_segs)
+
+    i.e. the *standard error*, not the population standard deviation -- it is
+    the uncertainty on the reported curve, which is what a fit weight needs.
+
+    The reported curve itself depends on *full_trace_G*:
+
+      full_trace_G=True (default)
+          G is estimated once from the whole stream; the segments are used
+          only to derive G_std.  Avoids the boundary effects of cutting the
+          stream (pairs spanning a segment edge are lost from every segment),
+          at the cost of one extra correlation pass.
+
+      full_trace_G=False
+          G is the mean of the per-segment curves.  Cheaper (no extra pass)
+          and G_std is then exactly the standard error of the reported mean,
+          but long-lag bins are biased low by the lost boundary-spanning
+          pairs.
+
+    Note that with full_trace_G=True the reported G and the quoted G_std come
+    from slightly different estimators; the std is a faithful measure of the
+    run-to-run scatter of a segment-length estimate, rescaled to the mean.
 
     For autocorrelation, pass the same array for both timesA_s and timesB_s.
 
@@ -624,69 +754,98 @@ def compute_segmented(
     method : Method
         Computation backend.
     segment : bool
-        If False (default), correlate the full dataset as one block.
-        If True, segment and return mean +/- std across segments.
+        If True (default), segment and return the standard error in G_std.
+        If False, correlate the full stream in one pass; G_std is all-NaN.
+    seg_duration_s : float
+        Segment duration in seconds.
+    full_trace_G : bool
+        See above.  Ignored when segment=False (the full trace is the only
+        estimate available).
+    symmetric : bool
+        If True, each segment reports 0.5 * (G_AB + G_BA) -- the symmetrised
+        cross-correlation -- so the across-segment scatter is measured on the
+        same quantity that is reported.  See
+        :func:`compute_crosscorr_symmetric`.
     progress_cb : callable(completed: int, label: str) | None
-        Optional progress callback.  Called after each unit of work with:
-          completed — number of steps done so far (out of total_steps)
-          label     — human-readable status string
-        The total number of steps is:
-          • segment=False, perbin:      n_bins
-          • segment=False, twopointer:  ceil(N / _TP_CHUNK_SIZE)
-          • segment=True,  perbin:      n_segs × n_bins
-          • segment=True,  twopointer:  n_segs × ceil(N_seg / _TP_CHUNK_SIZE)
+        Optional progress callback.
 
     Returns
     -------
     tau    : np.ndarray -- bin centre lag times (seconds)
     G_mean : np.ndarray -- G(tau), baseline 0
-    G_std  : np.ndarray -- std across segments, or all-NaN if segment=False
-    n_segs : int        -- number of segments used (1 if segment=False)
+    G_std  : np.ndarray -- standard error across segments; all-NaN when
+                           segment=False or when only one segment exists
+    n_segs : int        -- number of segments contributing to G_std
     """
-    tau = 0.5 * (tau_edges[:-1] + tau_edges[1:])
+    tau    = 0.5 * (tau_edges[:-1] + tau_edges[1:])
+    n_bins = len(tau_edges) - 1
 
-    if not segment:
-        # Full-dataset path
-        t_start = max(timesA_s[0], timesB_s[0])
-        t_end   = min(timesA_s[-1], timesB_s[-1])
-        maskA   = (timesA_s >= t_start) & (timesA_s <= t_end)
-        maskB   = (timesB_s >= t_start) & (timesB_s <= t_end)
-        segA    = timesA_s[maskA] - t_start
-        segB    = timesB_s[maskB] - t_start
-        counts  = _correlate(segA, segB, tau_edges, method, progress_cb, 0)
-        G_mean  = _normalize(counts, segA, segB, tau_edges)
-        G_std   = np.full_like(G_mean, np.nan)
-        return tau, G_mean, G_std, 1
-
-    # Segmented path
-    tau_max        = tau_edges[-1]
-    n_bins         = len(tau_edges) - 1
-    seg_duration_s = _MIN_SEGMENT_FACTOR * tau_max
     t_start = max(timesA_s[0], timesB_s[0])
     t_end   = min(timesA_s[-1], timesB_s[-1])
-    total   = t_end - t_start
-    n_segs  = max(1, int(total // seg_duration_s))
 
-    # Pre-compute step size per segment for the progress offset
+    # Steps reported by ONE directed pass over one segment.  Symmetrisation
+    # runs two such passes, so a symmetric segment reports twice this.  The
+    # dialog's progress budget must use the same arithmetic or the bar will
+    # either strand short of 100% or overshoot.
     if method == "perbin":
-        steps_per_seg = n_bins
+        steps_per_pass = n_bins
     else:
-        # Approximate photons per segment (used to size chunk count)
-        avg_N_seg = max(len(timesA_s), len(timesB_s)) // n_segs
-        steps_per_seg = max(1, (avg_N_seg + _TP_CHUNK_SIZE - 1) // _TP_CHUNK_SIZE)
+        n_segs_guess = max(1, len(segment_bounds(t_start, t_end,
+                                                 seg_duration_s))) if segment else 1
+        avg_N_seg = max(len(timesA_s), len(timesB_s)) // n_segs_guess
+        steps_per_pass = max(1, (avg_N_seg + _TP_CHUNK_SIZE - 1)
+                                // _TP_CHUNK_SIZE)
+    steps_per_seg = steps_per_pass * (2 if symmetric else 1)
+
+    def _curve(segA, segB, cb):
+        """G(tau) for one (sub)trace, symmetrised if requested."""
+        counts = _correlate(segA, segB, tau_edges, method, cb, 0)
+        G_ab   = _normalize(counts, segA, segB, tau_edges)
+        if not symmetric:
+            return G_ab
+        # Reverse direction B->A on the SAME photons.  Symmetrising inside the
+        # segment means the across-segment scatter is measured on the reported
+        # quantity directly -- no assumption that the two directions are
+        # independent estimates (they are not; they are the same photons read
+        # both ways).
+        rev_cb = None
+        if cb is not None:
+            def rev_cb(completed, label, _off=steps_per_pass):
+                cb(_off + completed, label)
+        counts_ba = _correlate(segB, segA, tau_edges, method, rev_cb, 0)
+        G_ba      = _normalize(counts_ba, segB, segA, tau_edges)
+        return 0.5 * (G_ab + G_ba)
+
+    def _full_trace(cb):
+        maskA = (timesA_s >= t_start) & (timesA_s <= t_end)
+        maskB = (timesB_s >= t_start) & (timesB_s <= t_end)
+        return _curve(timesA_s[maskA] - t_start,
+                      timesB_s[maskB] - t_start, cb)
+
+    # ── Unsegmented path ─────────────────────────────────────────────────────
+    if not segment:
+        G_mean = _full_trace(progress_cb)
+        return tau, G_mean, np.full_like(G_mean, np.nan), 1
+
+    # ── Segmented path ───────────────────────────────────────────────────────
+    bounds = segment_bounds(t_start, t_end, seg_duration_s)
+    n_segs = len(bounds)
 
     G_segments = []
-    for k in range(n_segs):
-        lo = t_start + k * seg_duration_s
-        hi = lo + seg_duration_s
+    for k, (lo, hi) in enumerate(bounds):
         maskA = (timesA_s >= lo) & (timesA_s < hi)
         maskB = (timesB_s >= lo) & (timesB_s < hi)
         segA  = timesA_s[maskA] - lo
         segB  = timesB_s[maskB] - lo
         if len(segA) < 2 or len(segB) < 2:
+            warnings.warn(
+                f"Segment {k + 1}/{n_segs} ({lo:.3g}-{hi:.3g} s) has too few "
+                f"photons (Ch1 {len(segA)}, Ch2 {len(segB)}) and was skipped; "
+                f"the quoted uncertainty is based on the remaining segments.",
+                RuntimeWarning,
+            )
             continue
 
-        # Wrap progress_cb to inject the segment label prefix
         seg_cb = None
         if progress_cb is not None:
             offset = k * steps_per_seg
@@ -696,20 +855,37 @@ def compute_segmented(
                     f"Segment {_k + 1} / {_n}  —  {label}",
                 )
 
-        counts = _correlate(segA, segB, tau_edges, method, seg_cb, 0)
-        G_segments.append(_normalize(counts, segA, segB, tau_edges))
+        G_segments.append(_curve(segA, segB, seg_cb))
 
     if not G_segments:
         raise ValueError(
             "No valid segments could be computed.  "
-            "The dataset may be too short relative to tau_max."
+            "The dataset may be too short, or the segment duration too small."
         )
 
     G_stack = np.array(G_segments)
     n_valid = len(G_stack)
-    G_mean  = np.nanmean(G_stack, axis=0)
-    G_std   = np.nanstd(G_stack, axis=0, ddof=1) if n_valid > 1 \
-              else np.full_like(G_mean, np.nan)
+
+    # Standard ERROR of the segment ensemble: the uncertainty on the mean.
+    if n_valid > 1:
+        with np.errstate(invalid="ignore"):
+            G_std = (np.nanstd(G_stack, axis=0, ddof=1)
+                     / np.sqrt(float(n_valid)))
+    else:
+        # A single segment carries no scatter information.  NaN (not zero) so
+        # downstream fits treat the point as unweighted rather than infinitely
+        # well determined.
+        G_std = np.full(n_bins, np.nan)
+
+    if full_trace_G:
+        full_cb = None
+        if progress_cb is not None:
+            base = n_segs * steps_per_seg
+            def full_cb(completed, label, _off=base):
+                progress_cb(_off + completed, f"Full trace  —  {label}")
+        G_mean = _full_trace(full_cb)
+    else:
+        G_mean = np.nanmean(G_stack, axis=0)
 
     return tau, G_mean, G_std, n_valid
 
@@ -722,18 +898,22 @@ def compute_crosscorr(
     timesB_s: np.ndarray,
     tau_edges: np.ndarray,
     method: Method = "perbin",
-    segment: bool = False,
+    segment: bool = True,
     progress_cb=None,
+    *,
+    seg_duration_s: float = _SEGMENT_DURATION_S,
+    full_trace_G: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
-    Directed cross-correlation G_AB(tau) with optional segmented uncertainty.
+    Directed cross-correlation G_AB(tau) with segment-and-average uncertainty.
 
     Returns
     -------
     tau, G_mean, G_std, n_segments
     """
     return compute_segmented(
-        timesA_s, timesB_s, tau_edges, method, segment, progress_cb)
+        timesA_s, timesB_s, tau_edges, method, segment, progress_cb,
+        seg_duration_s=seg_duration_s, full_trace_G=full_trace_G)
 
 
 def compute_crosscorr_symmetric(
@@ -741,69 +921,63 @@ def compute_crosscorr_symmetric(
     timesB_s: np.ndarray,
     tau_edges: np.ndarray,
     method: Method = "perbin",
-    segment: bool = False,
+    segment: bool = True,
     progress_cb=None,
+    *,
+    seg_duration_s: float = _SEGMENT_DURATION_S,
+    full_trace_G: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Symmetric cross-correlation ½[G_AB(τ) + G_BA(τ)].
 
     Averages the forward (A→B) and reverse (B→A) directed cross-correlations.
     For a time-symmetric process the two directions estimate the same G(τ);
-    averaging them halves the variance of the cross term (to the extent the
-    two directed estimates are independent) and removes any small asymmetry
-    bias.  This matches the (Ch1×Ch2 + Ch2×Ch1)/2 convention used by ISS
-    VistaVision and most commercial correlators.
+    averaging them removes any small asymmetry bias.  This matches the
+    (Ch1×Ch2 + Ch2×Ch1)/2 convention used by ISS VistaVision and most
+    commercial correlators.
 
     The two directions are averaged at the level of the *normalised* G(τ),
     not the raw counts, since each direction carries its own normalisation.
 
-    Returns
-    -------
-    tau, G_mean, G_std, n_segments
-    """
-    # Forward A→B occupies the first half of the progress budget, reverse B→A
-    # the second half, so the existing progress window stays monotonic.
-    fwd_cb = rev_cb = None
-    if progress_cb is not None:
-        # crude split: each direction reports into its own half
-        def fwd_cb(completed, label):
-            progress_cb(completed, f"A→B  —  {label}")
-        def rev_cb(completed, label):
-            progress_cb(completed, f"B→A  —  {label}")
-
-    tau, G_ab, std_ab, n_ab = compute_segmented(
-        timesA_s, timesB_s, tau_edges, method, segment, fwd_cb)
-    _,   G_ba, std_ba, n_ba = compute_segmented(
-        timesB_s, timesA_s, tau_edges, method, segment, rev_cb)
-
-    G_mean = 0.5 * (G_ab + G_ba)
-
-    # Combine uncertainties. In the unsegmented case both stds are NaN, so the
-    # result is NaN (no error bars), matching the directed behaviour. In the
-    # segmented case, average the two independent estimates: the SD of the mean
-    # of two independent estimates each with SD s is sqrt(s_ab² + s_ba²)/2.
-    with np.errstate(invalid="ignore"):
-        G_std = np.sqrt(std_ab**2 + std_ba**2) / 2.0
-
-    return tau, G_mean, G_std, max(n_ab, n_ba)
-
-
-def compute_autocorr(
-    times_s: np.ndarray,
-    tau_edges: np.ndarray,
-    method: Method = "perbin",
-    segment: bool = False,
-    progress_cb=None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """
-    Autocorrelation G(tau) with optional segmented uncertainty.
+    Symmetrisation happens *within each segment*, so the across-segment scatter
+    is measured on the symmetrised quantity that is actually reported.  The
+    previous implementation correlated the whole stream in each direction and
+    combined the two standard deviations as sqrt(s_ab² + s_ba²)/2, which treats
+    A→B and B→A as independent estimates.  They are not independent -- they are
+    the same photons read in two directions, and for a time-symmetric process
+    they are strongly correlated -- so that formula understated the
+    uncertainty.  Expect slightly larger, and honest, error bars.
 
     Returns
     -------
     tau, G_mean, G_std, n_segments
     """
     return compute_segmented(
-        times_s, times_s, tau_edges, method, segment, progress_cb)
+        timesA_s, timesB_s, tau_edges, method, segment, progress_cb,
+        seg_duration_s=seg_duration_s, full_trace_G=full_trace_G,
+        symmetric=True)
+
+
+def compute_autocorr(
+    times_s: np.ndarray,
+    tau_edges: np.ndarray,
+    method: Method = "perbin",
+    segment: bool = True,
+    progress_cb=None,
+    *,
+    seg_duration_s: float = _SEGMENT_DURATION_S,
+    full_trace_G: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Autocorrelation G(tau) with segment-and-average uncertainty.
+
+    Returns
+    -------
+    tau, G_mean, G_std, n_segments
+    """
+    return compute_segmented(
+        times_s, times_s, tau_edges, method, segment, progress_cb,
+        seg_duration_s=seg_duration_s, full_trace_G=full_trace_G)
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
@@ -813,8 +987,36 @@ _CORR_LABEL = {
     "auto_ch2": "Autocorr Ch2",
     "cross":    "Ch1xCh2",
 }
+def multitau_lag_grid(dt0: float, m: int, coarsen: int,
+                      tau_max: float) -> np.ndarray:
+    """
+    The canonical multi-tau lag grid (s), ascending.
+
+    The grid is a pure function of (dt0, m, coarsen, tau_max) and does NOT
+    depend on the trace length: octaves are terminated by tau_max alone.  This
+    is what lets segments of different durations -- in particular the final,
+    over-long segment produced by :func:`segment_bounds` -- share one grid and
+    be averaged element-wise.
+    """
+    taus: List[float] = []
+    dt = float(dt0)
+    first = True
+    while dt * m <= tau_max:
+        k0 = 1 if first else (m // coarsen + 1)
+        taus.extend(k * dt for k in range(k0, m + 1))
+        dt *= coarsen
+        first = False
+    return np.asarray(sorted(taus), float)
+
+
 def _multitau_curve(a_times, b_times, dt0, m, coarsen, tau_max, T):
-    """One multi-tau pass over a single (sub)trace; returns (tau_s, G)."""
+    """
+    One multi-tau pass over a single (sub)trace; returns (tau_s, G).
+
+    The returned tau axis is always :func:`multitau_lag_grid`, regardless of
+    T.  Octaves the trace is too short to support yield NaN rather than
+    silently shortening the grid, so every segment is element-wise comparable.
+    """
     nb = int(T / dt0) + 2
     a = np.bincount((a_times / dt0).astype(np.int64), minlength=nb).astype(np.float64)
     b = np.bincount((b_times / dt0).astype(np.int64), minlength=nb).astype(np.float64)
@@ -822,21 +1024,28 @@ def _multitau_curve(a_times, b_times, dt0, m, coarsen, tau_max, T):
     Gs:   List[float] = []
     dt = dt0
     first = True
-    while dt * m <= tau_max and a.size >= 2 * m + 1:
+    while dt * m <= tau_max:
         k0 = 1 if first else (m // coarsen + 1)
         for k in range(k0, m + 1):
             n = a.size - k
-            if n <= 0:
+            taus.append(k * dt)
+            # Too few bins left at this octave to estimate the lag: report NaN
+            # and keep the grid intact.
+            if n <= 0 or a.size < 2 * m + 1:
+                Gs.append(float("nan"))
                 continue
             C  = float(np.dot(a[:n], b[k:k + n]))
             Sa = float(a[:n].sum())
             Sb = float(b[k:k + n].sum())
             Gs.append(C * n / (Sa * Sb) - 1.0 if Sa > 0.0 and Sb > 0.0
                       else float("nan"))
-            taus.append(k * dt)
         n_keep = (a.size // coarsen) * coarsen
-        a = a[:n_keep].reshape(-1, coarsen).sum(axis=1)
-        b = b[:n_keep].reshape(-1, coarsen).sum(axis=1)
+        if n_keep >= coarsen:
+            a = a[:n_keep].reshape(-1, coarsen).sum(axis=1)
+            b = b[:n_keep].reshape(-1, coarsen).sum(axis=1)
+        else:
+            a = np.zeros(0, dtype=np.float64)
+            b = np.zeros(0, dtype=np.float64)
         dt *= coarsen
         first = False
     order = np.argsort(taus)
@@ -850,9 +1059,13 @@ def compute_multitau(
     tau_max_s: float,
     m: int = 8,
     coarsen: int = 8,
-    segment: bool = False,
+    segment: bool = True,
     duration_s: Optional[float] = None,
     progress_cb=None,
+    *,
+    seg_duration_s: float = _SEGMENT_DURATION_S,
+    full_trace_G: bool = True,
+    symmetric: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Multi-tau correlation on binned intensity with symmetric normalisation.
@@ -886,9 +1099,16 @@ def compute_multitau(
     coarsen : int
         Intensity coarsening factor between octaves (default 8).
     segment : bool
-        If True, split into non-overlapping segments of duration
-        ``_MIN_SEGMENT_FACTOR * tau_max_s`` and return the segment mean and
-        standard deviation; else a single full-trace curve with zero G_std.
+        If True (default), split into fixed-duration segments (see
+        :func:`segment_bounds`) and return the standard error across them in
+        G_std; else a single full-trace curve with an all-NaN G_std.
+    seg_duration_s : float
+        Segment duration in seconds.
+    full_trace_G : bool
+        If True (default), G is estimated once from the whole trace and the
+        segments contribute only G_std.  See :func:`compute_segmented`.
+    symmetric : bool
+        If True, each curve is 0.5 * (G_AB + G_BA).
     duration_s : float, optional
         Measurement duration (s); defaults to the span of the photon times.
 
@@ -905,37 +1125,341 @@ def compute_multitau(
     b_all = np.asarray(times_b, float) - t0
     T = float(duration_s) if duration_s else float(max(a_all[-1], b_all[-1]))
 
-    if segment:
-        seg_dur = _MIN_SEGMENT_FACTOR * tau_max_s
-        n_segs = max(1, int(T // seg_dur))
-    else:
-        seg_dur = T
-        n_segs = 1
+    tau_grid = multitau_lag_grid(base_dt_s, m, coarsen, tau_max_s)
+    if tau_grid.size == 0:
+        raise ValueError(
+            f"No multi-tau lags fit between base bin {base_dt_s:.3g} s and "
+            f"tau_max {tau_max_s:.3g} s with m={m}."
+        )
 
-    tau_ref: Optional[np.ndarray] = None
+    def _curve(aseg, bseg, span):
+        tau, G = _multitau_curve(aseg, bseg, base_dt_s, m, coarsen,
+                                 tau_max_s, span)
+        if not symmetric:
+            return G
+        _, G_ba = _multitau_curve(bseg, aseg, base_dt_s, m, coarsen,
+                                  tau_max_s, span)
+        return 0.5 * (G + G_ba)
+
+    # ── Unsegmented path ─────────────────────────────────────────────────────
+    if not segment:
+        G_mean = _curve(a_all, b_all, T)
+        if progress_cb is not None:
+            progress_cb(1, "multi-tau full trace")
+        return tau_grid, G_mean, np.full(tau_grid.size, np.nan), 1
+
+    # ── Segmented path ───────────────────────────────────────────────────────
+    bounds = segment_bounds(0.0, T, seg_duration_s)
+    n_segs = len(bounds)
+
     rows: List[np.ndarray] = []
-    for s in range(n_segs):
-        lo = s * seg_dur
-        hi = (s + 1) * seg_dur if segment else T
+    for s, (lo, hi) in enumerate(bounds):
         aseg = a_all[(a_all >= lo) & (a_all < hi)] - lo
         bseg = b_all[(b_all >= lo) & (b_all < hi)] - lo
         if aseg.size >= 2 and bseg.size >= 2:
-            tau, G = _multitau_curve(aseg, bseg, base_dt_s, m, coarsen,
-                                     tau_max_s, hi - lo)
-            if tau_ref is None:
-                tau_ref = tau
-            if tau.size == tau_ref.size:
-                rows.append(G)
+            rows.append(_curve(aseg, bseg, hi - lo))
+        else:
+            warnings.warn(
+                f"Multi-tau segment {s + 1}/{n_segs} ({lo:.3g}-{hi:.3g} s) has "
+                f"too few photons and was skipped.",
+                RuntimeWarning,
+            )
         if progress_cb is not None:
             progress_cb(s + 1, f"multi-tau segment {s + 1}/{n_segs}")
 
     if not rows:
         raise ValueError("Multi-tau produced no valid segments.")
-    stack = np.vstack(rows)
-    G_mean = np.nanmean(stack, axis=0)
-    G_std = (np.nanstd(stack, axis=0, ddof=1) if stack.shape[0] > 1
-             else np.zeros_like(G_mean))
-    return tau_ref, G_mean, G_std, int(stack.shape[0])
+    stack   = np.vstack(rows)
+    n_valid = int(stack.shape[0])
+
+    # Standard ERROR across segments; NaN (not zero) for a lone segment.
+    if n_valid > 1:
+        with np.errstate(invalid="ignore"):
+            G_std = (np.nanstd(stack, axis=0, ddof=1)
+                     / np.sqrt(float(n_valid)))
+    else:
+        G_std = np.full(tau_grid.size, np.nan)
+
+    if full_trace_G:
+        G_mean = _curve(a_all, b_all, T)
+        if progress_cb is not None:
+            progress_cb(n_segs + 1, "multi-tau full trace")
+    else:
+        G_mean = np.nanmean(stack, axis=0)
+
+    return tau_grid, G_mean, G_std, n_valid
+
+
+# ── multipletau package backend ───────────────────────────────────────────────
+
+def _bin_intensity(times_s: np.ndarray, dt0: float, n_bins: int) -> np.ndarray:
+    """Bin arrival times (s) into a regular intensity trace of n_bins bins."""
+    idx = (times_s / dt0).astype(np.int64)
+    idx = idx[(idx >= 0) & (idx < n_bins)]
+    return np.bincount(idx, minlength=n_bins).astype(np.float64)
+
+
+def _even_m(m: int) -> int:
+    """multipletau requires an even m; round up and keep it >= 2."""
+    m = max(2, int(m))
+    return m if m % 2 == 0 else m + 1
+
+
+def _multitau_pkg_curve(a_times, b_times, dt0, m, tau_max, T,
+                        compress="average", is_auto=False):
+    """
+    One multipletau pass over a single (sub)trace; returns (tau_s, G).
+
+    Photons are binned to a regular grid of width dt0, then handed to
+    multipletau.  The tau=0 row is dropped (it is the shot-noise spike, not
+    signal) and lags beyond tau_max are truncated.
+
+    The returned grid depends on the trace length T, because multipletau adds
+    octaves for as long as the data supports them.  Callers must therefore NOT
+    assume positional alignment between curves from traces of different
+    lengths -- align by tau value (see _align_to_grid).
+    """
+    if not _MULTIPLETAU:
+        raise NotImplementedError(
+            "The 'multipletau' package is not installed.\n\n"
+            "Install it with:    pip install multipletau\n\n"
+            "Or choose a different correlation method."
+        )
+
+    n_bins = int(T / dt0) + 2
+    if n_bins < 4 * m:
+        raise ValueError(
+            f"Trace of {T:.4g} s at a {dt0:.3g} s base bin gives only "
+            f"{n_bins} bins, too few for m={m}."
+        )
+
+    a = _bin_intensity(np.asarray(a_times, float), dt0, n_bins)
+    # NB: identity (`b_times is a_times`) is NOT a usable test for an
+    # autocorrelation -- compute_multitau_pkg subtracts a common t0 from both
+    # streams, so even an autocorrelation arrives here as two distinct arrays
+    # holding identical data.  The caller must say so explicitly.
+    b = a if is_auto else _bin_intensity(np.asarray(b_times, float),
+                                         dt0, n_bins)
+
+    # multipletau guards against an all-zero trace with (core.py:412-414):
+    #
+    #     if np.abs(traceavg1) / np.median(np.abs(v)) < ZERO_CUTOFF: ...
+    #
+    # For photon-counting data binned at tau_min the MEDIAN BIN IS EMPTY, so
+    # that divides by zero and numpy emits a RuntimeWarning on every call.
+    # The median of a Poisson trace is 0 whenever the mean is below ln(2), i.e.
+    # whenever the count rate is below ln(2)/dt0 -- about 69 kHz per channel at
+    # a 10 us bin.  Ordinary FCS count rates sit well under that, so the
+    # warning fires on essentially every run.
+    #
+    # It is benign: x/0 -> inf, and `inf < ZERO_CUTOFF` is False, so the check
+    # PASSES and the correlation proceeds untouched.  The normalisation uses
+    # the trace MEAN, not the median, and the mean is unaffected by sparsity.
+    #
+    # Rather than mute it blindly, we test the condition multipletau is
+    # actually trying to catch -- a trace with no photons in it -- and raise a
+    # clear error ourselves.  Only then is the (now meaningless) divide-by-zero
+    # in its heuristic suppressed.
+    if a.mean() <= 0.0 or b.mean() <= 0.0:
+        raise ValueError(
+            f"Cannot correlate an empty intensity trace over {T:.4g} s "
+            f"(Ch1 mean {a.mean():.4g}, Ch2 mean {b.mean():.4g} counts/bin). "
+            f"Check the gate, the thinning factor, and the channel selection."
+        )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if is_auto:
+            out = _multipletau.autocorrelate(
+                a, m=m, deltat=dt0, normalize=True, copy=False,
+                compress=compress)
+        else:
+            out = _multipletau.correlate(
+                a, b, m=m, deltat=dt0, normalize=True, copy=False,
+                compress=compress)
+
+    tau = np.asarray(out[:, 0], float)
+    G   = np.asarray(out[:, 1], float)
+
+    # normalize=True already subtracts the 1 (verified against multipletau
+    # 0.4.1: an uncorrelated Poisson trace gives a large-lag baseline of
+    # 0.000000).  No further offset is applied here.
+    keep = (tau > 0) & (tau <= tau_max)
+    return tau[keep], G[keep]
+
+
+def _align_to_grid(tau_ref: np.ndarray, tau_seg: np.ndarray,
+                   G_seg: np.ndarray) -> np.ndarray:
+    """
+    Place G_seg onto tau_ref, matching by lag VALUE rather than by position.
+
+    multipletau's grid grows with trace length, so the over-long final segment
+    from segment_bounds() can carry more octaves than the nominal ones.  Lags
+    are exact binary multiples of dt0 and so compare exactly, but a tolerance
+    is used anyway to stay safe against float drift.  Lags present in tau_ref
+    but absent from this segment become NaN, which nanmean/nanstd then skip --
+    no segment is ever silently discarded.
+    """
+    out = np.full(tau_ref.size, np.nan)
+    if tau_seg.size == 0:
+        return out
+    idx = np.searchsorted(tau_seg, tau_ref)
+    idx = np.clip(idx, 0, tau_seg.size - 1)
+    close = np.isclose(tau_seg[idx], tau_ref, rtol=1e-9, atol=0.0)
+    out[close] = G_seg[idx[close]]
+    return out
+
+
+def compute_multitau_pkg(
+    times_a: np.ndarray,
+    times_b: Optional[np.ndarray],
+    base_dt_s: float,
+    tau_max_s: float,
+    m: int = 16,
+    segment: bool = True,
+    duration_s: Optional[float] = None,
+    progress_cb=None,
+    *,
+    seg_duration_s: float = _SEGMENT_DURATION_S,
+    full_trace_G: bool = True,
+    symmetric: bool = False,
+    compress: str = "average",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Multi-tau correlation using the `multipletau` package as the backend.
+
+    The reference implementation of the Schaetzel multiple-tau scheme.  The lag
+    grid is hard-wired base-2; `m` (channels per octave) is the only grid knob.
+    For an ISS-matched grid with an arbitrary coarsening factor use
+    :func:`compute_multitau` instead.
+
+    Uncertainty follows the suite-wide segment-and-average policy: see
+    :func:`compute_segmented` for the meaning of `segment`, `seg_duration_s`
+    and `full_trace_G`.
+
+    Parameters
+    ----------
+    times_a, times_b : np.ndarray
+        Photon arrival times (s).  Pass times_b=None for an autocorrelation.
+    base_dt_s : float
+        Base intensity-bin width (s) = the shortest lag = multipletau's deltat.
+    tau_max_s : float
+        Largest lag to keep (s).
+    m : int
+        Channels per octave.  Forced to an even integer (multipletau requires
+        it); an odd request is rounded UP.
+    symmetric : bool
+        If True, report 0.5 * (G_AB + G_BA).  multipletau computes only the
+        positive direction, so the reverse is obtained by swapping the inputs
+        -- exactly as the package's own documentation prescribes.
+    compress : str
+        multipletau's register-propagation strategy: 'average' (default,
+        carries the Schaetzel binning bias), or 'first'/'second' (bias-free,
+        noisier).  See https://doi.org/10.1063/1.3491098.
+
+    Returns
+    -------
+    (tau_s, G_mean, G_std, n_segs)
+    """
+    if not _MULTIPLETAU:
+        raise NotImplementedError(
+            "The 'multipletau' package is not installed.\n\n"
+            "Install it with:    pip install multipletau\n\n"
+            "Or choose a different correlation method."
+        )
+    # Decide this BEFORE subtracting t0 below: that subtraction produces new
+    # arrays, after which the two streams are no longer the same object and an
+    # autocorrelation is indistinguishable from a cross-correlation of two
+    # identical traces.
+    is_auto = (times_b is None) or (times_b is times_a)
+    if times_b is None:
+        times_b = times_a
+    m_eff = _even_m(m)
+    if m_eff != int(m):
+        warnings.warn(
+            f"multipletau requires an even number of channels; m={int(m)} "
+            f"was rounded up to {m_eff}.",
+            RuntimeWarning,
+        )
+
+    t0 = float(min(times_a[0], times_b[0]))
+    a_all = np.asarray(times_a, float) - t0
+    b_all = np.asarray(times_b, float) - t0
+    T = float(duration_s) if duration_s else float(max(a_all[-1], b_all[-1]))
+
+    def _curve(aseg, bseg, span):
+        tau, G = _multitau_pkg_curve(aseg, bseg, base_dt_s, m_eff,
+                                     tau_max_s, span, compress,
+                                     is_auto=is_auto)
+        if not symmetric:
+            return tau, G
+        # Reached only for a cross-correlation, so is_auto is False here.
+        tau_r, G_ba = _multitau_pkg_curve(bseg, aseg, base_dt_s, m_eff,
+                                          tau_max_s, span, compress,
+                                          is_auto=False)
+        # Same trace length both ways, so the grids are identical; assert it
+        # rather than trust it.
+        if tau_r.size != tau.size or not np.allclose(tau_r, tau):
+            raise RuntimeError(
+                "multipletau returned different lag grids for A->B and B->A "
+                "on the same trace; cannot symmetrise."
+            )
+        return tau, 0.5 * (G + G_ba)
+
+    # ── Unsegmented path ─────────────────────────────────────────────────────
+    if not segment:
+        tau, G = _curve(a_all, b_all, T)
+        if progress_cb is not None:
+            progress_cb(1, "multipletau full trace")
+        return tau, G, np.full(tau.size, np.nan), 1
+
+    # ── Segmented path ───────────────────────────────────────────────────────
+    bounds = segment_bounds(0.0, T, seg_duration_s)
+    n_segs = len(bounds)
+
+    seg_curves: List[Tuple[np.ndarray, np.ndarray]] = []
+    for s, (lo, hi) in enumerate(bounds):
+        aseg = a_all[(a_all >= lo) & (a_all < hi)] - lo
+        bseg = b_all[(b_all >= lo) & (b_all < hi)] - lo
+        if aseg.size >= 2 and bseg.size >= 2:
+            seg_curves.append(_curve(aseg, bseg, hi - lo))
+        else:
+            warnings.warn(
+                f"multipletau segment {s + 1}/{n_segs} ({lo:.3g}-{hi:.3g} s) "
+                f"has too few photons and was skipped.",
+                RuntimeWarning,
+            )
+        if progress_cb is not None:
+            progress_cb(s + 1, f"multipletau segment {s + 1}/{n_segs}")
+
+    if not seg_curves:
+        raise ValueError("multipletau produced no valid segments.")
+
+    # Reference grid = the LONGEST segment's grid.  segment_bounds() puts the
+    # remainder in the final segment, so that one is always the longest and
+    # carries the most octaves -- a deterministic choice, unlike "whichever
+    # segment happened to be computed first".
+    ref_i   = int(np.argmax([len(t) for t, _ in seg_curves]))
+    tau_ref = seg_curves[ref_i][0]
+
+    stack   = np.vstack([_align_to_grid(tau_ref, t, G) for t, G in seg_curves])
+    n_valid = int(stack.shape[0])
+
+    if n_valid > 1:
+        with np.errstate(invalid="ignore"):
+            G_std = (np.nanstd(stack, axis=0, ddof=1)
+                     / np.sqrt(float(n_valid)))
+    else:
+        G_std = np.full(tau_ref.size, np.nan)
+
+    if full_trace_G:
+        tau_full, G_full = _curve(a_all, b_all, T)
+        G_mean = _align_to_grid(tau_ref, tau_full, G_full)
+        if progress_cb is not None:
+            progress_cb(n_segs + 1, "multipletau full trace")
+    else:
+        G_mean = np.nanmean(stack, axis=0)
+
+    return tau_ref, G_mean, G_std, n_valid
 
 
 _METHOD_LABEL = {
@@ -943,7 +1467,28 @@ _METHOD_LABEL = {
     "twopointer":      "two-pointer (Wahl)",
     "wiener_khinchin": "Wiener–Khinchin",
     "multitau":        "multi-tau (ISS-style)",
+    "multitau_pkg":    "multi-tau (multipletau pkg)",
 }
+
+def _method_annotation(method: Method,
+                       mt_channels: Optional[int] = None,
+                       mt_coarsen: Optional[int] = None,
+                       mt_compress: Optional[str] = None) -> str:
+    """
+    Human-readable method string, including the parameters that change the
+    numbers.  Single source of truth for the plot annotation, the overlay
+    annotation and the CSV `method_label` header, so the three cannot drift
+    apart.
+    """
+    s = _METHOD_LABEL.get(method, method)
+    if method == "twopointer":
+        s += f" [{'numba' if _NUMBA else 'numpy'}]"
+    elif method == "multitau" and mt_channels:
+        s += f" [m={mt_channels}, coarsen x{mt_coarsen}]"
+    elif method == "multitau_pkg" and mt_channels:
+        s += f" [m={mt_channels}, base-2, compress={mt_compress}]"
+    return s
+
 
 def _cps_meta(n1: int, n2: int, T: float) -> dict:
     """
@@ -982,27 +1527,87 @@ def _export_correlation(
     n_used_ch1: Optional[int] = None,
     n_used_ch2: Optional[int] = None,
     T_used: Optional[float] = None,
+    *,
+    seg_duration_s: Optional[float] = None,
+    full_trace_G: Optional[bool] = None,
+    mt_channels: Optional[int] = None,
+    mt_coarsen: Optional[int] = None,
+    mt_compress: Optional[str] = None,
 ) -> None:
     """
     Write one file's plotted correlation curve to a CSV.
 
     Mirrors the inline export in :func:`plot_correlation` so single-file and
     batch/overlay exports use an identical column and metadata layout.
+
+    The header records how G and G_std were produced, not just that they were.
+    Two of those facts changed meaning at the same time as this suite gained
+    segment-and-average, WITHOUT the column names changing:
+
+      * G_std used to be the population standard deviation across segments;
+        it is now the STANDARD ERROR (smaller by sqrt(n_segments) -- a factor
+        of ~3.2 at the default ten 1 s segments).  Anything weighting a fit by
+        1/G_std^2 would be off by ~10x between an old file and a new one.
+      * A "cross" export used to be a DIRECTED Ch1->Ch2 estimate on the
+        single-file path; it is now symmetrised.
+
+    A reader cannot tell old from new by looking at the numbers, so the header
+    says which it is.  Files written before this patch simply lack these keys,
+    which is itself the signal that they are the old convention.
     """
     cols: dict = {
         "tau_s":  tau,
         "tau_ms": tau * 1e3,
         "G":      G_mean,
     }
-    if np.isfinite(G_std).any():
+    have_std = bool(np.isfinite(G_std).any())
+    if have_std:
         cols["G_std"] = G_std
+
     meta = {
-        "type":       corr_type,
-        "method":     method,
-        "tau_min_s":  f"{tau_min_s:.6g}",
-        "tau_max_s":  f"{tau_max_s:.6g}",
-        "n_segments": n_segs,
+        "type":         corr_type,
+        "method":       method,
+        "method_label": _method_annotation(method, mt_channels,
+                                           mt_coarsen, mt_compress),
+        "tau_min_s":    f"{tau_min_s:.6g}",
+        "tau_max_s":    f"{tau_max_s:.6g}",
+        "n_segments":   n_segs,
     }
+
+    if corr_type == "cross":
+        meta["symmetrized"] = "yes: G = 0.5*(G_Ch1Ch2 + G_Ch2Ch1), per segment"
+
+    # Segment-and-average provenance.
+    if seg_duration_s is not None and n_segs > 1:
+        meta["segmented"]          = "yes"
+        meta["segment_duration_s"] = f"{seg_duration_s:.6g}"
+        meta["segment_note"] = (
+            "fixed-duration segments; the final segment absorbs the "
+            "remainder and may be up to 2x segment_duration_s"
+        )
+    elif n_segs <= 1:
+        meta["segmented"] = "no"
+
+    if full_trace_G is not None and n_segs > 1:
+        meta["G_source"] = ("full trace (segments used only for G_std)"
+                            if full_trace_G else "mean of the per-segment G")
+
+    if have_std:
+        meta["G_std_definition"] = (
+            "standard error of the mean: "
+            "std(G_segments, ddof=1) / sqrt(n_segments)"
+        )
+
+    # Multi-tau grid parameters: without these the lag grid cannot be
+    # reconstructed from the file alone.
+    if method in ("multitau", "multitau_pkg") and mt_channels is not None:
+        meta["mt_channels_per_octave"] = mt_channels
+    if method == "multitau" and mt_coarsen is not None:
+        meta["mt_coarsen_factor"] = mt_coarsen
+    if method == "multitau_pkg":
+        meta["mt_coarsen_factor"] = 2      # multipletau is hard-wired base-2
+        if mt_compress is not None:
+            meta["mt_compress"] = mt_compress
     if None not in (n_used_ch1, n_used_ch2, T_used):
             meta.update(_cps_meta(n_used_ch1, n_used_ch2, T_used))
     
@@ -1031,18 +1636,25 @@ def plot_correlation(
     n_used_ch1: Optional[int] = None,
     n_used_ch2: Optional[int] = None,
     T_used: Optional[float] = None,
+    *,
+    seg_duration_s: Optional[float] = None,
+    full_trace_G: Optional[bool] = None,
+    mt_channels: Optional[int] = None,
+    mt_coarsen: Optional[int] = None,
+    mt_compress: Optional[str] = None,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """
     Plot a segmented correlation function with uncertainty bounds.
 
-    The mean G(τ) is drawn as black dots.  The ±1σ band (mean ± std) is
-    drawn as light grey lines above and below.
+    The reported G(τ) is drawn as black dots.  The grey band is ±1 STANDARD
+    ERROR -- the uncertainty ON THE PLOTTED CURVE -- not the segment-to-segment
+    spread, which is larger by sqrt(n_segments).
 
     Parameters
     ----------
     tau      : lag times in seconds
-    G_mean   : mean normalised correlation (baseline 0)
-    G_std    : standard deviation across segments
+    G_mean   : reported correlation (baseline 0)
+    G_std    : standard error across segments (std/sqrt(n)), or all-NaN
     corr_type: 'auto_ch1', 'auto_ch2', or 'cross'
     fcs_data : source FCSData (for title / photon counts)
     tau_min_s, tau_max_s : lag range in seconds
@@ -1061,6 +1673,9 @@ def plot_correlation(
             fcs_data, tau, G_mean, G_std, corr_type, method,
             tau_min_s, tau_max_s, n_segs, gate_min_ns, gate_max_ns,
             n_used_ch1=n_used_ch1, n_used_ch2=n_used_ch2, T_used=T_used,
+            seg_duration_s=seg_duration_s, full_trace_G=full_trace_G,
+            mt_channels=mt_channels, mt_coarsen=mt_coarsen,
+            mt_compress=mt_compress,
         )
 
 
@@ -1081,9 +1696,11 @@ def plot_correlation(
         mask_u = np.isfinite(upper)
         mask_l = np.isfinite(lower)
 
+        # "±1σ" would read as the segment-to-segment spread; this band is the
+        # standard error of the mean, smaller by sqrt(n_segments).
         ax.semilogx(tau_ms[mask_u], upper[mask_u],
                     color="lightgrey", linewidth=1.0,
-                    label=f"±1σ  (n={n_segs} segments)")
+                    label=f"±1 SEM  (n={n_segs} segments)")
         ax.semilogx(tau_ms[mask_l], lower[mask_l],
                     color="lightgrey", linewidth=1.0)
 
@@ -1109,10 +1726,18 @@ def plot_correlation(
     title = f"Correlation — {fcs_data.filepath.name}"
     gate_str = (f"  ·  gate: {gate_min_ns:.2f}–{gate_max_ns:.2f} ns"
                 if gate_min_ns is not None else "")
+    if n_segs > 1 and seg_duration_s:
+        seg_str = f"{n_segs} × {seg_duration_s:.3g} s segments"
+        if full_trace_G is False:
+            seg_str += " (G = segment mean)"
+    elif n_segs > 1:
+        seg_str = f"{n_segs} segments"
+    else:
+        seg_str = "unsegmented — no error bars"
     subtitle = (
         f"{label}  ·  "
         f"τ: {tau_min_s*1e3:.3g}–{tau_max_s*1e3:.3g} ms  ·  "
-        f"{n_segs} segments"
+        f"{seg_str}"
         f"{gate_str}  ·  "
         f"Ch1: {n_ch1:,}  Ch2: {n_ch2:,} photons"
     )
@@ -1139,10 +1764,9 @@ def plot_correlation(
     ax.grid(True, which="minor", linestyle=":",  linewidth=0.3, alpha=0.3)
     ax.legend(fontsize=10, framealpha=0.85)
 
-    # Bottom-right: method + numba status
-    method_str = _METHOD_LABEL.get(method, method)
-    if method == "twopointer":
-        method_str += f" [{'numba' if _NUMBA else 'numpy'}]"
+    # Bottom-right: method + the parameters that change the numbers
+    method_str = _method_annotation(method, mt_channels, mt_coarsen,
+                                    mt_compress)
     fig.text(0.99, 0.01, method_str,
              ha="right", va="bottom", fontsize=7, color="grey")
 
@@ -1226,13 +1850,16 @@ def compute_correlation_for(
     segment     = params["segment"]
     use_gate    = params["gate"]
     ppd         = max(2, int(params.get("points_per_decade", _POINTS_PER_DECADE)))
+    seg_duration_s = float(params.get("seg_duration_s", _SEGMENT_DURATION_S))
+    full_trace_G   = bool(params.get("full_trace_G", True))
     thin_factor = max(1, int(params.get("thin_factor", 1)))
 
     tau_min_s = float(params["tau_min_ms"]) * 1e-3
     tau_max_s = float(params["tau_max_ms"]) * 1e-3
-    is_multitau = (method == "multitau")
+    is_multitau = method in ("multitau", "multitau_pkg")
     mt_m        = max(2, int(params.get("mt_channels", 8)))
     mt_coarsen  = max(2, int(params.get("mt_coarsen", 8)))
+    mt_compress = params.get("mt_compress", "average")
     if is_multitau:
         tau_edges, n_bins = None, 0
     else:
@@ -1317,20 +1944,34 @@ def compute_correlation_for(
                 _a = _b = times_ch1
             else:
                 _a = _b = times_ch2
-            tau, G_mean, G_std, n_segs = compute_multitau(
-                _a, _b, tau_min_s, tau_max_s, m=mt_m, coarsen=mt_coarsen,
-                segment=segment, duration_s=fcs_data.duration_s,
-                progress_cb=progress_cb)
+            if method == "multitau_pkg":
+                tau, G_mean, G_std, n_segs = compute_multitau_pkg(
+                    _a, _b, tau_min_s, tau_max_s, m=mt_m,
+                    segment=segment, duration_s=fcs_data.duration_s,
+                    progress_cb=progress_cb,
+                    seg_duration_s=seg_duration_s, full_trace_G=full_trace_G,
+                    symmetric=(corr_type == "cross"),
+                    compress=mt_compress)
+            else:
+                tau, G_mean, G_std, n_segs = compute_multitau(
+                    _a, _b, tau_min_s, tau_max_s, m=mt_m, coarsen=mt_coarsen,
+                    segment=segment, duration_s=fcs_data.duration_s,
+                    progress_cb=progress_cb,
+                    seg_duration_s=seg_duration_s, full_trace_G=full_trace_G,
+                    symmetric=(corr_type == "cross"))
         elif corr_type == "cross":
             tau, G_mean, G_std, n_segs = compute_crosscorr_symmetric(
                 times_ch1, times_ch2, tau_edges, method, segment,
-                progress_cb=progress_cb)                                                                                                       
+                progress_cb=progress_cb,
+                seg_duration_s=seg_duration_s, full_trace_G=full_trace_G)
         elif corr_type == "auto_ch1":
             tau, G_mean, G_std, n_segs = compute_autocorr(
-                times_ch1, tau_edges, method, segment, progress_cb=progress_cb)
+                times_ch1, tau_edges, method, segment, progress_cb=progress_cb,
+                seg_duration_s=seg_duration_s, full_trace_G=full_trace_G)
         else:
             tau, G_mean, G_std, n_segs = compute_autocorr(
-                times_ch2, tau_edges, method, segment, progress_cb=progress_cb)
+                times_ch2, tau_edges, method, segment, progress_cb=progress_cb,
+                seg_duration_s=seg_duration_s, full_trace_G=full_trace_G)
     except KeyboardInterrupt:
         if pw is not None:
             pw.close()
@@ -1357,6 +1998,14 @@ def compute_correlation_for(
         "n_used_ch1": len(times_ch1), "n_used_ch2": len(times_ch2),
         "T_used": float(max(times_ch1[-1], times_ch2[-1])
                         - min(times_ch1[0], times_ch2[0])),
+        # Provenance, so the batch export writes the same header as the
+        # single-file path rather than re-deriving it from _defaults (which
+        # the user may have changed since).
+        "seg_duration_s": seg_duration_s if segment else None,
+        "full_trace_G":   full_trace_G if segment else None,
+        "mt_channels":    mt_m if is_multitau else None,
+        "mt_coarsen":     mt_coarsen if method == "multitau" else None,
+        "mt_compress":    mt_compress if method == "multitau_pkg" else None,
     }
 
 
@@ -1427,6 +2076,11 @@ def plot_correlation_overlay(
                 res["gate_min_ns"], res["gate_max_ns"],
                 n_used_ch1=res["n_used_ch1"], n_used_ch2=res["n_used_ch2"],
                 T_used=res["T_used"],
+                seg_duration_s=res.get("seg_duration_s"),
+                full_trace_G=res.get("full_trace_G"),
+                mt_channels=res.get("mt_channels"),
+                mt_coarsen=res.get("mt_coarsen"),
+                mt_compress=res.get("mt_compress"),
             )
 
 
@@ -1452,9 +2106,11 @@ def plot_correlation_overlay(
     ax.grid(True, which="minor", linestyle=":",  linewidth=0.3, alpha=0.3)
     ax.legend(fontsize=9, framealpha=0.85, title="File")
 
-    method_str = _METHOD_LABEL.get(method, method)
-    if method == "twopointer":
-        method_str += f" [{'numba' if _NUMBA else 'numpy'}]"
+    _first = next((r for _d, r in results), {}) if results else {}
+    method_str = _method_annotation(method,
+                                    _first.get("mt_channels"),
+                                    _first.get("mt_coarsen"),
+                                    _first.get("mt_compress"))
     fig.text(0.99, 0.01, method_str,
              ha="right", va="bottom", fontsize=7, color="grey")
 
@@ -1468,15 +2124,18 @@ def plot_correlation_overlay(
 
 _defaults: dict = {
     "tau_min_ms":       0.01,
-    "tau_max_ms":       1000.0,
+    "tau_max_ms":       10.0,
     "corr_type":        "cross",
     "method":           "perbin",
-    "segment":          False,
+    "segment":          True,
     "gate":             False,
     "points_per_decade": _POINTS_PER_DECADE,
     "thin_factor":      1,
     "mt_channels":      8,
     "mt_coarsen":       8,
+    "seg_duration_s":   _SEGMENT_DURATION_S,
+    "full_trace_G":     True,
+    "mt_compress":      "average",
 }
 
 
@@ -1501,17 +2160,72 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
 
     dialog = tk.Toplevel()
     dialog.title("Correlation — options")
-    dialog.geometry("340x640")
     dialog.resizable(False, True)
     dialog.grab_set()
 
     pad = dict(padx=12, pady=4)
 
-    tk.Label(dialog, text="Correlation options",
+    # ── Layout: pinned buttons + scrollable body ──────────────────────────────
+    # The option list is long enough to overflow a short screen, so the body
+    # scrolls.  The buttons are packed FIRST with side="bottom" so pack()
+    # reserves the bottom slot for them before the canvas claims the rest --
+    # they can never be scrolled away or clipped off-screen, whatever the
+    # window height.  The buttons themselves are added further down, once
+    # _on_compute exists; the frame is created here purely to claim the slot.
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(side="bottom", fill="x", pady=8)
+    tk.Frame(dialog, height=1, bg="#c8c8c8").pack(side="bottom", fill="x")
+
+    _canvas = tk.Canvas(dialog, borderwidth=0, highlightthickness=0)
+    _vsb    = tk.Scrollbar(dialog, orient="vertical", command=_canvas.yview)
+    _canvas.configure(yscrollcommand=_vsb.set)
+    _vsb.pack(side="right", fill="y")
+    _canvas.pack(side="left", fill="both", expand=True)
+
+    body     = tk.Frame(_canvas)
+    _body_id = _canvas.create_window((0, 0), window=body, anchor="nw")
+
+    def _on_body_configure(_e=None):
+        """Body changed size (e.g. a section was shown/hidden) — re-measure."""
+        _canvas.configure(scrollregion=_canvas.bbox("all"))
+
+    def _on_canvas_configure(e):
+        """Keep the body exactly as wide as the canvas (no horizontal scroll)."""
+        _canvas.itemconfigure(_body_id, width=e.width)
+
+    body.bind("<Configure>", _on_body_configure)
+    _canvas.bind("<Configure>", _on_canvas_configure)
+
+    # Mouse wheel, bound only while the pointer is over this dialog.  bind_all
+    # is global, so it is attached on <Enter> and removed on <Leave> rather
+    # than left hanging on every other window in the app.
+    def _on_mousewheel(e):
+        if e.delta:                      # Windows / macOS
+            _canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        elif e.num == 4:                 # X11 scroll up
+            _canvas.yview_scroll(-1, "units")
+        elif e.num == 5:                 # X11 scroll down
+            _canvas.yview_scroll(1, "units")
+
+    def _bind_wheel(_e=None):
+        _canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        _canvas.bind_all("<Button-4>", _on_mousewheel)
+        _canvas.bind_all("<Button-5>", _on_mousewheel)
+
+    def _unbind_wheel(_e=None):
+        _canvas.unbind_all("<MouseWheel>")
+        _canvas.unbind_all("<Button-4>")
+        _canvas.unbind_all("<Button-5>")
+
+    _canvas.bind("<Enter>", _bind_wheel)
+    _canvas.bind("<Leave>", _unbind_wheel)
+    dialog.bind("<Destroy>", lambda e: _unbind_wheel())
+
+    tk.Label(body, text="Correlation options",
              font=("Helvetica", 12, "bold"), pady=8).pack()
 
     # ── Correlation type ──────────────────────────────────────────────────────
-    type_frame = tk.LabelFrame(dialog, text="Type", padx=10, pady=4)
+    type_frame = tk.LabelFrame(body, text="Type", padx=10, pady=4)
     type_frame.pack(fill="x", **pad)
 
     type_var = tk.StringVar(value=_defaults["corr_type"])
@@ -1524,7 +2238,7 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
                        value=value, anchor="w").pack(fill="x")
 
     # ── Lag range ─────────────────────────────────────────────────────────────
-    range_frame = tk.LabelFrame(dialog, text="Lag range (ms)", padx=10, pady=6)
+    range_frame = tk.LabelFrame(body, text="Lag range (ms)", padx=10, pady=6)
     range_frame.pack(fill="x", **pad)
 
     row = tk.Frame(range_frame)
@@ -1536,52 +2250,93 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
     max_var = tk.StringVar(value=str(_defaults["tau_max_ms"]))
     tk.Entry(row, textvariable=max_var, width=10).pack(side="left", padx=4)
 
-    # ── Segmentation toggle ───────────────────────────────────────────────────
-    seg_frame = tk.LabelFrame(dialog, text="Uncertainty", padx=10, pady=4)
+    # ── Uncertainty (segment-and-average) ─────────────────────────────────────
+    seg_frame = tk.LabelFrame(body, text="Uncertainty", padx=10, pady=4)
     seg_frame.pack(fill="x", **pad)
 
     segment_var = tk.BooleanVar(value=_defaults["segment"])
     seg_cb = tk.Checkbutton(
         seg_frame,
-        text="Segment and average  (experimental)",
+        text="Segment and average  (error bars from segment scatter)",
         variable=segment_var,
         anchor="w",
     )
     seg_cb.pack(fill="x")
 
-    # Info label: shows expected segment count; only visible when ticked
+    # Segment length (s) — only meaningful when segmenting.
+    seg_len_row = tk.Frame(seg_frame)
+    tk.Label(seg_len_row, text="Segment length:", anchor="w",
+             width=14).pack(side="left")
+    seg_len_var = tk.StringVar(value=str(_defaults["seg_duration_s"]))
+    tk.Entry(seg_len_row, textvariable=seg_len_var, width=6).pack(side="left",
+                                                                  padx=3)
+    tk.Label(seg_len_row, text="s", anchor="w").pack(side="left")
+
+    # Full-trace G: report G from the whole stream, segments only for G_std.
+    full_trace_var = tk.BooleanVar(value=_defaults["full_trace_G"])
+    full_trace_cb = tk.Checkbutton(
+        seg_frame,
+        text="Full trace G?  (avoids segment-boundary effects; 1 extra pass)",
+        variable=full_trace_var,
+        anchor="w",
+    )
+
+    # Info label: segment count / warnings; only visible when ticked
     seg_info_var = tk.StringVar(value="")
     seg_info_label = tk.Label(seg_frame, textvariable=seg_info_var,
-                              font=("Helvetica", 9), fg="grey", anchor="w")
+                              font=("Helvetica", 9), fg="grey", anchor="w",
+                              justify="left")
 
     def _update_seg_info(*_):
-        """Recompute expected segment count and show/hide the info label."""
+        """Recompute expected segment count and show/hide the sub-controls."""
         if not segment_var.get():
+            seg_len_row.pack_forget()
+            full_trace_cb.pack_forget()
             seg_info_label.pack_forget()
             return
+        seg_len_row.pack(fill="x", pady=(3, 0))
+        full_trace_cb.pack(fill="x")
         try:
-            tau_max_s  = float(max_var.get()) * 1e-3
-            seg_dur    = _MIN_SEGMENT_FACTOR * tau_max_s
-            total_s    = fcs_data.duration_s
-            n          = int(total_s // seg_dur)
-            warn       = "  ⚠ few segments" if 0 < n < _MIN_SEGMENTS else ""
-            seg_info_var.set(
-                f"  {n} segment{'s' if n != 1 else ''}  "
-                f"({seg_dur*1e3:.3g} ms each){warn}"
-                if n > 0 else
-                f"  dataset too short for tau_max  ({total_s:.1f} s available)"
-            )
-        except ValueError:
+            seg_dur = float(seg_len_var.get())
+            if seg_dur <= 0:
+                raise ValueError
+            total_s = fcs_data.duration_s
+            bounds  = segment_bounds(0.0, total_s, seg_dur)
+            n       = len(bounds)
+            last    = bounds[-1][1] - bounds[-1][0]
+
+            parts = [f"  {n} segment{'s' if n != 1 else ''}"]
+            if n > 1 and abs(last - seg_dur) > 1e-9:
+                parts.append(f"last {last:.4g} s absorbs remainder")
+            txt = "  ·  ".join(parts)
+
+            if n == 1:
+                txt += ("\n  ⚠ one segment only — no scatter to measure, "
+                        "G_std will be blank")
+            elif n < _MIN_SEGMENTS:
+                txt += (f"\n  ⚠ fewer than {_MIN_SEGMENTS} segments — "
+                        f"G_std unreliable")
+
+            # A segment of duration D only supports lags well below D.
+            tau_max_s = float(max_var.get()) * 1e-3
+            if tau_max_s * _MIN_SEGMENT_FACTOR > seg_dur:
+                usable = seg_dur / _MIN_SEGMENT_FACTOR
+                txt += (f"\n  ⚠ τ max {tau_max_s*1e3:.3g} ms exceeds "
+                        f"{usable*1e3:.3g} ms (1/{_MIN_SEGMENT_FACTOR} of a "
+                        f"segment); long-lag error bars will be large")
+            seg_info_var.set(txt)
+        except (ValueError, tk.TclError):
             seg_info_var.set("")
         seg_info_label.pack(fill="x")
 
     segment_var.trace_add("write", _update_seg_info)
+    seg_len_var.trace_add("write", _update_seg_info)
     max_var.trace_add("write", _update_seg_info)
     _update_seg_info()
 
 
     # ── Time gating ───────────────────────────────────────────────────────────
-    gate_frame = tk.LabelFrame(dialog, text="Time gating", padx=10, pady=4)
+    gate_frame = tk.LabelFrame(body, text="Time gating", padx=10, pady=4)
     gate_frame.pack(fill="x", **pad)
 
     gate_var = tk.BooleanVar(value=_defaults["gate"])
@@ -1592,10 +2347,73 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         anchor="w",
     ).pack(fill="x")
 
+    # ── Method ────────────────────────────────────────────────────────────────
+    method_frame = tk.LabelFrame(body, text="Method", padx=10, pady=4)
+    method_frame.pack(fill="x", **pad)
+
+    method_var = tk.StringVar(value=_defaults["method"])
+    tk.Radiobutton(method_frame,
+                   text="Per-bin searchsorted  (fast, all sizes)",
+                   variable=method_var, value="perbin",
+                   anchor="w").pack(fill="x")
+
+    tp_label = ("Two-pointer / Wahl  (numba — fast)"
+                if _NUMBA else
+                "Two-pointer / Wahl  (pure Python — slow for N > 5k)")
+    tk.Radiobutton(method_frame, text=tp_label,
+                   variable=method_var, value="twopointer",
+                   anchor="w").pack(fill="x")
+
+    tk.Radiobutton(method_frame,
+                   text="Wiener–Khinchin / FFT  (coming soon)",
+                   variable=method_var, value="wiener_khinchin",
+                   anchor="w", state="disabled", fg="grey").pack(fill="x")
+
+    tk.Radiobutton(method_frame,
+                   text="Multi-tau  (binned intensity; for ISS comparison)",
+                   variable=method_var, value="multitau",
+                   anchor="w").pack(fill="x")
+
+    if _MULTIPLETAU:
+        pkg_label = "Multi-tau  (multipletau package; base-2 grid)"
+        pkg_state, pkg_fg = "normal", "black"
+    else:
+        pkg_label = "Multi-tau  (multipletau package — not installed)"
+        pkg_state, pkg_fg = "disabled", "grey"
+    tk.Radiobutton(method_frame, text=pkg_label,
+                   variable=method_var, value="multitau_pkg",
+                   anchor="w", state=pkg_state, fg=pkg_fg).pack(fill="x")
+
+    # ── Multi-tau sub-controls ────────────────────────────────────────────────
+    # Channels/octave applies to BOTH multi-tau backends.  The coarsening
+    # factor applies only to the in-house one: the multipletau package is
+    # hard-wired to base-2 octaves (measured successive-lag ratio 2.000), so
+    # exposing a coarsen knob there would be a control that does nothing.
+    mt_row = tk.Frame(method_frame)
+    tk.Label(mt_row, text="channels/octave:").pack(side="left")
+    mt_m_var = tk.StringVar(value=str(_defaults.get("mt_channels", 8)))
+    tk.Entry(mt_row, textvariable=mt_m_var, width=4).pack(side="left", padx=(3, 10))
+
+    mt_coarsen_row = tk.Frame(method_frame)
+    tk.Label(mt_coarsen_row, text="coarsen ×:").pack(side="left")
+    mt_coarsen_var = tk.StringVar(value=str(_defaults.get("mt_coarsen", 8)))
+    tk.Entry(mt_coarsen_row, textvariable=mt_coarsen_var,
+             width=4).pack(side="left", padx=3)
+    tk.Label(mt_coarsen_row, text="(8 / 8 with τ min = 1 µs matches ISS)",
+             font=("Helvetica", 8), fg="grey").pack(side="left", padx=8)
+
+    mt_note_var = tk.StringVar(value="")
+    mt_note = tk.Label(method_frame, textvariable=mt_note_var,
+                       font=("Helvetica", 8), fg="grey", anchor="w",
+                       justify="left")
+
     # ── Speed controls ────────────────────────────────────────────────────────
-    speed_frame = tk.LabelFrame(dialog, text="Speed / resolution trade-off",
+    # Only the per-bin and two-pointer estimators use a log-spaced tau_edges
+    # grid and per-photon thinning; the multi-tau backends bin the intensity
+    # onto their own octave grid and never see these.  So this whole frame is
+    # shown only for those two methods (see _update_method_controls).
+    speed_frame = tk.LabelFrame(body, text="Speed / resolution trade-off",
                                 padx=10, pady=6)
-    speed_frame.pack(fill="x", **pad)
 
     # Bins per decade
     ppd_row = tk.Frame(speed_frame)
@@ -1656,42 +2474,6 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
     thin_var.trace_add("write", _update_thin_info)
     _update_thin_info()
 
-    # ── Method ────────────────────────────────────────────────────────────────
-    method_frame = tk.LabelFrame(dialog, text="Method", padx=10, pady=4)
-    method_frame.pack(fill="x", **pad)
-
-    method_var = tk.StringVar(value=_defaults["method"])
-    tk.Radiobutton(method_frame,
-                   text="Per-bin searchsorted  (fast, all sizes)",
-                   variable=method_var, value="perbin",
-                   anchor="w").pack(fill="x")
-
-    tp_label = ("Two-pointer / Wahl  (numba — fast)"
-                if _NUMBA else
-                "Two-pointer / Wahl  (pure Python — slow for N > 5k)")
-    tk.Radiobutton(method_frame, text=tp_label,
-                   variable=method_var, value="twopointer",
-                   anchor="w").pack(fill="x")
-
-    tk.Radiobutton(method_frame,
-                   text="Wiener–Khinchin / FFT  (coming soon)",
-                   variable=method_var, value="wiener_khinchin",
-                   anchor="w", state="disabled", fg="grey").pack(fill="x")
-
-    tk.Radiobutton(method_frame,
-                   text="Multi-tau  (binned intensity; for ISS comparison)",
-                   variable=method_var, value="multitau",
-                   anchor="w").pack(fill="x")
-    mt_row = tk.Frame(method_frame)
-    mt_row.pack(fill="x", padx=(22, 0))
-    tk.Label(mt_row, text="channels/octave:").pack(side="left")
-    mt_m_var = tk.StringVar(value=str(_defaults.get("mt_channels", 8)))
-    tk.Entry(mt_row, textvariable=mt_m_var, width=4).pack(side="left", padx=(3, 10))
-    tk.Label(mt_row, text="coarsen ×:").pack(side="left")
-    mt_coarsen_var = tk.StringVar(value=str(_defaults.get("mt_coarsen", 8)))
-    tk.Entry(mt_row, textvariable=mt_coarsen_var, width=4).pack(side="left", padx=3)
-    tk.Label(mt_row, text="(8 / 8 with tau_min = 1 µs matches ISS)",
-             font=("Helvetica", 8), fg="grey").pack(side="left", padx=8)
 
     # Info label: estimated computation time
     time_est_var = tk.StringVar(value="")
@@ -1722,10 +2504,18 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
             total_s  = fcs_data.duration_s
             seg_on   = segment_var.get()
             if seg_on:
-                seg_dur = _MIN_SEGMENT_FACTOR * tau_max_s
-                n_segs  = max(1, int(total_s // seg_dur))
+                seg_dur = float(seg_len_var.get())
+                n_segs  = len(segment_bounds(0.0, total_s, seg_dur))
+                # full_trace_G costs one more pass over the whole stream
+                if full_trace_var.get():
+                    n_segs += 1
             else:
                 n_segs = 1
+            # Symmetrisation correlates both directions (the multi-tau
+            # backends included -- this is real work, even though they report
+            # only one progress step per segment).
+            if type_var.get() == "cross":
+                n_segs *= 2
 
             est = estimate_corr_time(
                 N=N, n_bins=n_bins, method=method,
@@ -1735,13 +2525,23 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         except (ValueError, ZeroDivisionError, tk.TclError):
             time_est_var.set("")
 
-    for _var in (method_var, min_var, max_var, segment_var, ppd_var, thin_var):
+    for _var in (method_var, min_var, max_var, segment_var, ppd_var, thin_var,
+                 seg_len_var, full_trace_var, type_var):
         _var.trace_add("write", _update_time_estimate)
     _update_time_estimate()
 
+    # Tail spacer: a stable anchor for re-packing sections that get hidden.
+    # pack() appends to the END of the parent's order, so a section that is
+    # hidden and later re-shown would jump to the bottom of the body.
+    # `before=_tail` pins it back above this spacer.  btn_frame can no longer
+    # serve as that anchor: it lives in `dialog`, while the sections live in
+    # `body`, and pack(before=...) requires a common parent.
+    _tail = tk.Frame(body)
+    _tail.pack(fill="x")
+
     # ── Buttons ───────────────────────────────────────────────────────────────
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(pady=10)
+    # btn_frame itself was created and pinned to the bottom at the top of this
+    # function; only its contents are added here.
 
     def _on_compute():
         try:
@@ -1771,12 +2571,29 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         method    = method_var.get()
         segment   = segment_var.get()
         use_gate  = gate_var.get()
-        is_multitau = (method == "multitau")
+        is_multitau = method in ("multitau", "multitau_pkg")
+        full_trace_G = full_trace_var.get()
         try:
             mt_m       = max(2, int(mt_m_var.get()))
             mt_coarsen = max(2, int(mt_coarsen_var.get()))
         except (ValueError, tk.TclError):
             mt_m, mt_coarsen = 8, 8
+
+        try:
+            seg_duration_s = float(seg_len_var.get())
+        except (ValueError, tk.TclError):
+            seg_duration_s = -1.0
+        if seg_duration_s <= 0:
+            if segment:
+                messagebox.showerror("Invalid input",
+                                     "Segment length must be a positive "
+                                     "number of seconds.",
+                                     parent=dialog)
+                return
+            # Not segmenting, so the value is unused — but it still gets
+            # persisted into _defaults, so keep it sane rather than storing a
+            # negative that would reappear next session.
+            seg_duration_s = _SEGMENT_DURATION_S
 
         # Slow-path warning for two-pointer without numba (single-file only)
         if (not collect_only) and method == "twopointer" and not _NUMBA:
@@ -1796,16 +2613,41 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         # per-file segment count is handled inside compute_correlation_for.
         tau_max_s  = tau_max_ms * 1e-3
         if (not collect_only) and segment:
-            seg_dur    = _MIN_SEGMENT_FACTOR * tau_max_s
-            n_expected = int(fcs_data.duration_s // seg_dur)
+            n_expected = len(segment_bounds(0.0, fcs_data.duration_s,
+                                            seg_duration_s))
             if n_expected < _MIN_SEGMENTS:
+                detail = (
+                    "G_std cannot be estimated from a single segment and will "
+                    "be left blank."
+                    if n_expected == 1 else
+                    f"Uncertainty estimates are unreliable with fewer than "
+                    f"{_MIN_SEGMENTS} segments."
+                )
                 if not messagebox.askyesno(
                     "Few segments",
-                    f"Only {n_expected} segment{'s' if n_expected != 1 else ''} "
-                    f"can be formed with tau_max = {tau_max_ms:.3g} ms.\n\n"
-                    f"Uncertainty estimates will be unreliable with fewer than "
-                    f"{_MIN_SEGMENTS} segments.\n\n"
-                    f"Consider reducing tau_max or using a longer dataset.\n\n"
+                    f"Only {n_expected} segment"
+                    f"{'s' if n_expected != 1 else ''} can be formed from "
+                    f"{fcs_data.duration_s:.4g} s of data at a "
+                    f"{seg_duration_s:.4g} s segment length.\n\n"
+                    f"{detail}\n\n"
+                    f"Consider a shorter segment length or a longer "
+                    f"dataset.\n\n"
+                    f"Proceed anyway?",
+                    parent=dialog,
+                ):
+                    return
+
+            # A segment of duration D only supports lags well below D.
+            if tau_max_s * _MIN_SEGMENT_FACTOR > seg_duration_s:
+                usable_ms = (seg_duration_s / _MIN_SEGMENT_FACTOR) * 1e3
+                if not messagebox.askyesno(
+                    "τ max large for this segment length",
+                    f"τ max = {tau_max_ms:.3g} ms exceeds "
+                    f"{usable_ms:.3g} ms, which is 1/{_MIN_SEGMENT_FACTOR} of "
+                    f"the {seg_duration_s:.4g} s segment length.\n\n"
+                    f"G(τ) is still computed out to τ max, but the long-lag "
+                    f"error bars will be large because each segment contains "
+                    f"few independent samples at those lags.\n\n"
                     f"Proceed anyway?",
                     parent=dialog,
                 ):
@@ -1822,6 +2664,8 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         _defaults["thin_factor"]       = thin_factor
         _defaults["mt_channels"]       = mt_m
         _defaults["mt_coarsen"]        = mt_coarsen
+        _defaults["seg_duration_s"]    = seg_duration_s
+        _defaults["full_trace_G"]      = full_trace_G
 
         # ── Batch / collect-only mode ────────────────────────────────────────
         # When called by the multi-file batch path, just hand back the chosen
@@ -1839,6 +2683,9 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
                 "thin_factor":       thin_factor,
                 "mt_channels":       mt_m,
                 "mt_coarsen":        mt_coarsen,
+                "seg_duration_s":    seg_duration_s,
+                "full_trace_G":      full_trace_G,
+                "mt_compress":       _defaults["mt_compress"],
             }
             dialog.destroy()
             return
@@ -1883,22 +2730,36 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
             times_ch2 = thin_photons(times_ch2, thin_factor)
 
         # ── Compute total progress steps ─────────────────────────────────────
+        # Must match the work actually done, or the bar saturates early and
+        # sits at 100% while the computation continues:
+        #   * segmenting  -> one pass per segment
+        #   * full_trace_G -> one EXTRA pass over the whole stream
+        #   * symmetric cross -> each pass runs both A->B and B->A
         N = max(len(times_ch1), len(times_ch2))
         if segment:
-            seg_dur = _MIN_SEGMENT_FACTOR * tau_max_s
-            total_s = fcs_data.duration_s
-            n_segs  = max(1, int(total_s // seg_dur))
+            n_segs = len(segment_bounds(0.0, fcs_data.duration_s,
+                                        seg_duration_s))
         else:
             n_segs = 1
 
+        # Passes over the data: one per segment, plus the full-trace pass.
+        n_passes = n_segs + (1 if (segment and full_trace_G) else 0)
+
+        # Symmetrisation correlates both directions, and both now report
+        # progress — but only for the tau_edges-based estimators.  The
+        # multi-tau backends report ONE step per segment regardless of
+        # direction, so they must not be doubled.
+        sym_mult = 2 if (corr_type == "cross" and not is_multitau) else 1
+
         if is_multitau:
-            total_steps = n_segs
+            total_steps = n_passes
         elif method == "perbin":
-            total_steps = n_segs * n_bins
+            total_steps = n_passes * n_bins * sym_mult
         else:
-            N_per_seg   = max(1, N // n_segs)
-            total_steps = n_segs * max(1, (N_per_seg + _TP_CHUNK_SIZE - 1)
-                                          // _TP_CHUNK_SIZE)
+            N_per_seg   = max(1, N // max(1, n_segs))
+            total_steps = (n_passes * sym_mult
+                           * max(1, (N_per_seg + _TP_CHUNK_SIZE - 1)
+                                    // _TP_CHUNK_SIZE))
 
         # ── Progress window ──────────────────────────────────────────────────
         pw = _ProgressWindow(
@@ -1924,22 +2785,44 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
                     _a = _b = times_ch1
                 else:
                     _a = _b = times_ch2
-                tau, G_mean, G_std, n_segs = compute_multitau(
-                    _a, _b, tau_min_s, tau_max_s, m=mt_m, coarsen=mt_coarsen,
-                    segment=segment, duration_s=fcs_data.duration_s,
-                    progress_cb=_progress)
+                if method == "multitau_pkg":
+                    tau, G_mean, G_std, n_segs = compute_multitau_pkg(
+                        _a, _b, tau_min_s, tau_max_s, m=mt_m,
+                        segment=segment, duration_s=fcs_data.duration_s,
+                        progress_cb=_progress,
+                        seg_duration_s=seg_duration_s,
+                        full_trace_G=full_trace_G,
+                        symmetric=(corr_type == "cross"),
+                        compress=_defaults["mt_compress"])
+                else:
+                    tau, G_mean, G_std, n_segs = compute_multitau(
+                        _a, _b, tau_min_s, tau_max_s, m=mt_m,
+                        coarsen=mt_coarsen,
+                        segment=segment, duration_s=fcs_data.duration_s,
+                        progress_cb=_progress,
+                        seg_duration_s=seg_duration_s,
+                        full_trace_G=full_trace_G,
+                        symmetric=(corr_type == "cross"))
             elif corr_type == "cross":
-                tau, G_mean, G_std, n_segs = compute_crosscorr(
+                # Symmetric ½(G_AB + G_BA) — matches compute_correlation_for,
+                # so a file correlated single vs. batch gives the same answer.
+                tau, G_mean, G_std, n_segs = compute_crosscorr_symmetric(
                     times_ch1, times_ch2, tau_edges, method, segment,
-                    progress_cb=_progress)
+                    progress_cb=_progress,
+                    seg_duration_s=seg_duration_s,
+                    full_trace_G=full_trace_G)
             elif corr_type == "auto_ch1":
                 tau, G_mean, G_std, n_segs = compute_autocorr(
                     times_ch1, tau_edges, method, segment,
-                    progress_cb=_progress)
+                    progress_cb=_progress,
+                    seg_duration_s=seg_duration_s,
+                    full_trace_G=full_trace_G)
             else:
                 tau, G_mean, G_std, n_segs = compute_autocorr(
                     times_ch2, tau_edges, method, segment,
-                    progress_cb=_progress)
+                    progress_cb=_progress,
+                    seg_duration_s=seg_duration_s,
+                    full_trace_G=full_trace_G)
         except KeyboardInterrupt:
             pw.close()
             messagebox.showinfo("Cancelled", "Correlation computation cancelled.")
@@ -1971,13 +2854,74 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
             method=method,
             gate_min_ns=gate_min_ns,
             gate_max_ns=gate_max_ns,
-            export=export,n_used_ch1=_n1, n_used_ch2=_n2, T_used=_T
+            export=export, n_used_ch1=_n1, n_used_ch2=_n2, T_used=_T,
+            seg_duration_s=(seg_duration_s if segment else None),
+            full_trace_G=(full_trace_G if segment else None),
+            mt_channels=(mt_m if is_multitau else None),
+            mt_coarsen=(mt_coarsen if method == "multitau" else None),
+            mt_compress=(_defaults["mt_compress"]
+                         if method == "multitau_pkg" else None),
         )
 
     tk.Button(btn_frame, text="Compute", width=12,
               command=_on_compute, pady=4).pack(side="left", padx=6)
     tk.Button(btn_frame, text="Cancel", width=10,
               command=dialog.destroy, pady=4).pack(side="left", padx=6)
+
+    # ── Method-dependent control visibility ───────────────────────────────────
+    # Defined last, so every widget it repositions already exists.  tkinter's
+    # pack() appends to the END of the parent's packing order, so a widget that
+    # is pack_forget()-ten and later re-packed would jump to the bottom of the
+    # dialog; `before=` pins it back to its proper place.
+    def _update_method_controls(*_):
+        m = method_var.get()
+
+        # Bins/decade and photon thinning drive the log-spaced tau_edges grid,
+        # which only the per-bin and two-pointer estimators use.  The multi-tau
+        # backends bin the intensity onto their own octave grid and never see
+        # either control.
+        if m in ("perbin", "twopointer"):
+            speed_frame.pack(fill="x", before=_tail, **pad)
+        else:
+            speed_frame.pack_forget()
+
+        # Channels/octave: both multi-tau backends.
+        if m in ("multitau", "multitau_pkg"):
+            mt_row.pack(fill="x", padx=(22, 0), before=time_est_label)
+        else:
+            mt_row.pack_forget()
+
+        # Coarsening: in-house multi-tau only — multipletau is fixed base-2.
+        if m == "multitau":
+            mt_coarsen_row.pack(fill="x", padx=(22, 0), before=time_est_label)
+        else:
+            mt_coarsen_row.pack_forget()
+
+        if m == "multitau_pkg":
+            mt_note_var.set(
+                "      base-2 octaves (no coarsening factor); an odd channel\n"
+                "      count is rounded up to the next even number")
+            mt_note.pack(fill="x", before=time_est_label)
+        else:
+            mt_note.pack_forget()
+
+    method_var.trace_add("write", _update_method_controls)
+    _update_method_controls()
+
+    # ── Size the window to its content, clamped to the screen ────────────────
+    # Guessing a fixed geometry is how the buttons ended up clipped: the option
+    # list grows, and any hardcoded height is wrong on some screen.  Measure the
+    # content instead, then cap at 85% of screen height so the window always
+    # fits; whatever does not fit is reachable by scrolling, and the buttons are
+    # pinned outside the scroll region regardless.
+    dialog.update_idletasks()
+    _w = max(380, body.winfo_reqwidth() + _vsb.winfo_reqwidth() + 6)
+    _content_h = body.winfo_reqheight() + btn_frame.winfo_reqheight() + 14
+    _h = min(_content_h, int(dialog.winfo_screenheight() * 0.85))
+    dialog.geometry(f"{_w}x{_h}")
+    # Never let the user drag it shorter than the buttons plus a usable strip.
+    dialog.minsize(_w, min(_content_h, 320))
+    _on_body_configure()
 
     dialog.wait_window()
     return result_box["params"]
@@ -1989,23 +2933,37 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
         print("Usage: python fcs_corr.py <file.fcs> [tau_min_ms] [tau_max_ms] [method]")
-        print("  method: perbin (default) | twopointer | multitau")
+        print("  method: perbin (default) | twopointer | multitau | multitau_pkg")
         sys.exit(1)
     d    = read_fcs(sys.argv[1])
     tmin = float(sys.argv[2]) if len(sys.argv) > 2 else _defaults["tau_min_ms"]
     tmax = float(sys.argv[3]) if len(sys.argv) > 3 else _defaults["tau_max_ms"]
     meth = sys.argv[4]        if len(sys.argv) > 4 else "perbin"
 
-    if meth == "multitau":
+    if meth == "multitau_pkg":
+        tau, G_mean, G_std, n_segs = compute_multitau_pkg(
+            d.ch1_times_s, d.ch2_times_s, tmin * 1e-3, tmax * 1e-3,
+            m=_defaults["mt_channels"], duration_s=d.duration_s,
+            symmetric=True)
+    elif meth == "multitau":
         tau, G_mean, G_std, n_segs = compute_multitau(
             d.ch1_times_s, d.ch2_times_s, tmin * 1e-3, tmax * 1e-3,
             m=_defaults["mt_channels"], coarsen=_defaults["mt_coarsen"],
-            duration_s=d.duration_s)
+            duration_s=d.duration_s, symmetric=True)
     else:
         edges = build_tau_edges(tmin * 1e-3, tmax * 1e-3,
                                 grid_period_s=d.macrotime_period_s)
-        tau, G_mean, G_std, n_segs = compute_crosscorr(
+        tau, G_mean, G_std, n_segs = compute_crosscorr_symmetric(
             d.ch1_times_s, d.ch2_times_s, edges, meth)
     print(f"Segments used: {n_segs}")
     plot_correlation(tau, G_mean, G_std, "cross", d,
-                     tmin * 1e-3, tmax * 1e-3, n_segs, method=meth)
+                     tmin * 1e-3, tmax * 1e-3, n_segs, method=meth,
+                     seg_duration_s=_defaults["seg_duration_s"],
+                     full_trace_G=_defaults["full_trace_G"],
+                     mt_channels=(_defaults["mt_channels"]
+                                  if meth in ("multitau", "multitau_pkg")
+                                  else None),
+                     mt_coarsen=(_defaults["mt_coarsen"]
+                                 if meth == "multitau" else None),
+                     mt_compress=(_defaults["mt_compress"]
+                                  if meth == "multitau_pkg" else None))

@@ -856,7 +856,7 @@ def run_calibration_dialog(parent=None, init_dir=None):
     has_err = bool(np.all(np.isfinite(N_err)) and np.all(N_err > 0))
     win = tk.Toplevel(parent)
     win.title("Volume calibration — ⟨N⟩ vs concentration")
-    win.resizable(False, False)
+    win.resizable(True, True)
     win.grab_set()
 
     tk.Label(win, text="Enter the known concentration for each dataset",
@@ -903,8 +903,32 @@ def run_calibration_dialog(parent=None, init_dir=None):
     tk.Label(imp, text="  (dataset,concentration  —  or one value per row)",
              font=("Helvetica", 8), fg="grey").pack(side="left")
 
-    table = tk.Frame(win, padx=12, pady=4)
-    table.pack(fill="x")
+
+    #ADDING BELOW:
+    table_container = tk.Frame(win)
+    table_container.pack(fill="both", expand=True, padx=12, pady=4)
+
+    canvas = tk.Canvas(table_container, height=300)
+    scrollbar = tk.Scrollbar(table_container,
+                         orient="vertical",
+                         command=canvas.yview)
+
+    table = tk.Frame(canvas)
+
+    table.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+    canvas.create_window((0, 0), window=table, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    # END ADDITION -- next 2 lines also commented out
+
+
+    #table = tk.Frame(win, padx=12, pady=4)
+    #table.pack(fill="x")
     tk.Label(table, text="dataset", font=("Helvetica", 10, "bold")).grid(
         row=0, column=0, sticky="w", padx=4, pady=(0, 4))
     tk.Label(table, text="⟨N⟩", font=("Helvetica", 10, "bold")).grid(
