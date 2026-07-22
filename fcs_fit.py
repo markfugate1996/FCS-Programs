@@ -207,6 +207,33 @@ def _bg_corr_from_meta(meta: Optional[dict]) -> Optional[Tuple[float, float]]:
 
 # ── Initial-guess heuristics ──────────────────────────────────────────────────
 
+# Pair-starved cutoff.
+#
+# G(tau) = C.n/(Sa.Sb) - 1 with C the number of photon PAIRS at that lag, so
+# G = -1 is the hard floor of the estimator: it is what a lag returns when no
+# pair was observed at all.  Such a channel is CENSORED, not measured -- the
+# true G could be anything below the detection limit.
+#
+# Two things make these channels poisonous to a fit rather than merely
+# uninformative.  Every segment returns the same floored value, so the
+# segment-to-segment scatter is zero and G_std collapses; the point then
+# carries an enormous 1/sigma^2 weight.  On a real 10 cps dataset this
+# produced weights of 1e6 against 0.05 for the legitimate points, and the fit
+# returned a negative amplitude and a negative diffusion time.
+#
+# The cutoff sits at -0.9 rather than exactly -1 because the observed floor is
+# not exactly -1: normalising by the MEASURED trace mean carries a finite
+# sample bias of order 1/N, which lifts the floor to -(1 - (1/Sa + 1/Sb)/2).
+# On the dataset above that put the floor at -0.998.  For the floor to rise
+# above -0.9 a channel would need fewer than about ten photons in the entire
+# acquisition.
+#
+# The only physical process that drives G below -0.9 is photon antibunching,
+# which lives at nanosecond lags -- four decades below the microsecond tau_min
+# this suite works at -- so a false positive is not a practical concern.
+_PAIR_STARVED_CUTOFF = -0.9
+
+
 def auto_guess(model: FCSModel, tau_s: np.ndarray, G: np.ndarray) -> Dict[str, float]:
     """
     Produce sensible starting guesses from the data.
@@ -220,6 +247,11 @@ def auto_guess(model: FCSModel, tau_s: np.ndarray, G: np.ndarray) -> Dict[str, f
     t = np.asarray(tau_s, dtype=np.float64)
     y = np.asarray(G, dtype=np.float64)
     m = np.isfinite(t) & np.isfinite(y) & (t > 0)
+    # Pair-starved channels cluster at SHORT lag, which is exactly where the
+    # amplitude guess is read from, so leaving them in would start the fit
+    # from an amplitude of about -1.  Dropped here unconditionally: this only
+    # sets a starting point, never the fitted result.
+    m &= y > _PAIR_STARVED_CUTOFF
     t, y = t[m], y[m]
     if len(t) < 3:
         return guess
@@ -333,6 +365,8 @@ def fit_global(
     fixed: Dict[str, bool],
     weighted: bool = False,
     maxfev: int = 20000,
+    drop_pair_starved: bool = True,
+    pair_starved_cutoff: float = _PAIR_STARVED_CUTOFF,
 ) -> dict:
     """
     Global least-squares fit of one model to several correlation datasets.
@@ -346,6 +380,13 @@ def fit_global(
     optionally ``sigma``.  Weighting is applied only if ``weighted`` is True
     *and* every included dataset carries a usable sigma.
 
+    When *drop_pair_starved* is True (the default) any lag whose G lies at or
+    below *pair_starved_cutoff* is discarded before fitting.  See
+    ``_PAIR_STARVED_CUTOFF`` for why those channels are censored rather than
+    measured, and why their uncertainties are not to be trusted.  The count
+    discarded per dataset is returned in the result as ``n_pair_starved`` so
+    the report can state it rather than silently using fewer points.
+
     Returns a result dict with global goodness-of-fit plus a per-dataset
     breakdown (values, 1σ errors, fit curve, residuals, R²).
     """
@@ -353,6 +394,7 @@ def fit_global(
 
     # ── Mask each dataset to finite, positive-lag points ─────────────────────
     prepped = []
+    starved_counts: Dict[str, int] = {}
     for ds in datasets:
         t = np.asarray(ds["tau"], dtype=np.float64)
         y = np.asarray(ds["G"],   dtype=np.float64)
@@ -361,12 +403,33 @@ def fit_global(
         if weighted and ds.get("sigma") is not None:
             s = np.asarray(ds["sigma"], dtype=np.float64)
             m &= np.isfinite(s) & (s > 0)
+
+        n_starved = 0
+        if drop_pair_starved:
+            starved = m & (y <= pair_starved_cutoff)
+            n_starved = int(np.count_nonzero(starved))
+            m &= ~starved
+        starved_counts[ds["name"]] = n_starved
+
         t, y = t[m], y[m]
         s = s[m] if s is not None else None
         if len(t) < 2:
-            raise ValueError(f"Dataset '{ds['name']}' has too few finite points to fit.")
+            if n_starved:
+                raise ValueError(
+                    f"Dataset '{ds['name']}' has too few usable points to fit: "
+                    f"{n_starved} lag channel"
+                    f"{'s' if n_starved != 1 else ''} were discarded as "
+                    f"pair-starved (G <= {pair_starved_cutoff:g}, meaning no "
+                    f"photon pairs were detected at those lags) and fewer than "
+                    f"two remain.\n\n"
+                    f"This usually means the count rate is too low for the "
+                    f"chosen lag range, not that the fit settings are wrong."
+                )
+            raise ValueError(
+                f"Dataset '{ds['name']}' has too few finite points to fit.")
         prepped.append({"name": ds["name"], "tau": t, "G": y, "sigma": s,
-                        "meta": ds.get("meta", {})})
+                        "meta": ds.get("meta", {}),
+                        "n_pair_starved": n_starved})
 
     D = len(prepped)
     if D == 0:
@@ -449,6 +512,7 @@ def fit_global(
             "Gfit": mvals, "resid": resid, "sigma": pp["sigma"],
             "values": vals, "errors": errs, "r2": r2,
             "ss_res": ss_res, "n_points": len(pp["tau"]),
+            "n_pair_starved": pp.get("n_pair_starved", 0),
             "meta": pp.get("meta", {}),
         })
 
@@ -470,6 +534,8 @@ def fit_global(
         "linked": dict(linked), "fixed": dict(fixed),
         "lowers": dict(lowers), "uppers": dict(uppers), "guesses": dict(guesses),
         "weighted": use_weights, "n_datasets": D,
+        "drop_pair_starved": bool(drop_pair_starved),
+        "pair_starved_cutoff": float(pair_starved_cutoff),
         "dof": dof, "n_free": n_par, "n_obs": n_obs,
         "chi2": chi2, "red_chi2": red_chi2, "ss_res": ss_res_tot,
         "success": bool(sol.success), "message": str(sol.message),
@@ -827,6 +893,14 @@ def export_global_fit(result: dict, out_source: str | Path) -> Tuple[Path, Path,
     L.append(f"free params: {result['n_free']}   observations: {result['n_obs']}   "
              f"dof: {result['dof']}")
     L.append(f"weighted   : {'yes (σ from G_std)' if result['weighted'] else 'no'}")
+    _starved = sum(d.get("n_pair_starved", 0) for d in result["datasets"])
+    if result.get("drop_pair_starved"):
+        L.append(f"pair-starved: {_starved} lag channel"
+                 f"{'s' if _starved != 1 else ''} discarded "
+                 f"(G <= {result.get('pair_starved_cutoff', -0.9):g})")
+    else:
+        L.append("pair-starved: guard DISABLED — censored channels, if any, "
+                 "were fitted")
     L.append(f"converged  : {result['success']}  ({result['message']})")
     if result["weighted"]:
         L.append(f"red. chi^2 : {result['red_chi2']:.6g}")
@@ -854,7 +928,10 @@ def export_global_fit(result: dict, out_source: str | Path) -> Tuple[Path, Path,
     L.append("Per-dataset results")
     L.append("-" * 64)
     for ds in result["datasets"]:
-        L.append(f"[{ds['name']}]   points: {ds['n_points']}   R² = {ds['r2']:.5f}")
+        _ns = ds.get("n_pair_starved", 0)
+        _drop = f"   pair-starved dropped: {_ns}" if _ns else ""
+        L.append(f"[{ds['name']}]   points: {ds['n_points']}   "
+                 f"R² = {ds['r2']:.5f}{_drop}")
         cps = _cps_from_meta(ds.get("meta"))
         if cps is not None:
             L.append(f"    CPS      : Ch1 {_fmt_cps(cps['cps_ch1'])}   "
@@ -1653,6 +1730,29 @@ def _global_setup_dialog(parent, model, datasets, out_source):
         state="normal" if all_have_sigma else "disabled",
     ).pack(fill="x", padx=12, pady=(6, 0))
 
+    # How many channels this would actually remove, so the effect of the
+    # option is visible before the fit rather than discovered afterwards.
+    _n_starved = 0
+    for _ds in datasets:
+        _y = np.asarray(_ds["G"], dtype=np.float64)
+        _n_starved += int(np.count_nonzero(
+            np.isfinite(_y) & (_y <= _PAIR_STARVED_CUTOFF)))
+
+    starved_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(
+        win,
+        text=(f"Drop pair-starved bins (G ≤ {_PAIR_STARVED_CUTOFF:g}) "
+              f"— {_n_starved} found"),
+        variable=starved_var, anchor="w",
+    ).pack(fill="x", padx=12, pady=(2, 0))
+    if _n_starved:
+        tk.Label(
+            win,
+            text=("      those lags recorded no photon pairs, so their G is a "
+                  "floor value\n      and their σ is spuriously small"),
+            font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
+        ).pack(fill="x", padx=12)
+
     btns = tk.Frame(win)
     btns.pack(pady=10)
 
@@ -1678,7 +1778,8 @@ def _global_setup_dialog(parent, model, datasets, out_source):
 
         try:
             result = fit_global(model, datasets, linked, guesses,
-                                lowers, uppers, fixed, weighted=weighted)
+                                lowers, uppers, fixed, weighted=weighted,
+                                drop_pair_starved=starved_var.get())
         except Exception as e:
             messagebox.showerror("Fit failed", str(e), parent=win)
             return
