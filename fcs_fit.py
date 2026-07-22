@@ -39,6 +39,7 @@ from scipy.optimize import least_squares
 
 import fcs_models
 from fcs_models import FCSModel
+import fcs_export
 from fcs_reader import read_fcs, FCSData
 import fcs_lifetime
 import fcs_lifetime_fit
@@ -86,32 +87,11 @@ def load_correlation_csv(
     columns : dict of every column found, by name
     meta  : dict of header ``# key : value`` fields (e.g. 'source file', 'type')
     """
+    # Parsing lives in fcs_export.read_export -- the same reader the writer
+    # is paired with, so the format is defined in exactly one place.  This
+    # function keeps its own signature and its FCS-specific validation.
     path = Path(path)
-    header: Optional[list[str]] = None
-    rows: list[list[str]] = []
-    meta: Dict[str, str] = {}
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            if line.startswith("#"):
-                body = line[1:].strip()
-                if ":" in body:
-                    k, v = body.split(":", 1)
-                    meta[k.strip()] = v.strip()
-                continue
-            if not line.strip():
-                continue
-            cells = [c.strip() for c in line.rstrip("\n").split(",")]
-            if header is None:
-                header = cells
-                continue
-            rows.append(cells)
-
-    if not header:
-        raise ValueError(f"No header row found in {path.name}.")
-
-    data = (np.array(rows, dtype=np.float64)
-            if rows else np.empty((0, len(header)), dtype=np.float64))
-    columns = {name: data[:, i] for i, name in enumerate(header)}
+    meta, columns = fcs_export.read_export(path)
 
     if "tau_s" in columns:
         tau_s = columns["tau_s"]
@@ -194,6 +174,35 @@ def _fmt_cps(x: Optional[float]) -> str:
     if x is None or (isinstance(x, float) and not np.isfinite(x)):
         return "n/a"
     return f"{x:,.0f}"
+
+
+def _bg_corr_from_meta(meta: Optional[dict]) -> Optional[Tuple[float, float]]:
+    """
+    Read the Koppel amplitude correction (kappa, sigma_kappa) from a
+    correlation CSV header, as written by fcs_corr.
+
+    kappa = bg_correction_factor is the AMPLITUDE multiplier:
+    G0_corr = G0 * kappa (kappa >= 1).  Occupancy is the reciprocal:
+    N_corr = N / kappa.  Returns None when the header has no factor (a CSV
+    exported before this field existed), so the correction is simply skipped.
+    """
+    if not meta:
+        return None
+    v = meta.get("bg_correction_factor")
+    if v in (None, ""):
+        return None
+    try:
+        kappa = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not (kappa > 0):
+        return None
+    e = meta.get("bg_correction_factor_std")
+    try:
+        kappa_err = float(e) if e not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        kappa_err = 0.0
+    return kappa, kappa_err
 
 
 # ── Initial-guess heuristics ──────────────────────────────────────────────────
@@ -484,15 +493,26 @@ def plot_global_fit(result: dict, show: bool = True):
     for ds, c in zip(dsets, colors):
         tau_ms = ds["tau"] * 1e3
         ax.semilogx(tau_ms, ds["G"], linestyle="none", marker=".",
-                    markersize=3.5, color=c, alpha=0.8)
-        t_dense = np.logspace(np.log10(ds["tau"].min()),
-                              np.log10(ds["tau"].max()), 400)
-        g_dense = model.func(t_dense, **{n: ds["values"][n] for n in result["names"]})
+                    markersize=3.5, color=c, alpha=0.8,
+                    label=f"_{ds['name']}  (data)")
+        # A rebuilt fit supplies its own curve (see rebuild_plot): the model
+        # function may be unavailable, or re-evaluating it may not reproduce
+        # what was actually fitted.  A live fit has no "dense" key and the
+        # model is evaluated as usual.
+        dense = ds.get("dense")
+        if dense is not None:
+            t_dense, g_dense = dense
+        else:
+            t_dense = np.logspace(np.log10(ds["tau"].min()),
+                                  np.log10(ds["tau"].max()), 400)
+            g_dense = model.func(
+                t_dense, **{n: ds["values"][n] for n in result["names"]})
         ax.semilogx(t_dense * 1e3, g_dense, color=c, linewidth=1.4,
                     label=ds["name"])
         res = ds["resid"] / ds["sigma"] if result["weighted"] else ds["resid"]
         axr.semilogx(tau_ms, res, linestyle="none", marker=".",
-                     markersize=2.5, color=c, alpha=0.8)
+                     markersize=2.5, color=c, alpha=0.8,
+                     label=f"_{ds['name']}  (residual)")
 
     ax.axhline(0, color="grey", linewidth=0.6, linestyle="--")
     ax.set_ylabel("G(τ)", fontsize=12)
@@ -500,18 +520,25 @@ def plot_global_fit(result: dict, show: bool = True):
     ax.grid(True, which="minor", linestyle=":",  linewidth=0.3, alpha=0.3)
 
     # Linked-parameter summary box (linked values are shared, so read ds 0)
-    linked_names = [n for n in result["names"] if result["linked"].get(n)]
+    ref = dsets[0].get("values", {})
+    referr = dsets[0].get("errors", {})
+    # A rebuilt fit whose parameter table could not be found has no values to
+    # report, so those entries are simply omitted rather than raising.
+    linked_names = [n for n in result["names"]
+                    if result["linked"].get(n) and n in ref]
     box = []
-    ref = dsets[0]["values"]
-    referr = dsets[0]["errors"]
     for n in linked_names:
         unit = next((p.unit for p in model.params if p.name == n), "")
-        tag = "(fixed)" if result["fixed"].get(n) else f"± {referr[n]:.2g}"
+        tag = ("(fixed)" if result["fixed"].get(n)
+               else (f"± {referr[n]:.2g}" if n in referr else ""))
         box.append(f"{n} = {ref[n]:.4g} {tag} {unit}".rstrip())
-    gof = (f"red. χ² = {result['red_chi2']:.3g}"
-           if result["weighted"] else
-           f"global R² = {1 - result['ss_res'] / _grand_ss_tot(dsets):.4f}")
-    box.append(gof)
+    if result["weighted"] and result.get("red_chi2") is not None:
+        box.append(f"red. χ² = {result['red_chi2']:.3g}")
+    elif not result["weighted"] and result.get("ss_res") is not None:
+        box.append(
+            f"global R² = {1 - result['ss_res'] / _grand_ss_tot(dsets):.4f}")
+    if result.get("rebuilt_note"):
+        box.append(result["rebuilt_note"])
     if box:
         ax.text(0.98, 0.95, "linked:\n" + "\n".join(box),
                 transform=ax.transAxes, ha="right", va="top",
@@ -539,13 +566,242 @@ def plot_global_fit(result: dict, show: bool = True):
     return fig, np.array([ax, axr])
 
 
+class _StoredModel:
+    """
+    Stand-in for an FCSModel when the original cannot be reconstructed.
+
+    Carries only what plot_global_fit reads for labelling.  Its func() raises:
+    a rebuilt fit that reaches this class must supply its own curve, and a
+    silent wrong curve would be far worse than a loud failure.
+    """
+
+    def __init__(self, name: str, formula: str = "", params=()):
+        self.key = ""
+        self.name = name
+        self.formula = formula
+        self.params = list(params)
+
+    def func(self, *_a, **_k):
+        raise RuntimeError(
+            "This fit was rebuilt from a CSV and its model could not be "
+            "reconstructed, so the model function is unavailable."
+        )
+
+
+def _read_param_table(path: Path):
+    """
+    Read the sibling globalfit_params.csv, if it is there.
+
+    Returns (values_by_dataset, errors_by_dataset, columns) -- all empty when
+    the file is missing or unreadable.  A missing parameter table is not an
+    error: it only means the linked-parameter box cannot be filled in and the
+    fit curve cannot be re-evaluated densely.
+    """
+    empty: tuple = ({}, {}, [])
+    if path is None:
+        return empty
+    pp = Path(path).with_name("globalfit_params.csv")
+    if not pp.is_file():
+        return empty
+    try:
+        _meta, cols = fcs_export.read_export(pp)
+    except Exception:
+        return empty
+    if "dataset" not in cols:
+        return empty
+
+    names = [c for c in cols if f"{c}_err" in cols]
+    values: Dict[str, dict] = {}
+    errors: Dict[str, dict] = {}
+    for i, raw in enumerate(cols["dataset"]):
+        ds = str(raw)
+        values[ds] = {n: float(cols[n][i]) for n in names}
+        errors[ds] = {n: float(cols[f"{n}_err"][i]) for n in names}
+    return values, errors, names
+
+
+def rebuild_plot(meta: dict, columns: dict, show: bool = True, path=None):
+    """
+    Rebuild a global-fit figure from an exported globalfit_curves.csv.
+
+    The curves file holds the data, the fitted curve and the residuals at the
+    lags that were actually fitted.  Two further things are recovered when
+    available, and both degrade gracefully:
+
+    * The linked-parameter box needs per-dataset values, which live in the
+      sibling ``globalfit_params.csv``.  Without it the box is omitted.
+    * The smooth fit line is drawn by re-evaluating the model densely, which
+      needs both the model key (recorded in the header) and those parameter
+      values.  Without either, the stored fit is plotted at its own lags.
+      On a semilog axis with 20+ points per decade that is visually
+      indistinguishable -- under a tenth of a typical error bar.
+
+    Re-evaluating the model is VERIFIED before it is used.  fcs_models can
+    change: correct a factor, alter a convention, and re-evaluating a fit
+    saved beforehand would silently draw a curve that is not the one that was
+    fitted.  The stored G_fit column is the ground truth, so the
+    reconstruction is checked against it at the data lags and discarded if it
+    disagrees, with the reason shown on the plot.
+
+    Parameters
+    ----------
+    meta, columns : from fcs_export.read_export
+    show : passed through to plot_global_fit
+    path : the curves CSV itself, used to find the sibling parameter table
+
+    Returns
+    -------
+    fig, axes
+    """
+    if "dataset" not in columns:
+        raise ValueError(
+            "No 'dataset' column: this does not look like a global-fit "
+            "curves export."
+        )
+    if "tau_s" in columns:
+        tau_all = np.asarray(columns["tau_s"], dtype=float)
+    elif "tau_ms" in columns:
+        tau_all = np.asarray(columns["tau_ms"], dtype=float) * 1e-3
+    else:
+        raise ValueError("No 'tau_s' or 'tau_ms' column in this export.")
+    for need in ("G_data", "G_fit"):
+        if need not in columns:
+            raise ValueError(f"No '{need}' column in this export.")
+
+    G_all    = np.asarray(columns["G_data"], dtype=float)
+    Gfit_all = np.asarray(columns["G_fit"], dtype=float)
+    res_all  = (np.asarray(columns["residual"], dtype=float)
+                if "residual" in columns else G_all - Gfit_all)
+    sig_all  = (np.asarray(columns["sigma"], dtype=float)
+                if "sigma" in columns else None)
+
+    weighted = (meta.get("weighted", "").strip().lower() == "yes"
+                if "weighted" in meta else sig_all is not None)
+
+    def _name_list(key):
+        raw = meta.get(key, "")
+        return [x.strip() for x in raw.split(",") if x.strip()]
+
+    linked_names = _name_list("linked")
+    fixed_names  = _name_list("fixed")
+
+    values_by_ds, errors_by_ds, table_names = _read_param_table(path)
+
+    model = None
+    model_key = meta.get("model_key", "").strip()
+    if model_key:
+        try:
+            model = fcs_models.get_model(model_key)
+        except Exception:
+            model = None
+
+    if model is not None:
+        names = [p.name for p in model.params]
+    else:
+        names = table_names or sorted(set(linked_names) | set(fixed_names))
+
+    # ── Split the long format back into datasets, preserving file order ──────
+    order: list = []
+    index: Dict[str, list] = {}
+    for i, raw in enumerate(columns["dataset"]):
+        ds = str(raw)
+        if ds not in index:
+            index[ds] = []
+            order.append(ds)
+        index[ds].append(i)
+
+    notes: list = []
+    dsets: list = []
+    for ds in order:
+        idx = np.asarray(index[ds], dtype=int)
+        tau_i, G_i, Gfit_i = tau_all[idx], G_all[idx], Gfit_all[idx]
+        vals = values_by_ds.get(ds, {})
+        errs = errors_by_ds.get(ds, {})
+
+        dense = None
+        if model is not None and vals and all(n in vals for n in names):
+            try:
+                check = model.func(tau_i, **{n: vals[n] for n in names})
+                scale = float(np.nanmax(np.abs(Gfit_i))) or 1.0
+                if np.allclose(check, Gfit_i, rtol=1e-4, atol=1e-6 * scale):
+                    t_dense = np.logspace(np.log10(tau_i.min()),
+                                          np.log10(tau_i.max()), 400)
+                    dense = (t_dense,
+                             model.func(t_dense, **{n: vals[n] for n in names}))
+                else:
+                    worst = float(np.nanmax(np.abs(check - Gfit_i)))
+                    notes.append(
+                        f"model '{model_key}' no longer reproduces the stored "
+                        f"fit (max Δ {worst:.3g}); showing the stored curve"
+                    )
+            except Exception as exc:      # noqa: BLE001 — fall back, don't fail
+                notes.append(f"could not re-evaluate '{model_key}' ({exc})")
+
+        if dense is None:
+            dense = (tau_i, Gfit_i)
+
+        dsets.append({
+            "name": ds,
+            "tau": tau_i,
+            "G": G_i,
+            "Gfit": Gfit_i,
+            "resid": res_all[idx],
+            "sigma": (sig_all[idx] if sig_all is not None
+                      else np.ones(idx.size)),
+            "values": vals,
+            "errors": errs,
+            "n_points": int(idx.size),
+            "dense": dense,
+        })
+
+    if model is None:
+        model = _StoredModel(meta.get("model", model_key or "unknown model"))
+        if model_key:
+            notes.append(f"model '{model_key}' is not in fcs_models")
+
+    ss_res = float(sum(float(np.sum(d["resid"] ** 2)) for d in dsets))
+
+    note = ""
+    if notes:
+        # One line, even when several datasets report the same thing.
+        note = "⚠ " + sorted(set(notes))[0]
+
+    result = {
+        "model": model,
+        "datasets": dsets,
+        "names": names,
+        "linked": {n: True for n in linked_names},
+        "fixed": {n: True for n in fixed_names},
+        "weighted": weighted,
+        "red_chi2": _to_float(meta.get("red_chi2")),
+        "ss_res": ss_res,
+        "n_datasets": _to_int(meta.get("n_datasets"), len(dsets)),
+        "n_free": _to_int(meta.get("n_free"), 0),
+        "rebuilt_note": note,
+    }
+    return plot_global_fit(result, show=show)
+
+
+def _to_float(v, default=None):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(v, default=0):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
 def _grand_ss_tot(dsets) -> float:
     allG = np.concatenate([d["G"] for d in dsets])
     return float(np.sum((allG - allG.mean()) ** 2)) or float("nan")
 
 
-def export_global_fit(result: dict, out_source: str | Path,
-                      bg_factors: Optional[dict] = None) -> Tuple[Path, Path, Path]:
+def export_global_fit(result: dict, out_source: str | Path) -> Tuple[Path, Path, Path]:
     """
     Write a global-fit report (.txt) and a combined long-format curve CSV.
 
@@ -611,24 +867,22 @@ def export_global_fit(result: dict, out_source: str | Path,
             err = "—" if result["fixed"].get(n) else f"{ds['errors'][n]:.6g}"
             L.append(f"    {n:<8} = {ds['values'][n]:.6g}  ± {err}  {unit}".rstrip())
         L.append("")
-
-    if bg_factors:
-        win = bg_factors.get("_window_ns")
-        L.append("Background correction")
+    
+    corr = [(ds["name"], _bg_corr_from_meta(ds.get("meta")))
+            for ds in result["datasets"]]
+    if ("G0" in result["names"]) and any(c is not None for _n, c in corr):
+        L.append("Background correction (Koppel amplitude factor)")
         L.append("-" * 64)
-        if win:
-            L.append(f"  TCSPC tail window : {win[0]:.2f} – {win[1]:.2f} ns")
-        L.append(f"  {'dataset':<24}{'f1':>9}{'f2':>9}{'factor':>10}")
-        for ds in result["datasets"]:
-            bg = bg_factors.get(ds["name"])
-            if bg is None:
-                continue
-            L.append(f"  {ds['name']:<24}{bg['f1']:>9.4f}{bg['f2']:>9.4f}"
-                     f"{bg['factor']:>10.4f}")
-        L.append("  (corrected <N> = <N> × factor;  factor = (1−f1)(1−f2) "
-                 "for cross, (1−fX)² for auto)")
+        L.append(f"  {'dataset':<24}{'factor':>12}{'err':>12}")
+        for name, c in corr:
+            if c is None:
+                L.append(f"  {name:<24}{'n/a':>12}")
+            else:
+                L.append(f"  {name:<24}{c[0]:>12.4f}{c[1]:>12.4f}")
+        L.append("  G0_corr = G0 x factor ;  N_corr = N / factor  "
+                 "(factor + error from the correlation CSV)")
         L.append("")
-        
+    
     L.extend(fcs_fisher.format_report_lines(
         fcs_fisher.fisher_from_covariance(
             result.get("cov"), result["free_labels"], result["weighted"])))
@@ -665,8 +919,29 @@ def export_global_fit(result: dict, out_source: str | Path,
     header = ["dataset", "tau_s", "tau_ms", "G_data", "G_fit", "residual"]
     if weighted:
         header.append("sigma")
+    linked_names = [n for n in result["names"] if result["linked"].get(n)]
+    fixed_names  = [n for n in result["names"] if result["fixed"].get(n)]
     with curve_path.open("w", encoding="utf-8-sig", newline="") as fh:
         fh.write(f"# FCS global fit curves — {model.key}\n")
+        # Machine-readable header, so this file can be reopened as a live plot
+        # (see fcs_plotopen).  The banner above uses an em-dash and no colon,
+        # so a "key : value" parser cannot read it.  Which parameters were
+        # linked and which were fixed is recorded here because it is not
+        # recoverable from the numbers alone: a linked parameter merely has
+        # equal values across datasets, which can also happen by coincidence.
+        fh.write("# analysis   : global fit curves\n")
+        fh.write(f"# model_key  : {model.key}\n")
+        fh.write(f"# model      : {model.name}\n")
+        fh.write(f"# weighted   : {'yes' if weighted else 'no'}\n")
+        fh.write(f"# n_datasets : {result['n_datasets']}\n")
+        fh.write(f"# n_free     : {result['n_free']}\n")
+        fh.write(f"# linked     : {', '.join(linked_names)}\n")
+        fh.write(f"# fixed      : {', '.join(fixed_names)}\n")
+        if weighted:
+            fh.write(f"# red_chi2   : {result['red_chi2']:.10g}\n")
+        else:
+            fh.write(f"# r2_global  : "
+                     f"{1 - result['ss_res'] / _grand_ss_tot(result['datasets']):.10g}\n")
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
         fh.write(",".join(header) + "\n")
         for ds in result["datasets"]:
@@ -698,9 +973,13 @@ def export_global_fit(result: dict, out_source: str | Path,
     has_N = "G0" in result["names"]
     if has_N:
         p_header += ["N", "N_err"]                 # <N> = 1/G0, propagated error
-    has_bg = bool(bg_factors) and has_N
+    
+    has_bg = has_N and any(_bg_corr_from_meta(ds.get("meta")) is not None
+                           for ds in result["datasets"])
     if has_bg:
-        p_header += ["bg_factor", "N_corr", "N_corr_err"]
+        p_header += ["bg_correction_factor", "bg_correction_factor_err",
+                     "G0_corr", "G0_corr_err", "N_corr", "N_corr_err"]
+                     
     has_cps = any(_cps_from_meta(ds.get("meta")) is not None
                   for ds in result["datasets"])
     if has_cps:
@@ -723,12 +1002,20 @@ def export_global_fit(result: dict, out_source: str | Path,
                 N_err = g0e / (g0 * g0)             # σ_N = σ_G0 / G0²
             row.append(float(N))
             row.append(float(N_err))
+        
         if has_bg:
-            bg = bg_factors.get(ds["name"], {})
-            factor = bg.get("factor", float("nan"))
-            row.append(float(factor))
-            row.append(float(N * factor))
-            row.append(float(N_err * factor))       # factor treated as exact
+            corr = _bg_corr_from_meta(ds.get("meta"))
+            if corr is not None and g0 > 0:
+                kappa, kappa_err = corr
+                rel = float(np.sqrt((g0e / g0) ** 2 + (kappa_err / kappa) ** 2))
+                g0_corr = g0 * kappa
+                N_corr  = N / kappa
+                row += [float(kappa), float(kappa_err),
+                        float(g0_corr), float(g0_corr * rel),
+                        float(N_corr),  float(N_corr * rel)]
+            else:
+                row += [float("nan")] * 6
+                
         if has_cps:
             cps = _cps_from_meta(ds.get("meta")) or {}
             for key in ("cps_ch1", "cps_ch2", "cps_fit", "acq_time_s"):
@@ -752,11 +1039,13 @@ def export_global_fit(result: dict, out_source: str | Path,
     comments.append("units : tau_D in seconds")
     if has_N:
         comments.append("note : N = 1/G0 (geometric factor 1); N_err = G0_err / G0^2")
+
     if has_bg:
-        win = bg_factors.get("_window_ns")
-        if win:
-            comments.append(f"background_window_ns : {win[0]:.3f} - {win[1]:.3f}")
-        comments.append("note : N_corr = N * bg_factor (background-corrected occupancy)")
+        comments.append("note : G0_corr = G0 * bg_correction_factor "
+                        "(Koppel amplitude correction, from the correlation CSV)")
+        comments.append("note : N_corr = N / bg_correction_factor ; "
+                        "*_corr_err combine fit and factor errors in quadrature")
+
     if has_cps:
         comments.append("note : cps_* are mean count rates (Hz) from the correlation "
                         "headers; cps_fit = that channel (auto) or the Ch1/Ch2 average (cross)")
@@ -775,110 +1064,6 @@ def export_global_fit(result: dict, out_source: str | Path,
     _write_params_xlsx(xlsx_path, comments, p_header, data_rows)
 
     return report_path, curve_path, params_path
-
-
-# ── Background correction ─────────────────────────────────────────────────────
-
-def resolve_source_fcs(dataset: dict) -> Optional[Path]:
-    """
-    Locate the .fcs file a correlation CSV came from, using the 'source file'
-    recorded in its header and the analysis/-folder convention.
-    """
-    meta = dataset.get("meta", {})
-    src_name = meta.get("source file") or meta.get("source")
-    csvp = Path(dataset["path"])
-    base = csvp.parent.parent if csvp.parent.name.lower() == "analysis" else csvp.parent
-
-    candidates: list[Path] = []
-    if src_name:
-        candidates += [base / src_name, csvp.parent / src_name]
-    stem = csvp.stem
-    if "_correlation" in stem:                      # '<stem>_correlation_<type>'
-        gstem = stem.split("_correlation")[0]
-        candidates += [base / f"{gstem}.fcs", csvp.parent / f"{gstem}.fcs"]
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
-
-
-def background_fraction(d: FCSData, channel: int,
-                        lo_ns: float, hi_ns: float) -> float:
-    """
-    Estimate the uncorrelated-background fraction f = B/(F+B) for one channel
-    from a TCSPC tail window where fluorescence has decayed.
-
-    The background is flat across the laser period, so extrapolating the
-    window's photon density to the full period gives the total background:
-
-        f = (photons in window / total) × (period / window width)
-    """
-    micro_ns = d.ch1_micro_ns if channel == 1 else d.ch2_micro_ns
-    total = len(micro_ns)
-    if total == 0 or hi_ns <= lo_ns:
-        return 0.0
-    period = d.laser_period_ns
-    n_win = int(np.count_nonzero((micro_ns >= lo_ns) & (micro_ns < hi_ns)))
-    f = (n_win / total) * (period / (hi_ns - lo_ns))
-    return float(np.clip(f, 0.0, 1.0))
-
-
-def default_background_window(d: FCSData) -> Tuple[float, float]:
-    """A safe tail window (ns) past the fluorescence decay for the gate default."""
-    period = d.laser_period_ns
-    try:
-        bt, c1 = d.lifetime_histogram(channel=1, n_bins=256)
-        _,  c2 = d.lifetime_histogram(channel=2, n_bins=256)
-        peak_ns = float(bt[int(np.argmax(c1.astype(float) + c2.astype(float)))])
-    except Exception:
-        peak_ns = 0.0
-    lo = max(0.60 * period, peak_ns + 15.0)
-    hi = 0.97 * period
-    if lo >= hi:
-        lo, hi = 0.70 * period, 0.99 * period
-    return float(lo), float(hi)
-
-
-def compute_background_factors(datasets: list,
-                               lo_ns: float, hi_ns: float) -> dict:
-    """
-    For each dataset, load its source .fcs and compute the amplitude
-    background-correction factor over the tail window [lo_ns, hi_ns):
-
-        cross   : factor = (1 − f1)(1 − f2)
-        auto_chX: factor = (1 − fX)²
-
-    Corrected occupancy is  <N>_corr = <N>_meas × factor.
-
-    Returns {name: {factor, f1, f2, type, source}}.  Datasets whose source
-    .fcs cannot be located get factor = nan.
-    """
-    cache: dict = {}
-    out: dict = {}
-    for ds in datasets:
-        name = ds["name"]
-        ctype = (ds.get("meta", {}).get("type") or "cross").strip()
-        src = resolve_source_fcs(ds)
-        if src is None:
-            out[name] = {"factor": float("nan"), "f1": float("nan"),
-                         "f2": float("nan"), "type": ctype, "source": None}
-            continue
-        key = str(src)
-        if key not in cache:
-            cache[key] = read_fcs(src)
-        d = cache[key]
-        f1 = background_fraction(d, 1, lo_ns, hi_ns)
-        f2 = background_fraction(d, 2, lo_ns, hi_ns)
-        if ctype == "auto_ch1":
-            factor = (1.0 - f1) ** 2
-        elif ctype == "auto_ch2":
-            factor = (1.0 - f2) ** 2
-        else:
-            factor = (1.0 - f1) * (1.0 - f2)
-        out[name] = {"factor": float(factor), "f1": f1, "f2": f2,
-                     "type": ctype, "source": src}
-    return out
-
 
 # ── GUI workflow ──────────────────────────────────────────────────────────────
 
@@ -1468,13 +1653,6 @@ def _global_setup_dialog(parent, model, datasets, out_source):
         state="normal" if all_have_sigma else "disabled",
     ).pack(fill="x", padx=12, pady=(6, 0))
 
-    bg_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(
-        win,
-        text="Correct for background  (pick a TCSPC tail range)",
-        variable=bg_var, anchor="w",
-    ).pack(fill="x", padx=12, pady=(0, 0))
-
     btns = tk.Frame(win)
     btns.pack(pady=10)
 
@@ -1495,45 +1673,8 @@ def _global_setup_dialog(parent, model, datasets, out_source):
                 messagebox.showerror("Invalid bounds",
                                      f"For '{n}', lower must be < upper.", parent=win)
                 return
+        
         weighted = all_have_sigma and weight_var.get()
-
-        # ── Optional background correction ────────────────────────────────────
-        bg_factors = None
-        if bg_var.get():
-            # Find a dataset whose source .fcs we can load to show the histogram.
-            ref_fcs = None
-            for ds in datasets:
-                src = resolve_source_fcs(ds)
-                if src is not None:
-                    try:
-                        ref_fcs = read_fcs(src)
-                        break
-                    except Exception:
-                        continue
-            if ref_fcs is None:
-                messagebox.showerror(
-                    "Background correction unavailable",
-                    "Could not locate the source .fcs file for any selected "
-                    "dataset (needed for the lifetime histogram).  Keep the "
-                    "correlation CSVs in their 'analysis' folder next to the "
-                    ".fcs files, or untick background correction.",
-                    parent=win)
-                return
-            lo0, hi0 = default_background_window(ref_fcs)
-            window = fcs_lifetime.select_gate(
-                ref_fcs, initial_gate=(lo0, hi0),
-                title="Background range — TCSPC tail",
-                gate_label="Background",
-                confirm_text="Use this background range")
-            if window is None:
-                return   # user cancelled — leave the setup open
-            lo_ns, hi_ns = window
-            try:
-                bg_factors = compute_background_factors(datasets, lo_ns, hi_ns)
-            except Exception as e:
-                messagebox.showerror("Background correction failed", str(e), parent=win)
-                return
-            bg_factors["_window_ns"] = (lo_ns, hi_ns)
 
         try:
             result = fit_global(model, datasets, linked, guesses,
@@ -1543,8 +1684,9 @@ def _global_setup_dialog(parent, model, datasets, out_source):
             return
 
         win.destroy()
-        report_path, _curve, _params = export_global_fit(
-            result, out_source, bg_factors=bg_factors)
+        report_path, _curve, _params = export_global_fit(result, out_source)
+        
+        
         fig, _axes = plot_global_fit(result, show=False)
         try:
             fig.savefig(report_path.with_suffix(".png"), dpi=150)

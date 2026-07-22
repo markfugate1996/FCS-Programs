@@ -1512,6 +1512,120 @@ def _cps_meta(n1: int, n2: int, T: float) -> dict:
         "cps_ch2": f"{n2 / T:.6g}",
     }
 
+# ── Background (Koppel) amplitude correction ──────────────────────────────────
+# Uncorrelated background dilutes the measured amplitude as
+#   G(0)_meas = (1 - B/F)^2 * G(0)_true,
+# so the corrective factor is (1 - B/F)^-2 == (F/S)^2, with F = total rate,
+# B = background rate, S = F - B = sample rate.  Cross-correlation dilutes as
+# (S1/F1)(S2/F2), so its factor is the product (F1/S1)(F2/S2).
+#
+# F is a direct photon sum (sigma_F = sqrt(F)), but B is NOT counted directly:
+# it is the window count b (Poisson) scaled by k = period/window_width (~49),
+# so sigma_B = k*sqrt(b), larger than sqrt(B) by sqrt(k).  b is a subset of F,
+# so error propagation goes through the independent parts r = F - b and b.
+
+_BG_WINDOW_MIN_NS = 40.0
+_BG_WINDOW_MAX_NS = 41.0
+
+# Bin 0 (untimed photons) is always dropped from the total.  The final bin is
+# the same kind of tagger catch-all; set True to drop it too (immaterial here).
+_DROP_LAST_MICRO_BIN = False
+
+
+def _bg_rates_one_channel(fcs_data, channel):
+    """
+    Per-channel background analysis for the Koppel amplitude correction.
+
+    Returns a dict with the three rates (Hz), the base factor g = F/S =
+    total/sample, and its 1-sigma Poisson uncertainty — or None if it can't
+    be formed.
+    """
+    bin_times_ns, counts = fcs_data.lifetime_histogram(channel=channel,
+                                                        n_bins=4096)
+    counts = counts.astype(np.float64)
+    T = fcs_data.duration_s
+    if counts.sum() <= 0 or T <= 0:
+        return None
+
+    hi_idx = -1 if _DROP_LAST_MICRO_BIN else counts.size
+    F = float(counts[1:hi_idx].sum())        # total timed counts (bin 0 dropped)
+
+    period = fcs_data.laser_period_ns
+    lo_ns, hi_ns = _BG_WINDOW_MIN_NS, _BG_WINDOW_MAX_NS
+    if hi_ns >= period:
+        hi_ns = 0.85 * period                # higher rep rate than the default
+        lo_ns = hi_ns - 1.0
+        if lo_ns <= 0:
+            return None
+
+    win = (bin_times_ns >= lo_ns) & (bin_times_ns < hi_ns)
+    if not win.any():
+        return None
+    n_w = int(win.sum())
+    b   = float(counts[win].sum())           # background counts in the window
+    win_width_ns = n_w * fcs_data.microtime_resolution_ns
+    k = period / win_width_ns                # window -> full-period scale
+
+    B = k * b
+    S = F - B                                # background-subtracted (sample)
+    if F <= 0 or b <= 0 or S <= 0:
+        return None
+
+    g = F / S
+    # Independent Poisson parts r = F - b and b.
+    #   dg/dr = -B / S^2 ;  dg/db = (S + F*(k-1)) / S^2
+    var_g = ((B / S**2)**2) * (F - b) + \
+            (((S + F * (k - 1.0)) / S**2)**2) * b
+    sigma_g = float(np.sqrt(var_g))
+
+    return {
+        "total_hz":      F / T,
+        "sample_hz":     S / T,
+        "background_hz": B / T,
+        "g":             g,
+        "sigma_g":       sigma_g,
+    }
+
+
+def _bg_correction_meta(fcs_data, corr_type):
+    """
+    Metadata for the Koppel amplitude correction: total / sample / background
+    rates for the channel(s) the correlation uses, the correction factor, and
+    its 1-sigma uncertainty (dominated by Poisson noise in the background
+    window, so it propagates into <N> and C once a fit applies the factor).
+
+      auto  : kappa = g^2   -> sigma = 2 g sigma_g
+      cross : kappa = g1 g2 -> sigma = kappa * sqrt((sg1/g1)^2 + (sg2/g2)^2)
+    """
+    channels = ((1,) if corr_type == "auto_ch1" else
+                (2,) if corr_type == "auto_ch2" else (1, 2))
+    meta: dict = {}
+    info: dict = {}
+    for ch in channels:
+        r = _bg_rates_one_channel(fcs_data, ch)
+        if r is None:
+            continue
+        info[ch] = r
+        meta[f"bg_total_rate_ch{ch}_hz"]      = f"{r['total_hz']:.6g}"
+        meta[f"bg_sample_rate_ch{ch}_hz"]     = f"{r['sample_hz']:.6g}"
+        meta[f"bg_background_rate_ch{ch}_hz"]  = f"{r['background_hz']:.6g}"
+
+    if corr_type in ("auto_ch1", "auto_ch2"):
+        ch = 1 if corr_type == "auto_ch1" else 2
+        if ch in info:
+            g, sg = info[ch]["g"], info[ch]["sigma_g"]
+            meta["bg_correction_factor"]     = f"{g ** 2:.6g}"
+            meta["bg_correction_factor_std"] = f"{2.0 * g * sg:.6g}"
+    elif corr_type == "cross" and 1 in info and 2 in info:
+        g1, sg1 = info[1]["g"], info[1]["sigma_g"]
+        g2, sg2 = info[2]["g"], info[2]["sigma_g"]
+        kappa = g1 * g2
+        rel   = float(np.hypot(sg1 / g1, sg2 / g2))
+        meta["bg_correction_factor"]     = f"{kappa:.6g}"
+        meta["bg_correction_factor_std"] = f"{kappa * rel:.6g}"
+    return meta
+    
+
 def _export_correlation(
     fcs_data: FCSData,
     tau: np.ndarray,
@@ -1589,8 +1703,12 @@ def _export_correlation(
         meta["segmented"] = "no"
 
     if full_trace_G is not None and n_segs > 1:
+        # Both a prose form (for a human reading the header) and a flag (for
+        # a reader rebuilding the plot -- string-matching the prose would be
+        # brittle).
         meta["G_source"] = ("full trace (segments used only for G_std)"
                             if full_trace_G else "mean of the per-segment G")
+        meta["G_from_full_trace"] = "yes" if full_trace_G else "no"
 
     if have_std:
         meta["G_std_definition"] = (
@@ -1614,6 +1732,8 @@ def _export_correlation(
     if gate_min_ns is not None:
         meta["gate_min_ns"] = f"{gate_min_ns:.3f}"
         meta["gate_max_ns"] = f"{gate_max_ns:.3f}"
+    # Koppel background-correction rates + amplitude factor (+ uncertainty).
+    meta.update(_bg_correction_meta(fcs_data, corr_type))
     fcs_export.safe_export(
         fcs_data, "correlation", cols, meta=meta, suffix=corr_type,
     )
@@ -1642,6 +1762,8 @@ def plot_correlation(
     mt_channels: Optional[int] = None,
     mt_coarsen: Optional[int] = None,
     mt_compress: Optional[str] = None,
+    source_name: Optional[str] = None,
+    std_is_sem: bool = True,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """
     Plot a segmented correlation function with uncertainty bounds.
@@ -1656,19 +1778,34 @@ def plot_correlation(
     G_mean   : reported correlation (baseline 0)
     G_std    : standard error across segments (std/sqrt(n)), or all-NaN
     corr_type: 'auto_ch1', 'auto_ch2', or 'cross'
-    fcs_data : source FCSData (for title / photon counts)
+    fcs_data : source FCSData (for title / photon counts), or None
     tau_min_s, tau_max_s : lag range in seconds
     n_segs   : number of segments used (shown in subtitle)
     method   : backend used (shown in annotation)
     gate_min_ns, gate_max_ns : gate window in ns, or None if not gated
     show     : call plt.show() if True
+    source_name : name for the title.  Supply this when rebuilding a figure
+               from an exported CSV, where there is no FCSData to read a
+               filename from.  Falls back to fcs_data.filepath.name.
+    std_is_sem : True when G_std is the standard error, as every export
+               written since segment-and-average became the default.  Pass
+               False for a legacy export whose G_std is the population sigma,
+               so the band is not mislabelled as a standard error.
+
+    *fcs_data* may be None, in which case *source_name* and the n_used_*
+    counts must supply what the title and subtitle need.  That is what lets a
+    figure be rebuilt from an exported CSV alone: the CSV is the contract, and
+    anything the plot needs has to be recorded in it.
 
     Returns
     -------
     fig, ax
     """
     # ── Optional CSV export of the plotted data ───────────────────────────────
-    if export:
+    # Skipped when there is no FCSData: the export folder is derived from the
+    # source file's location, and re-exporting a figure that was itself built
+    # from a CSV would only duplicate that CSV.
+    if export and fcs_data is not None:
         _export_correlation(
             fcs_data, tau, G_mean, G_std, corr_type, method,
             tau_min_s, tau_max_s, n_segs, gate_min_ns, gate_max_ns,
@@ -1698,11 +1835,19 @@ def plot_correlation(
 
         # "±1σ" would read as the segment-to-segment spread; this band is the
         # standard error of the mean, smaller by sqrt(n_segments).
+        # A legacy export's G_std is the population sigma, not the standard
+        # error; labelling it "SEM" would misstate it by sqrt(n_segments).
+        _band = "±1 SEM" if std_is_sem else "±1σ (population, legacy)"
         ax.semilogx(tau_ms[mask_u], upper[mask_u],
                     color="lightgrey", linewidth=1.0,
-                    label=f"±1 SEM  (n={n_segs} segments)")
+                    label=f"{_band}  (n={n_segs} segments)")
+        # Labelled with a leading underscore: matplotlib keeps it out of the
+        # legend (the upper line already carries the entry), but the Traces
+        # panel in fcs_plottools strips the underscore and can name it,
+        # rather than listing it as an anonymous "unnamed trace".
         ax.semilogx(tau_ms[mask_l], lower[mask_l],
-                    color="lightgrey", linewidth=1.0)
+                    color="lightgrey", linewidth=1.0,
+                    label="_±1 SEM (lower)")
 
     # ── Mean correlation ──────────────────────────────────────────────────────
     mask_m = np.isfinite(G_mean)
@@ -1721,9 +1866,28 @@ def plot_correlation(
     ax.set_xlabel("Lag time τ (ms)", fontsize=12)
     ax.set_ylabel("G(τ)", fontsize=12)
 
-    n_ch1 = len(fcs_data.ch1_deltas)
-    n_ch2 = len(fcs_data.ch2_deltas)
-    title = f"Correlation — {fcs_data.filepath.name}"
+    # Photons ACTUALLY correlated, not every photon in the file.  Under a
+    # microtime gate or photon thinning the two differ substantially, and a
+    # subtitle quoting the file total under a curve computed from a gated
+    # subset overstates the statistics behind the curve.  It also makes the
+    # figure reconstructible from the CSV, which records the used counts.
+    # Falls back to the file totals when the caller did not supply them.
+    def _count(used, attr):
+        if used is not None:
+            return int(used)
+        if fcs_data is not None:
+            return len(getattr(fcs_data, attr))
+        return None
+
+    n_ch1 = _count(n_used_ch1, "ch1_deltas")
+    n_ch2 = _count(n_used_ch2, "ch2_deltas")
+    if source_name:
+        _src = source_name
+    elif fcs_data is not None:
+        _src = fcs_data.filepath.name
+    else:
+        _src = "(unknown source)"
+    title = f"Correlation — {_src}"
     gate_str = (f"  ·  gate: {gate_min_ns:.2f}–{gate_max_ns:.2f} ns"
                 if gate_min_ns is not None else "")
     if n_segs > 1 and seg_duration_s:
@@ -1738,8 +1902,9 @@ def plot_correlation(
         f"{label}  ·  "
         f"τ: {tau_min_s*1e3:.3g}–{tau_max_s*1e3:.3g} ms  ·  "
         f"{seg_str}"
-        f"{gate_str}  ·  "
-        f"Ch1: {n_ch1:,}  Ch2: {n_ch2:,} photons"
+        f"{gate_str}"
+        + (f"  ·  Ch1: {n_ch1:,}  Ch2: {n_ch2:,} photons correlated"
+           if (n_ch1 is not None and n_ch2 is not None) else "")
     )
     ax.set_title(f"{title}\n{subtitle}", fontsize=10)
     ax.set_xlim(tau_min_s * 1e3, tau_max_s * 1e3)
@@ -2009,6 +2174,124 @@ def compute_correlation_for(
     }
 
 
+# ── Rebuilding a plot from an exported CSV ────────────────────────────────────
+
+def _meta_str(meta: dict, *keys, default=None):
+    """First non-empty value among *keys*, else *default*."""
+    for k in keys:
+        v = meta.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+
+def _meta_num(meta: dict, *keys, default=None, cast=float):
+    v = _meta_str(meta, *keys)
+    if v is None:
+        return default
+    try:
+        return cast(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def _meta_yes(meta: dict, *keys, default=None):
+    v = _meta_str(meta, *keys)
+    if v is None:
+        return default
+    return v.strip().lower() in ("yes", "true", "1")
+
+
+def rebuild_plot(meta: dict, columns: dict, show: bool = True,
+                 path=None):
+    """
+    Rebuild a correlation figure from a CSV written by this module.
+
+    The CSV is the contract: everything the figure needs is read from the
+    exported columns and header, and no .fcs file is opened.  A curve saved
+    months ago reopens as a live figure with the full plot-controls panel,
+    not as a flat image.
+
+    Older exports are handled as best the file allows.  The important case is
+    G_std: exports written before segment-and-average became the default hold
+    the POPULATION sigma, while current ones hold the standard error -- a
+    factor of sqrt(n_segments) apart, with no difference in the column name.
+    The presence of the ``G_std_definition`` key is what distinguishes them,
+    and the band is labelled accordingly rather than asserting "SEM" over a
+    number that is not one.
+
+    Parameters
+    ----------
+    meta    : header mapping from fcs_export.read_export
+    columns : column mapping from fcs_export.read_export
+    show    : passed through to plot_correlation
+    path    : the source CSV, part of the rebuilder contract so that a
+              rebuilder can find sibling files.  A correlation export is
+              self-contained, so this one ignores it.
+
+    Returns
+    -------
+    fig, ax
+    """
+    if "tau_s" in columns:
+        tau = np.asarray(columns["tau_s"], dtype=float)
+    elif "tau_ms" in columns:
+        tau = np.asarray(columns["tau_ms"], dtype=float) * 1e-3
+    else:
+        raise ValueError(
+            "No lag column found (expected 'tau_s' or 'tau_ms'); "
+            "this CSV does not look like a correlation export."
+        )
+    if "G" not in columns:
+        raise ValueError("No 'G' column found in this correlation export.")
+
+    G_mean = np.asarray(columns["G"], dtype=float)
+    G_std  = (np.asarray(columns["G_std"], dtype=float)
+              if "G_std" in columns else np.full(tau.size, np.nan))
+
+    corr_type = _meta_str(meta, "type", default="cross")
+    method    = _meta_str(meta, "method", default="perbin")
+    n_segs    = _meta_num(meta, "n_segments", default=1, cast=int)
+
+    # Fall back to the data itself when the range was not recorded.
+    tau_min_s = _meta_num(meta, "tau_min_s",
+                          default=float(tau.min()) if tau.size else 1e-6)
+    tau_max_s = _meta_num(meta, "tau_max_s",
+                          default=float(tau.max()) if tau.size else 1e-3)
+
+    # G_std_definition was introduced with the standard-error convention, so
+    # its absence means this file predates it and carries a population sigma.
+    std_is_sem = "G_std_definition" in meta
+
+    full_trace_G = _meta_yes(meta, "G_from_full_trace")
+    if full_trace_G is None:
+        # Pre-dates the explicit flag; fall back to the prose form.
+        prose = _meta_str(meta, "G_source", default="")
+        if prose:
+            full_trace_G = prose.lower().startswith("full trace")
+
+    return plot_correlation(
+        tau, G_mean, G_std, corr_type,
+        None,                                   # no FCSData when reopening
+        tau_min_s, tau_max_s, n_segs,
+        method=method,
+        gate_min_ns=_meta_num(meta, "gate_min_ns"),
+        gate_max_ns=_meta_num(meta, "gate_max_ns"),
+        show=show,
+        export=False,
+        n_used_ch1=_meta_num(meta, "n_photons_ch1", cast=int),
+        n_used_ch2=_meta_num(meta, "n_photons_ch2", cast=int),
+        T_used=_meta_num(meta, "acquisition_time_s"),
+        seg_duration_s=_meta_num(meta, "segment_duration_s"),
+        full_trace_G=full_trace_G,
+        mt_channels=_meta_num(meta, "mt_channels_per_octave", cast=int),
+        mt_coarsen=_meta_num(meta, "mt_coarsen_factor", cast=int),
+        mt_compress=_meta_str(meta, "mt_compress"),
+        source_name=_meta_str(meta, "source file", "source_file"),
+        std_is_sem=std_is_sem,
+    )
+
+
 def plot_correlation_overlay(
     results,
     corr_type: str,
@@ -2224,9 +2507,14 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
     tk.Label(body, text="Correlation options",
              font=("Helvetica", 12, "bold"), pady=8).pack()
 
-    # ── Correlation type ──────────────────────────────────────────────────────
-    type_frame = tk.LabelFrame(body, text="Type", padx=10, pady=4)
-    type_frame.pack(fill="x", **pad)
+    # ── Correlation type + lag range (side by side) ──────────────────────────
+    # Type on the left, Lag range packed to its right, so the two short boxes
+    # share one row instead of stacking and wasting vertical space.
+    type_range_row = tk.Frame(body)
+    type_range_row.pack(fill="x", **pad)
+
+    type_frame = tk.LabelFrame(type_range_row, text="Type", padx=10, pady=4)
+    type_frame.pack(side="left", fill="both", expand=True)
 
     type_var = tk.StringVar(value=_defaults["corr_type"])
     for text, value in [
@@ -2238,8 +2526,8 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
                        value=value, anchor="w").pack(fill="x")
 
     # ── Lag range ─────────────────────────────────────────────────────────────
-    range_frame = tk.LabelFrame(body, text="Lag range (ms)", padx=10, pady=6)
-    range_frame.pack(fill="x", **pad)
+    range_frame = tk.LabelFrame(type_range_row, text="Lag range (ms)",padx=10, pady=6)
+    range_frame.pack(side="left", fill="y", padx=(12, 0), anchor="n")
 
     row = tk.Frame(range_frame)
     row.pack(fill="x")

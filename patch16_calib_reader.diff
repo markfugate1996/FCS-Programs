@@ -1,0 +1,61 @@
+--- a/fcs_calib.py
++++ b/fcs_calib.py
+@@ -40,6 +40,7 @@
+ import numpy as np
+ import matplotlib.pyplot as plt
+ import fcs_plottools
++import fcs_export
+ 
+ try:
+     from scipy.stats import chi2 as _chi2dist
+@@ -66,39 +67,26 @@
+     is a dict keyed by column name (numeric columns parsed to float, 'dataset'
+     kept as a string) and meta is the parsed ``# key : value`` header block.
+     """
++    # Parsing lives in fcs_export.read_export so the header format is defined
++    # once.  read_export returns columns; this function's callers expect one
++    # dict per row, so the orientation is flipped here.
+     path = Path(path)
+-    header: Optional[List[str]] = None
+-    rows: List[List[str]] = []
+-    meta: Dict[str, str] = {}
+-    with path.open("r", encoding="utf-8") as fh:
+-        for line in fh:
+-            if line.startswith("#"):
+-                body = line[1:].strip()
+-                if ":" in body:
+-                    k, v = body.split(":", 1)
+-                    meta[k.strip()] = v.strip()
+-                continue
+-            if not line.strip():
+-                continue
+-            cells = [c.strip() for c in line.rstrip("\n").split(",")]
+-            if header is None:
+-                header = cells
+-                continue
+-            rows.append(cells)
+-
+-    if not header:
++    meta, columns = fcs_export.read_export(path)
++    if not columns:
+         raise ValueError(f"No header row found in {path.name}.")
+ 
++    n_rows = len(next(iter(columns.values())))
+     out: List[dict] = []
+-    for r in rows:
++    for i in range(n_rows):
+         d: dict = {}
+-        for k, v in zip(header, r):
++        for k, arr in columns.items():
++            v = arr[i]
+             if k == "dataset":
+-                d[k] = v
++                d[k] = str(v)
+             else:
+                 try:
+                     d[k] = float(v)
+-                except ValueError:
++                except (TypeError, ValueError):
+                     d[k] = np.nan
+         out.append(d)
+     return out, meta

@@ -1,0 +1,44 @@
+--- a/fcs_plottools.py
++++ b/fcs_plottools.py
+@@ -302,13 +302,41 @@
+     entries: list = []
+     n_axes = len(axes_list)
+     for ai, ax in enumerate(axes_list):
++        # An errorbar puts its label on the CONTAINER, not on the artists it
++        # is made of, so the data line, the caps and the bars all arrive here
++        # unlabelled.  Map each member back to its container's label first,
++        # otherwise a plot built from errorbars shows nothing but "unnamed
++        # trace N" -- exactly the failure this selector exists to avoid.
++        owned: dict = {}
++        for cont in list(getattr(ax, "containers", [])):
++            try:
++                clbl = cont.get_label() or ""
++            except Exception:
++                clbl = ""
++            if not clbl or clbl.startswith("_"):
++                continue
++            try:
++                kids = list(cont.get_children())
++            except Exception:
++                kids = [k for k in cont if k is not None]
++            for pos, kid in enumerate(kids):
++                if kid is None:
++                    continue
++                # First member is the data series itself; the rest are the
++                # caps and bars, which are worth naming but not confusing
++                # with it.
++                owned[id(kid)] = clbl if pos == 0 else f"{clbl}  (error bars)"
++
+         pairs = [(a, True) for a in ax.get_lines()]
+         pairs += [(a, False) for a in list(getattr(ax, "collections", []))]
++        pairs += [(a, False) for a in list(getattr(ax, "patches", []))]
+         for i, (art, is_line) in enumerate(pairs, start=1):
+             try:
+                 lbl = art.get_label() or ""
+             except Exception:
+                 lbl = ""
++            if (not lbl or lbl.startswith("_")) and id(art) in owned:
++                lbl = owned[id(art)]
+             if lbl and not lbl.startswith("_"):
+                 name = lbl
+             elif lbl and not _AUTO_LABEL.match(lbl):

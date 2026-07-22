@@ -1,0 +1,36 @@
+--- a/fcs_corr.py
++++ b/fcs_corr.py
+@@ def run_correlation_dialog
+     tk.Label(body, text="Correlation options",
+              font=("Helvetica", 12, "bold"), pady=8).pack()
+ 
+-    # ── Correlation type ──────────────────────────────────────────────────────
+-    type_frame = tk.LabelFrame(body, text="Type", padx=10, pady=4)
+-    type_frame.pack(fill="x", **pad)
++    # ── Correlation type + lag range (side by side) ──────────────────────────
++    # Type on the left, Lag range packed to its right, so the two short boxes
++    # share one row instead of stacking and wasting vertical space.
++    type_range_row = tk.Frame(body)
++    type_range_row.pack(fill="x", **pad)
++
++    type_frame = tk.LabelFrame(type_range_row, text="Type", padx=10, pady=4)
++    type_frame.pack(side="left", fill="both", expand=True)
+ 
+     type_var = tk.StringVar(value=_defaults["corr_type"])
+     for text, value in [
+         ("Cross-correlation  Ch1 → Ch2", "cross"),
+         ("Autocorrelation  Ch1",         "auto_ch1"),
+         ("Autocorrelation  Ch2",         "auto_ch2"),
+     ]:
+         tk.Radiobutton(type_frame, text=text, variable=type_var,
+                        value=value, anchor="w").pack(fill="x")
+ 
+     # ── Lag range ─────────────────────────────────────────────────────────────
+-    range_frame = tk.LabelFrame(body, text="Lag range (ms)", padx=10, pady=6)
+-    range_frame.pack(fill="x", **pad)
++    range_frame = tk.LabelFrame(type_range_row, text="Lag range (ms)",
++                                padx=10, pady=6)
++    range_frame.pack(side="left", fill="y", padx=(12, 0), anchor="n")
+ 
+     row = tk.Frame(range_frame)
+     row.pack(fill="x")

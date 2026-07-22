@@ -44,10 +44,11 @@ Public API
 
 from __future__ import annotations
 
+import csv
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -149,6 +150,11 @@ def export_columns(
     # ── Write commented header + real CSV header + data ──────────────────────
     with out_path.open("w", encoding="utf-8", newline="") as fh:
         fh.write(f"# FCS analysis export \u2014 {analysis}\n")
+        # The banner above is for a human opening the file in a text editor.
+        # This key is the machine-readable one: the banner uses an em-dash and
+        # no colon, so a "key : value" parser skips it entirely and cannot
+        # tell what analysis produced the file.
+        fh.write(f"# analysis    : {analysis}\n")
         fh.write(f"# source file : {d.filepath.name}\n")
         fh.write(f"# exported    : {datetime.now().isoformat(timespec='seconds')}\n")
         if meta:
@@ -159,6 +165,98 @@ def export_columns(
             fh.write(",".join(f"{v:.10g}" for v in row) + "\n")
 
     return out_path
+
+
+# ── Core reader ───────────────────────────────────────────────────────────────
+
+def read_export(path) -> Tuple[dict, dict]:
+    """
+    Read a CSV written by :func:`export_columns` back into (meta, columns).
+
+    This is the inverse of the writer and the single place the header format
+    is parsed.  Several modules previously each carried their own near-
+    identical parser; they should migrate to this one so the format is
+    defined once.
+
+    Parsing rules
+    -------------
+    * ``# key : value`` lines become string entries in *meta*.  Only the FIRST
+      colon separates, so values containing colons (timestamps, prose
+      definitions) survive intact.
+    * The legacy ``# FCS analysis export — <name>`` banner is recognised too,
+      so files written before the ``analysis`` key existed still identify
+      themselves.  An explicit ``analysis`` key always wins.
+    * The first non-comment line is the column header; the rest is data.
+    * A column parses to a float array when every value is numeric, and to an
+      object array of strings otherwise (dataset names, yes/no flags).
+
+    Parameters
+    ----------
+    path : str | Path
+        CSV to read.
+
+    Returns
+    -------
+    (meta, columns)
+        *meta* maps header key -> string value.
+        *columns* maps column name -> np.ndarray, in file order.
+
+    Raises
+    ------
+    ValueError
+        If the file contains no column header.
+    """
+    meta: dict = {}
+    header = None
+    rows: list = []
+
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.reader(fh)
+        for raw in reader:
+            if not raw:
+                continue
+            first = raw[0]
+            if first.lstrip().startswith("#"):
+                # Comment rows may have been split on commas by the reader;
+                # rejoin so values containing commas are not truncated.
+                body = ",".join(raw).lstrip()[1:].strip()
+                if ":" in body:
+                    key, val = body.split(":", 1)
+                    meta[key.strip()] = val.strip()
+                elif "\u2014" in body:
+                    # Legacy banners, for files written before the analysis
+                    # key existed.  Matched on the text LEFT of the dash --
+                    # the fit banner is "FCS global fit curves — <model key>",
+                    # so splitting blindly would record the model key as the
+                    # analysis name.
+                    left, right = body.split("\u2014", 1)
+                    banner, tail = left.strip().lower(), right.strip()
+                    if banner == "fcs analysis export":
+                        meta.setdefault("analysis", tail)
+                    elif banner == "fcs global fit curves":
+                        meta.setdefault("analysis", "global fit curves")
+                        meta.setdefault("model_key", tail)
+                continue
+            if header is None:
+                header = [c.strip() for c in raw]
+                continue
+            rows.append(raw)
+
+    if header is None:
+        raise ValueError(f"No column header found in {path}; "
+                         f"this does not look like an FCS analysis export.")
+
+    columns: dict = {}
+    for i, name in enumerate(header):
+        cell = [(r[i] if i < len(r) else "") for r in rows]
+        try:
+            columns[name] = np.array(
+                [float(c) if c.strip() != "" else np.nan for c in cell],
+                dtype=float)
+        except ValueError:
+            columns[name] = np.array([c.strip() for c in cell], dtype=object)
+
+    return meta, columns
 
 
 def safe_export(

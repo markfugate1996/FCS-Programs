@@ -49,6 +49,8 @@ For multi-axes figures pass the axes array::
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -119,11 +121,76 @@ def show_figure(
     panel.title("Plot controls")
     panel.resizable(False, True)
 
-    _build_scale_section(panel, fig, axes_list)
-    _build_limits_section(panel, fig, axes_list)
-    _build_legend_section(panel, fig, axes_list)
-    _build_label_section(panel, fig, axes_list)
-    _build_save_section(panel, fig)
+    # The sections stack to well over a laptop screen's height once Traces is
+    # added, so they live in a scrollable body rather than directly on the
+    # panel.  Without this the Export button falls off the bottom and cannot
+    # be reached at all.
+    _canvas = tk.Canvas(panel, borderwidth=0, highlightthickness=0)
+    _vsb    = tk.Scrollbar(panel, orient="vertical", command=_canvas.yview)
+    _canvas.configure(yscrollcommand=_vsb.set)
+    _vsb.pack(side="right", fill="y")
+    _canvas.pack(side="left", fill="both", expand=True)
+
+    body     = tk.Frame(_canvas)
+    _body_id = _canvas.create_window((0, 0), window=body, anchor="nw")
+
+    def _on_body_configure(_e=None):
+        _canvas.configure(scrollregion=_canvas.bbox("all"))
+
+    def _on_canvas_configure(e):
+        # Keep the body as wide as the canvas so nothing scrolls sideways.
+        _canvas.itemconfigure(_body_id, width=e.width)
+
+    body.bind("<Configure>", _on_body_configure)
+    _canvas.bind("<Configure>", _on_canvas_configure)
+
+    # Mouse wheel, bound only while the pointer is over the panel so it does
+    # not hijack scrolling in the figure window or anywhere else.
+    def _on_wheel(event):
+        if getattr(event, "num", None) == 4:
+            _canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            _canvas.yview_scroll(1, "units")
+        else:
+            _canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_wheel(_e=None):
+        _canvas.bind_all("<MouseWheel>", _on_wheel)
+        _canvas.bind_all("<Button-4>", _on_wheel)
+        _canvas.bind_all("<Button-5>", _on_wheel)
+
+    def _unbind_wheel(_e=None):
+        _canvas.unbind_all("<MouseWheel>")
+        _canvas.unbind_all("<Button-4>")
+        _canvas.unbind_all("<Button-5>")
+
+    panel.bind("<Enter>", _bind_wheel)
+    panel.bind("<Leave>", _unbind_wheel)
+
+    # Traces is built first (it is what people reach for) but the legend
+    # rebuild it needs does not exist until the Legend section is built, so
+    # the callback is resolved lazily through this holder.
+    _legend_cb = {"fn": None}
+
+    def _refresh_legend():
+        fn = _legend_cb["fn"]
+        if fn is not None:
+            fn()
+
+    _build_traces_section(body, fig, axes_list, on_change=_refresh_legend)
+    _build_scale_section(body, fig, axes_list)
+    _build_limits_section(body, fig, axes_list)
+    _legend_cb["fn"] = _build_legend_section(body, fig, axes_list)
+    _build_label_section(body, fig, axes_list)
+    _build_save_section(body, fig)
+
+    # ── Size to content, clamped to the screen ───────────────────────────────
+    panel.update_idletasks()
+    _panel_w = max(300, body.winfo_reqwidth() + _vsb.winfo_reqwidth() + 6)
+    _content_h = body.winfo_reqheight() + 8
+    _panel_h = min(_content_h, int(panel.winfo_screenheight() * 0.85))
+    panel.geometry(f"{_panel_w}x{_panel_h}")
+    panel.minsize(_panel_w, min(_content_h, 320))
 
     # ── Position panel to the right of the figure (deferred) ─────────────
     def _position_panel():
@@ -133,7 +200,7 @@ def show_figure(
             fy = tk_win.winfo_y()
             fw = tk_win.winfo_width()
             sw = tk_win.winfo_screenwidth()
-            panel_w = 280
+            panel_w = _panel_w
             px = fx + fw + 6
             if px + panel_w > sw:
                 px = max(0, fx - panel_w - 6)
@@ -170,6 +237,491 @@ def show_figure(
 
 
 # ── Section builders ──────────────────────────────────────────────────────────
+
+# ── Trace styling ─────────────────────────────────────────────────────────────
+
+# (display name, matplotlib value)
+_MARKER_CHOICES = [
+    ("none",       "None"), ("point  .",   "."), ("circle  o",  "o"),
+    ("square  s",  "s"),    ("triangle ^", "^"), ("diamond  D", "D"),
+    ("plus  +",    "+"),    ("cross  x",   "x"), ("star  *",    "*"),
+    ("down  v",    "v"),
+]
+_LINESTYLE_CHOICES = [
+    ("none",     "None"), ("solid",  "-"),
+    ("dashed",   "--"),   ("dashdot", "-."), ("dotted", ":"),
+]
+
+# Labels matplotlib generates for itself; these carry no meaning for a user.
+_AUTO_LABEL = re.compile(r"^_+(child|line|collection|nolegend)[_\d]*$")
+
+# Visibility glyphs for the trace selector.
+_DOT_SHOWN  = "\u25cf"
+_DOT_HIDDEN = "\u25cb"
+
+
+def _artist_description(art, index: int) -> str:
+    """
+    Describe an artist that carries no usable label.
+
+    Reference lines (a horizontal axhline, a vertical axvline) are by far the
+    most common unlabelled artists in this suite, so they are named for what
+    they are rather than by position in a list.
+    """
+    try:
+        xd = np.asarray(art.get_xdata(), dtype=float)
+        yd = np.asarray(art.get_ydata(), dtype=float)
+        if yd.size and np.allclose(yd, yd[0]):
+            return f"reference line (y = {yd[0]:.4g})"
+        if xd.size and np.allclose(xd, xd[0]):
+            return f"reference line (x = {xd[0]:.4g})"
+    except Exception:
+        pass
+    return f"unnamed trace {index}"
+
+
+def collect_artists(axes_list: list) -> list:
+    """
+    Enumerate the styleable artists across *axes_list*, with display names.
+
+    The display name is the artist's own matplotlib label wherever there is
+    one -- which for a correlation overlay is the source FILENAME, and for a
+    fit is the dataset name.  Naming traces after the data they hold is the
+    whole point: a selector that reads "Trace 1, Trace 2, Trace 3" forces you
+    to click each one to find out what it is.
+
+    A label starting with "_" is hidden from matplotlib legends by convention.
+    Such a trace is still a real trace, so it is listed here with the
+    underscore stripped -- unless the label is one matplotlib auto-generated
+    (``_child0``), which means nothing and is replaced by a description.
+
+    Returns a list of dicts: ``{artist, name, axis, is_line}``.
+    """
+    from matplotlib.lines import Line2D  # noqa: F401 — kept for clarity
+
+    entries: list = []
+    n_axes = len(axes_list)
+    for ai, ax in enumerate(axes_list):
+        # An errorbar puts its label on the CONTAINER, not on the artists it
+        # is made of, so the data line, the caps and the bars all arrive here
+        # unlabelled.  Map each member back to its container's label first,
+        # otherwise a plot built from errorbars shows nothing but "unnamed
+        # trace N" -- exactly the failure this selector exists to avoid.
+        owned: dict = {}
+        for cont in list(getattr(ax, "containers", [])):
+            try:
+                clbl = cont.get_label() or ""
+            except Exception:
+                clbl = ""
+            if not clbl or clbl.startswith("_"):
+                continue
+            try:
+                kids = list(cont.get_children())
+            except Exception:
+                kids = [k for k in cont if k is not None]
+            for pos, kid in enumerate(kids):
+                if kid is None:
+                    continue
+                # First member is the data series itself; the rest are the
+                # caps and bars, which are worth naming but not confusing
+                # with it.
+                owned[id(kid)] = clbl if pos == 0 else f"{clbl}  (error bars)"
+
+        pairs = [(a, True) for a in ax.get_lines()]
+        pairs += [(a, False) for a in list(getattr(ax, "collections", []))]
+        pairs += [(a, False) for a in list(getattr(ax, "patches", []))]
+        for i, (art, is_line) in enumerate(pairs, start=1):
+            try:
+                lbl = art.get_label() or ""
+            except Exception:
+                lbl = ""
+            if (not lbl or lbl.startswith("_")) and id(art) in owned:
+                lbl = owned[id(art)]
+            if lbl and not lbl.startswith("_"):
+                name = lbl
+            elif lbl and not _AUTO_LABEL.match(lbl):
+                name = lbl.lstrip("_")
+            elif is_line:
+                name = _artist_description(art, i)
+            else:
+                name = f"unnamed shading {i}"
+            # Only tag the panel index when there is more than one panel,
+            # e.g. the fit plot's G(tau) + residuals pair.
+            if n_axes > 1:
+                name = f"[{ai + 1}] {name}"
+            entries.append({"artist": art, "name": name,
+                            "axis": ax, "is_line": is_line})
+    return entries
+
+
+def _build_traces_section(
+    panel,
+    fig: plt.Figure,
+    axes_list: list,
+    on_change=None,
+) -> None:
+    """
+    Add the "Traces" LabelFrame to *panel*.
+
+    Layout is a selector plus ONE control block that retargets to whichever
+    trace is selected, rather than a row of controls per trace.  An overlay of
+    twenty files would otherwise produce a panel taller than the screen.
+
+    Visibility is shown in the list itself (● shown, ○ hidden) so the state of
+    every trace is readable at a glance without clicking through them.
+
+    *on_change* is called after any edit that the legend needs to know about
+    (colour, marker, line style, width, visibility, label).
+    """
+    import tkinter as tk
+    from tkinter import colorchooser
+    from matplotlib.colors import to_hex, to_rgba
+
+    entries = collect_artists(axes_list)
+    if not entries:
+        return
+
+    tf = tk.LabelFrame(panel, text="Traces", padx=10, pady=6)
+    tf.pack(fill="x", padx=10, pady=(10, 4))
+
+    # ── Selector ─────────────────────────────────────────────────────────────
+    list_row = tk.Frame(tf)
+    list_row.pack(fill="x")
+    lb_sb = tk.Scrollbar(list_row, orient="vertical")
+    lb = tk.Listbox(
+        list_row, height=min(8, max(3, len(entries))), activestyle="none",
+        font=("Courier", 9), exportselection=False, yscrollcommand=lb_sb.set,
+    )
+    lb_sb.config(command=lb.yview)
+    lb_sb.pack(side="right", fill="y")
+    lb.pack(side="left", fill="both", expand=True)
+
+    def _row_text(e) -> str:
+        try:
+            vis = bool(e["artist"].get_visible())
+        except Exception:
+            vis = True
+        return f"{_DOT_SHOWN if vis else _DOT_HIDDEN} {e['name']}"
+
+    for e in entries:
+        lb.insert("end", _row_text(e))
+
+    # ── Control block ────────────────────────────────────────────────────────
+    # True while the controls are being repopulated from a newly selected
+    # artist, so the trace-apply callbacks do not fire and write the previous
+    # trace's settings onto the new one.
+    loading = {"busy": False}
+
+    vis_var    = tk.BooleanVar(master=panel, value=True)
+    label_var  = tk.StringVar(master=panel, value="")
+    marker_var = tk.StringVar(master=panel, value="none")
+    ls_var     = tk.StringVar(master=panel, value="solid")
+    width_var  = tk.StringVar(master=panel, value="1.0")
+    msize_var  = tk.StringVar(master=panel, value="4")
+    alpha_var  = tk.DoubleVar(master=panel, value=1.0)
+    colour_box = {"hex": "#000000"}
+
+    def _redraw():
+        try:
+            fig.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _notify():
+        if on_change is not None:
+            try:
+                on_change()
+            except Exception:
+                pass
+
+    def _selected():
+        sel = lb.curselection()
+        return entries[sel[0]] if sel else None
+
+    def _refresh_row(idx):
+        """Rewrite one listbox row without disturbing the selection."""
+        e = entries[idx]
+        lb.delete(idx)
+        lb.insert(idx, _row_text(e))
+        lb.selection_set(idx)
+
+    # ── Visibility ───────────────────────────────────────────────────────────
+    vis_cb = tk.Checkbutton(
+        tf, text="Visible", variable=vis_var, anchor="w",
+        font=("Helvetica", 9),
+    )
+    vis_cb.pack(fill="x", pady=(6, 0))
+
+    def _apply_visible(*_):
+        if loading["busy"]:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        try:
+            entries[idx]["artist"].set_visible(vis_var.get())
+        except Exception:
+            return
+        _refresh_row(idx)
+        _redraw()
+        _notify()
+
+    vis_cb.config(command=_apply_visible)
+
+    # ── Label ────────────────────────────────────────────────────────────────
+    lab_row = tk.Frame(tf)
+    lab_row.pack(fill="x", pady=(4, 0))
+    tk.Label(lab_row, text="Label:", width=7, anchor="e",
+             font=("Helvetica", 9)).pack(side="left")
+    lab_entry = tk.Entry(lab_row, textvariable=label_var, width=22,
+                         font=("Helvetica", 9))
+    lab_entry.pack(side="left", padx=4, fill="x", expand=True)
+
+    def _apply_label(_event=None):
+        if loading["busy"]:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        new = label_var.get().strip()
+        if not new:
+            return
+        try:
+            entries[idx]["artist"].set_label(new)
+        except Exception:
+            return
+        entries[idx]["name"] = new
+        _refresh_row(idx)
+        _redraw()
+        _notify()
+
+    lab_entry.bind("<Return>", _apply_label)
+    lab_entry.bind("<FocusOut>", _apply_label)
+
+    # ── Colour + alpha ───────────────────────────────────────────────────────
+    col_row = tk.Frame(tf)
+    col_row.pack(fill="x", pady=(4, 0))
+    tk.Label(col_row, text="Colour:", width=7, anchor="e",
+             font=("Helvetica", 9)).pack(side="left")
+    swatch = tk.Button(col_row, text="    ", relief="solid", borderwidth=1,
+                       width=4)
+    swatch.pack(side="left", padx=4)
+
+    def _pick_colour():
+        sel = lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        rgb, hx = colorchooser.askcolor(
+            color=colour_box["hex"], parent=panel, title="Trace colour")
+        if not hx:
+            return
+        art = entries[idx]["artist"]
+        try:
+            art.set_color(hx)
+        except Exception:
+            try:
+                art.set_facecolor(hx)
+            except Exception:
+                return
+        colour_box["hex"] = hx
+        swatch.config(bg=hx)
+        _redraw()
+        _notify()
+
+    swatch.config(command=_pick_colour)
+
+    tk.Label(col_row, text="Alpha:", anchor="e",
+             font=("Helvetica", 9)).pack(side="left", padx=(10, 0))
+
+    def _apply_alpha(*_):
+        if loading["busy"]:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        try:
+            entries[sel[0]]["artist"].set_alpha(float(alpha_var.get()))
+        except Exception:
+            return
+        _redraw()
+
+    tk.Scale(col_row, from_=0.0, to=1.0, resolution=0.05, orient="horizontal",
+             variable=alpha_var, command=_apply_alpha, showvalue=True,
+             length=90, font=("Helvetica", 8)).pack(side="left", padx=4)
+
+    # ── Marker + marker size ─────────────────────────────────────────────────
+    mk_row = tk.Frame(tf)
+    mk_row.pack(fill="x", pady=(4, 0))
+    tk.Label(mk_row, text="Marker:", width=7, anchor="e",
+             font=("Helvetica", 9)).pack(side="left")
+    mk_menu = tk.OptionMenu(mk_row, marker_var,
+                            *[n for n, _v in _MARKER_CHOICES])
+    mk_menu.config(font=("Helvetica", 9), width=9)
+    mk_menu["menu"].config(font=("Helvetica", 9))
+    mk_menu.pack(side="left", padx=4)
+    tk.Label(mk_row, text="Size:", anchor="e",
+             font=("Helvetica", 9)).pack(side="left", padx=(8, 0))
+    msize_sp = tk.Spinbox(mk_row, from_=0, to=30, increment=0.5, width=5,
+                          textvariable=msize_var, font=("Helvetica", 9))
+    msize_sp.pack(side="left", padx=4)
+
+    # ── Line style + width ───────────────────────────────────────────────────
+    ln_row = tk.Frame(tf)
+    ln_row.pack(fill="x", pady=(4, 0))
+    tk.Label(ln_row, text="Line:", width=7, anchor="e",
+             font=("Helvetica", 9)).pack(side="left")
+    ls_menu = tk.OptionMenu(ln_row, ls_var,
+                            *[n for n, _v in _LINESTYLE_CHOICES])
+    ls_menu.config(font=("Helvetica", 9), width=9)
+    ls_menu["menu"].config(font=("Helvetica", 9))
+    ls_menu.pack(side="left", padx=4)
+    tk.Label(ln_row, text="Width:", anchor="e",
+             font=("Helvetica", 9)).pack(side="left", padx=(8, 0))
+    width_sp = tk.Spinbox(ln_row, from_=0, to=10, increment=0.5, width=5,
+                          textvariable=width_var, font=("Helvetica", 9))
+    width_sp.pack(side="left", padx=4)
+
+    _LINE_ONLY = (mk_menu, msize_sp, ls_menu, width_sp)
+
+    def _apply_marker(*_):
+        if loading["busy"]:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        val = dict(_MARKER_CHOICES).get(marker_var.get())
+        try:
+            entries[sel[0]]["artist"].set_marker(val)
+        except Exception:
+            return
+        _redraw()
+        _notify()
+
+    def _apply_linestyle(*_):
+        if loading["busy"]:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        val = dict(_LINESTYLE_CHOICES).get(ls_var.get())
+        try:
+            entries[sel[0]]["artist"].set_linestyle(val)
+        except Exception:
+            return
+        _redraw()
+        _notify()
+
+    def _apply_width(*_):
+        if loading["busy"]:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        try:
+            entries[sel[0]]["artist"].set_linewidth(float(width_var.get()))
+        except (ValueError, tk.TclError, AttributeError):
+            return
+        _redraw()
+        _notify()
+
+    def _apply_msize(*_):
+        if loading["busy"]:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        try:
+            entries[sel[0]]["artist"].set_markersize(float(msize_var.get()))
+        except (ValueError, tk.TclError, AttributeError):
+            return
+        _redraw()
+        _notify()
+
+    marker_var.trace_add("write", _apply_marker)
+    ls_var.trace_add("write", _apply_linestyle)
+    width_var.trace_add("write", _apply_width)
+    msize_var.trace_add("write", _apply_msize)
+    msize_sp.config(command=_apply_msize)
+    width_sp.config(command=_apply_width)
+
+    # ── Selection -> repopulate controls ─────────────────────────────────────
+    def _on_select(_event=None):
+        e = _selected()
+        if e is None:
+            return
+        art = e["artist"]
+        loading["busy"] = True
+        try:
+            try:
+                vis_var.set(bool(art.get_visible()))
+            except Exception:
+                vis_var.set(True)
+
+            label_var.set(e["name"])
+
+            # Colour: lines expose get_color; collections may only have
+            # facecolors, and an empty array means "no explicit colour".
+            hx = "#000000"
+            try:
+                hx = to_hex(to_rgba(art.get_color()))
+            except Exception:
+                try:
+                    fc = art.get_facecolor()
+                    if len(fc):
+                        hx = to_hex(fc[0])
+                except Exception:
+                    pass
+            colour_box["hex"] = hx
+            try:
+                swatch.config(bg=hx)
+            except Exception:
+                pass
+
+            try:
+                a = art.get_alpha()
+                alpha_var.set(1.0 if a is None else float(a))
+            except Exception:
+                alpha_var.set(1.0)
+
+            if e["is_line"]:
+                inv_mk = {v: n for n, v in _MARKER_CHOICES}
+                inv_ls = {v: n for n, v in _LINESTYLE_CHOICES}
+                try:
+                    marker_var.set(inv_mk.get(str(art.get_marker()), "none"))
+                except Exception:
+                    marker_var.set("none")
+                try:
+                    ls_var.set(inv_ls.get(str(art.get_linestyle()), "solid"))
+                except Exception:
+                    ls_var.set("solid")
+                try:
+                    width_var.set(f"{float(art.get_linewidth()):g}")
+                except Exception:
+                    width_var.set("1")
+                try:
+                    msize_var.set(f"{float(art.get_markersize()):g}")
+                except Exception:
+                    msize_var.set("4")
+
+            # Marker / line-style / width / size are Line2D concepts.  A
+            # collection (fill_between shading, scatter) has no equivalent, so
+            # those controls are disabled rather than silently doing nothing.
+            state = "normal" if e["is_line"] else "disabled"
+            for w in _LINE_ONLY:
+                try:
+                    w.config(state=state)
+                except Exception:
+                    pass
+        finally:
+            loading["busy"] = False
+
+    lb.bind("<<ListboxSelect>>", _on_select)
+    lb.selection_set(0)
+    _on_select()
+
 
 def _build_scale_section(
     panel,
@@ -342,7 +894,7 @@ def _build_legend_section(
     panel,
     fig: plt.Figure,
     axes_list: list,
-) -> None:
+):
     """
     Add the "Legend" LabelFrame to *panel*, if the main axis has a legend.
 
@@ -353,9 +905,17 @@ def _build_legend_section(
       * Text size — slider to shrink or grow it.
 
     Position and size changes rebuild the legend from a snapshot of its
-    handles/labels captured when the panel is built; the snapshot is taken
-    from the legend object itself (not the axes), so custom entries such as
-    the intensity plot's "Mean Ch1/Ch2 CPS" rows are preserved.
+    HANDLES captured when the panel is built; the snapshot is taken from the
+    legend object itself (not the axes), so custom entries such as the
+    intensity plot's "Mean Ch1/Ch2 CPS" rows are preserved.
+
+    The label TEXT, by contrast, is re-read from each handle every rebuild
+    rather than snapshotted, so a trace renamed in the Traces section is
+    renamed in the legend too.  Hidden traces drop out, and a trace that had
+    no label originally joins the legend once it is given one.
+
+    Returns the rebuild function, so other sections (Traces) can refresh the
+    legend after an edit that changes it.
     """
     import tkinter as tk
 
@@ -420,11 +980,67 @@ def _build_legend_section(
     lf = tk.LabelFrame(panel, text="Legend", padx=10, pady=6)
     lf.pack(fill="x", padx=10, pady=4)
 
+    def _live_entries():
+        """
+        Current (handles, labels) for the legend.
+
+        Built from the snapshot first, so proxy artists keep their original
+        order and survive, then extended with any axes artist that has since
+        been given a real label.  Labels come from the artists themselves;
+        the snapshot text is only a fallback for proxies whose label was set
+        on the legend rather than on the handle.
+        """
+        out_h, out_l, seen = [], [], set()
+        snap = list(zip(handles, labels)) if len(handles) == len(labels) \
+            else [(h, "") for h in handles]
+        for h, snap_lbl in snap:
+            seen.add(id(h))
+            try:
+                if not h.get_visible():
+                    continue
+            except Exception:
+                pass
+            try:
+                lbl = h.get_label() or ""
+            except Exception:
+                lbl = ""
+            if not lbl or lbl.startswith("_"):
+                lbl = snap_lbl
+            if not lbl or lbl.startswith("_"):
+                continue
+            out_h.append(h)
+            out_l.append(lbl)
+
+        for _ax in axes_list:
+            arts = list(_ax.get_lines()) + list(getattr(_ax, "collections", []))
+            for art in arts:
+                if id(art) in seen:
+                    continue
+                try:
+                    if not art.get_visible():
+                        continue
+                    lbl = art.get_label() or ""
+                except Exception:
+                    continue
+                if lbl and not lbl.startswith("_"):
+                    out_h.append(art)
+                    out_l.append(lbl)
+        return out_h, out_l
+
     def _apply_legend(*_):
-        if not handles:
+        live_h, live_l = _live_entries()
+        if not live_h:
+            # Everything hidden: drop the legend rather than draw an empty box.
+            existing = ax.get_legend()
+            if existing is not None:
+                existing.set_visible(False)
+            try:
+                fig.canvas.draw()
+            except Exception:
+                pass
             return
         new = ax.legend(
-            handles, labels,
+            live_h, live_l,
             loc=loc_var.get(),
             fontsize=size_var.get(),
             title=title_text,
@@ -466,6 +1082,8 @@ def _build_legend_section(
     ).pack(side="left", padx=4, fill="x", expand=True)
 
     loc_var.trace_add("write", _apply_legend)
+
+    return _apply_legend
 
 
 def _build_label_section(

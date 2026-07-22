@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 import fcs_plottools
+import fcs_export
 
 try:
     from scipy.stats import chi2 as _chi2dist
@@ -66,39 +67,26 @@ def load_params_csv(path) -> Tuple[List[dict], Dict[str, str]]:
     is a dict keyed by column name (numeric columns parsed to float, 'dataset'
     kept as a string) and meta is the parsed ``# key : value`` header block.
     """
+    # Parsing lives in fcs_export.read_export so the header format is defined
+    # once.  read_export returns columns; this function's callers expect one
+    # dict per row, so the orientation is flipped here.
     path = Path(path)
-    header: Optional[List[str]] = None
-    rows: List[List[str]] = []
-    meta: Dict[str, str] = {}
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            if line.startswith("#"):
-                body = line[1:].strip()
-                if ":" in body:
-                    k, v = body.split(":", 1)
-                    meta[k.strip()] = v.strip()
-                continue
-            if not line.strip():
-                continue
-            cells = [c.strip() for c in line.rstrip("\n").split(",")]
-            if header is None:
-                header = cells
-                continue
-            rows.append(cells)
-
-    if not header:
+    meta, columns = fcs_export.read_export(path)
+    if not columns:
         raise ValueError(f"No header row found in {path.name}.")
 
+    n_rows = len(next(iter(columns.values())))
     out: List[dict] = []
-    for r in rows:
+    for i in range(n_rows):
         d: dict = {}
-        for k, v in zip(header, r):
+        for k, arr in columns.items():
+            v = arr[i]
             if k == "dataset":
-                d[k] = v
+                d[k] = str(v)
             else:
                 try:
                     d[k] = float(v)
-                except ValueError:
+                except (TypeError, ValueError):
                     d[k] = np.nan
         out.append(d)
     return out, meta
@@ -287,34 +275,92 @@ def _through_origin_stats(x, y, yerr=None) -> dict:
     return out
 
 
-def select_linear_subset(conc, N, N_err, use_weights: bool = True,
-                         metric: str = "veff_err", n_min: int = 3,
-                         alpha: float = 0.05) -> dict:
+# ── Linear-range criteria ─────────────────────────────────────────────────────
+
+# A point lies "on the line" when its relative deviation from the fitted
+# through-origin model is within tolerance.  The two points at the ENDS of a
+# candidate window get a looser tolerance than the interior: roll-off sets in
+# gradually, so insisting on interior-grade agreement at the very edges
+# shortens the window for no physical reason.
+_MAX_REL_DEV      = 0.15        # interior points
+_MAX_REL_DEV_EDGE = 0.20        # the first and last point of the window
+
+
+def _window_linearity(x, y, yerr, max_dev, max_dev_edge):
     """
-    Choose the contiguous concentration window that best represents the linear
+    Fit y = s.x through the origin over one window and score its linearity.
+
+    Returns (slope, rel_dev, score):
+
+      rel_dev : |y - s.x| / (s.x) for each point -- deviation FROM THE FITTED
+                LINE, not the point's own error bar.  A point can be measured
+                very precisely and still sit far off the line; that is exactly
+                what leaving the linear regime looks like, and it is what this
+                criterion is meant to catch.
+      score   : max over points of rel_dev / (that point's allowance).
+                score <= 1 means every point is within tolerance.  When
+                nothing passes, the value itself ranks windows by how far the
+                worst point overshoots, so "least bad" needs no second metric.
+
+    A non-positive or non-finite slope scores infinite: the model is unusable.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    st = _through_origin_stats(x, y, yerr)
+    s_ = st["slope"]
+    if not np.isfinite(s_) or s_ <= 0:
+        return s_, np.full(x.size, np.inf), np.inf
+
+    fit = s_ * x
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel = np.abs(y - fit) / np.abs(fit)
+    rel = np.where(np.isfinite(rel), rel, np.inf)
+
+    allow = np.full(x.size, float(max_dev))
+    allow[0] = allow[-1] = float(max_dev_edge)   # window ends are the limits
+    score = float(np.max(rel / allow))
+    return s_, rel, score
+
+
+def select_linear_subset(conc, N, N_err, use_weights: bool = True,
+                         n_min: int = 3,
+                         max_rel_dev: float = _MAX_REL_DEV,
+                         max_rel_dev_edge: float = _MAX_REL_DEV_EDGE) -> dict:
+    """
+    Choose the contiguous concentration window that represents the linear
     calibration regime.
 
-    Points are ordered by concentration; every contiguous window of at least
-    ``n_min`` points is fit to <N> = s.C through the origin and scored by
-    ``metric``:
+    Criterion
+    ---------
+    Points are ordered by concentration.  Every contiguous window of at least
+    ``n_min`` points is fit to <N> = s.C through the origin, and the window is
+    accepted when no point deviates from that line by more than
+    ``max_rel_dev`` (default 15%), with ``max_rel_dev_edge`` (default 20%)
+    allowed at the window's own first and last point.
 
-      "veff_err" : minimise the *relative* external uncertainty of the
-                   calibration constant,  sqrt(chi2_red / Sxx) / |s|.
-                   Rewards more / higher-leverage points (larger Sxx), penalises
-                   non-linear points via chi2_red, needs no tuning constant, and
-                   is invariant to a global rescaling of the error bars.
+    Among accepted windows the LARGEST is chosen; ties go to the window at
+    lower concentration.  If no window is accepted, the one whose worst point
+    overshoots its allowance by the least is used and ``fallback`` is set, so
+    the caller can say so rather than presenting a bad range as a good one.
 
-      "gof"      : take the LARGEST window whose reduced chi-square is
-                   statistically acceptable (survival Q >= alpha), tie-broken by
-                   the largest Q.  Falls back to the window closest to
-                   chi2_red = 1 if nothing passes.  Requires real error bars.
+    Every contiguous window is enumerated rather than trimmed greedily from
+    the ends.  The fit changes each time a point is dropped, so a point that
+    failed can pass afterwards; a greedy trim can stop early and miss the
+    largest valid window.  At the ~10 points a calibration typically has this
+    is a few dozen fits.
+
+    This replaces the earlier "veff_err" / "gof" metrics, both of which keyed
+    off the ABSOLUTE scale of the error bars.  Those bars come from a fit
+    covariance and are routinely optimistic several-fold, which made the
+    selection swing between keeping everything and trimming perfectly linear
+    points.  Deviation from the line does not depend on that scale at all.
 
     Returns a dict:
         used     : boolean mask in the ORIGINAL point order (True = keep)
         order    : original indices sorted by concentration
         table    : per-window stat dicts (for the report / plot)
         best     : the chosen window record (or None)
-        metric, n_min, alpha, fallback, weighted
+        metric, n_min, max_rel_dev, max_rel_dev_edge, fallback, weighted
     """
     conc = np.asarray(conc, float)
     N = np.asarray(N, float)
@@ -330,44 +376,46 @@ def select_linear_subset(conc, N, N_err, use_weights: bool = True,
 
     table: List[dict] = []
     result = {"used": valid.copy(), "order": idx_valid, "table": table,
-              "metric": metric, "n_min": n_min, "alpha": float(alpha),
+              "metric": "rel_dev", "n_min": n_min,
+              "max_rel_dev": float(max_rel_dev),
+              "max_rel_dev_edge": float(max_rel_dev_edge),
               "best": None, "fallback": False, "weighted": weighted}
 
     if m < max(n_min, 2):               # too few points to trim: keep them all
         return result
-    if metric == "gof" and not weighted:
-        metric = "veff_err"             # GOF needs real error bars
-        result["metric"] = metric
 
     order = idx_valid[np.argsort(conc[idx_valid])]
     for i in range(m):
         for j in range(i + n_min - 1, m):
             win = order[i:j + 1]
             yee = (N_err_arr[win] if weighted else None)
-            st = _through_origin_stats(conc[win], N[win], yee)
-            if not np.isfinite(st["slope"]) or st["slope"] <= 0:
+            slope, rel, score = _window_linearity(
+                conc[win], N[win], yee, max_rel_dev, max_rel_dev_edge)
+            if not np.isfinite(slope) or slope <= 0:
                 continue
+            st = _through_origin_stats(conc[win], N[win], yee)
             table.append({
                 "i": int(i), "j": int(j), "n": int(win.size), "idx": win.copy(),
                 "c_lo": float(conc[win].min()), "c_hi": float(conc[win].max()),
-                "slope": st["slope"], "red_chi2": st["red_chi2"],
+                "slope": slope, "red_chi2": st["red_chi2"],
                 "gof_Q": st["gof_Q"], "s_err_ext": st["s_err_ext"],
-                "veff_err_rel": st["s_err_ext"] / st["slope"],
+                "veff_err_rel": (st["s_err_ext"] / slope if slope else np.nan),
+                "max_rel_dev": float(np.max(rel)) if rel.size else np.nan,
+                "score": float(score),
+                "passes": bool(score <= 1.0),
             })
 
     if not table:
         return result
 
-    if metric == "gof":
-        accepted = [r for r in table
-                    if np.isfinite(r["gof_Q"]) and r["gof_Q"] >= alpha]
-        if accepted:
-            best = max(accepted, key=lambda r: (r["n"], r["gof_Q"]))
-        else:
-            result["fallback"] = True
-            best = min(table, key=lambda r: abs(r["red_chi2"] - 1.0))
-    else:                               # "veff_err"
-        best = min(table, key=lambda r: r["veff_err_rel"])
+    passing = [r for r in table if r["passes"]]
+    if passing:
+        # Most points; ties to the window sitting at lower concentration.
+        best = max(passing, key=lambda r: (r["n"], -r["c_lo"]))
+    else:
+        # Least bad: smallest overshoot, then most points, then lower conc.
+        result["fallback"] = True
+        best = min(table, key=lambda r: (r["score"], -r["n"], r["c_lo"]))
 
     used = np.zeros_like(valid, dtype=bool)
     used[best["idx"]] = True
@@ -534,9 +582,9 @@ def calibrate(
     collapse: bool = True,
     collapse_rtol: float = 1e-6,
     select: str = "auto",
-    select_metric: str = "veff_err",
     n_min: int = 3,
-    alpha_gof: float = 0.05,
+    max_rel_dev: float = _MAX_REL_DEV,
+    max_rel_dev_edge: float = _MAX_REL_DEV_EDGE,
 ) -> dict:
     """
     Fit <N> = s·C through the origin and derive alpha (C = alpha·<N>) and,
@@ -563,8 +611,8 @@ def calibrate(
     if select == "auto":
         sel = select_linear_subset(
             conc, N, (N_err if have_err else None),
-            use_weights=use_weights, metric=select_metric,
-            n_min=n_min, alpha=alpha_gof,
+            use_weights=use_weights, n_min=n_min,
+            max_rel_dev=max_rel_dev, max_rel_dev_edge=max_rel_dev_edge,
         )
         used = np.asarray(sel["used"], bool)
     else:
@@ -604,6 +652,8 @@ def calibrate(
         "slope_err_ext": st["s_err_ext"],
         "select": select,
         "select_metric": (sel["metric"] if sel else None),
+        "max_rel_dev": float(max_rel_dev),
+        "max_rel_dev_edge": float(max_rel_dev_edge),
         "selection": sel,
     }
 
@@ -626,9 +676,11 @@ def plot_calibration(result: dict, show: bool = True):
     if excl.any() and used.any():
         lo, hi = float(conc[used].min()), float(conc[used].max())
         if conc[excl].min() < lo:
-            ax.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0)
+            ax.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0,
+                       label="_excluded range (low C)")
         if conc[excl].max() > hi:
-            ax.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5, zorder=0)
+            ax.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5,
+                       zorder=0, label="_excluded range (high C)")
 
     def _pts(mask, **kw):
         if not mask.any():
@@ -683,6 +735,96 @@ def plot_calibration(result: dict, show: bool = True):
     return fig, ax
 
 
+# ── Rebuilding a plot from an exported CSV ────────────────────────────────────
+
+def _meta_num(meta: dict, key: str, default=None, cast=float):
+    v = meta.get(key)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return cast(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def rebuild_plot(meta: dict, columns: dict, show: bool = True, path=None):
+    """
+    Rebuild a calibration figure from an exported *_calibration_points.csv.
+
+    Everything the plot needs is in that one file: the points and their
+    errors, which of them the fit used, and the fitted statistics.  No .fcs
+    file, no parameter table and no re-fitting are involved -- the numbers
+    shown are the ones that were actually fitted, not a re-derivation that
+    could differ if the selection rules changed in the meantime.
+
+    Older exports lack the statistics keys, since the header used to carry
+    only the unit and alpha.  In that case the slope is recovered from the
+    N_fit column (N_fit = slope . C) and the box shows what can be derived,
+    so an old calibration still reopens rather than refusing.
+
+    Parameters
+    ----------
+    meta, columns : from fcs_export.read_export
+    show : passed through to plot_calibration
+    path : unused; part of the rebuilder contract
+
+    Returns
+    -------
+    fig, ax
+    """
+    for need in ("concentration", "N"):
+        if need not in columns:
+            raise ValueError(
+                f"No '{need}' column: this does not look like a calibration "
+                f"points export."
+            )
+
+    conc = np.asarray(columns["concentration"], float)
+    N    = np.asarray(columns["N"], float)
+    N_err = (np.asarray(columns["N_err"], float)
+             if "N_err" in columns else np.zeros_like(N))
+    used = (np.asarray(columns["used"], float) > 0.5
+            if "used" in columns else np.ones(N.size, bool))
+
+    slope = _meta_num(meta, "slope")
+    if slope is None and "N_fit" in columns:
+        # Pre-dates the slope key: N_fit = slope . C, so any point with a
+        # non-zero concentration recovers it exactly.
+        nfit = np.asarray(columns["N_fit"], float)
+        ok = np.isfinite(nfit) & np.isfinite(conc) & (np.abs(conc) > 0)
+        if ok.any():
+            slope = float(np.median(nfit[ok] / conc[ok]))
+    if slope is None:
+        raise ValueError(
+            "This export records neither a slope nor an N_fit column, so the "
+            "calibration line cannot be drawn."
+        )
+
+    alpha = _meta_num(meta, "alpha", 1.0 / slope if slope else float("nan"))
+
+    result = {
+        "conc": conc,
+        "N": N,
+        "N_err": N_err,
+        "used": used,
+        "unit": meta.get("unit", "nM"),
+        "slope": slope,
+        "slope_err": _meta_num(meta, "slope_err", float("nan")),
+        "alpha": alpha,
+        "alpha_err": _meta_num(meta, "alpha_err", float("nan")),
+        "intercept": _meta_num(meta, "intercept", float("nan")),
+        "r2": _meta_num(meta, "r2", float("nan")),
+        "veff_um3": _meta_num(meta, "veff_um3"),
+        "red_chi2": _meta_num(meta, "red_chi2", float("nan")),
+        "gof_Q": _meta_num(meta, "gof_Q", float("nan")),
+        "n_used": _meta_num(meta, "n_used", int(np.count_nonzero(used)),
+                            cast=int),
+        "n_total": _meta_num(meta, "n_total", int(N.size), cast=int),
+        "corrected": str(meta.get("corrected", "")).strip().lower() == "yes",
+    }
+    return plot_calibration(result, show=show)
+
+
 # ── Export ────────────────────────────────────────────────────────────────────
 
 def _calib_dir(source_path: Path) -> Path:
@@ -730,8 +872,13 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
         L.append("")
         L.append("Linear-range selection")
         L.append("-" * 60)
-        L.append(f"metric     : {sel.get('metric')}"
-                 + ("   [fallback: no window met the GOF threshold]"
+        L.append(f"criterion  : |N - fit| / fit  <=  "
+                 f"{100*sel.get('max_rel_dev', float('nan')):.3g}% "
+                 f"(interior), "
+                 f"{100*sel.get('max_rel_dev_edge', float('nan')):.3g}% "
+                 f"(window ends)"
+                 + ("\n             [FALLBACK: no window met the criteria; "
+                    "the least-bad window is shown]"
                     if sel.get("fallback") else ""))
         L.append(f"n_min      : {sel.get('n_min')}    "
                  f"points used: {result['n_used']}/{result['n_total']}")
@@ -742,17 +889,19 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
             best = sel.get("best")
             L.append("")
             L.append(f"    {'n':>2}  {'C range':>18}  {'slope':>9}  "
-                     f"{'chi2_red':>9}  {'GOF Q':>8}  {'relErr(s)':>10}")
+                     f"{'max dev':>8}  {'ok':>3}  {'chi2_red':>9}")
             for r in sorted(tbl, key=lambda r: (r["i"], r["j"])):
                 star = " *" if (best is not None and r["i"] == best["i"]
                                 and r["j"] == best["j"]) else "  "
-                q = r["gof_Q"]
-                qs = f"{q:.3g}" if np.isfinite(q) else "—"
+                dev = r.get("max_rel_dev", float("nan"))
+                devs = f"{100*dev:.1f}%" if np.isfinite(dev) else "—"
                 L.append(f"{star}  {r['n']:>2}  "
                          f"{r['c_lo']:>8.3g}–{r['c_hi']:<9.3g}  "
-                         f"{r['slope']:>9.4g}  {r['red_chi2']:>9.3g}  "
-                         f"{qs:>8}  {r['veff_err_rel']:>10.3g}")
-            L.append("  (* = selected window)")
+                         f"{r['slope']:>9.4g}  {devs:>8}  "
+                         f"{'yes' if r.get('passes') else 'no':>3}  "
+                         f"{r['red_chi2']:>9.3g}")
+            L.append("  (* = selected window;  'max dev' is the largest "
+                     "|N - fit|/fit in that window)")
     groups = result.get("groups")
     if result.get("collapsed") and groups and any(g["n"] > 1 for g in groups):
         L.append("")
@@ -786,7 +935,36 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
     used = result.get("used")
     with points_path.open("w", encoding="utf-8-sig", newline="") as fh:
         fh.write("# FCS volume calibration points\n")
+        # Machine-readable header, so this file can be reopened as a live plot
+        # (see fcs_plotopen).  The banner above carries no colon, so a
+        # "key : value" parser cannot read it.  Everything the plot draws --
+        # the fit line, the statistics box, the shaded excluded regions --
+        # comes from these keys plus the columns below, so the figure is
+        # reconstructible from this file alone.
+        fh.write("# analysis : calibration points\n")
         fh.write(f"# unit : {unit}\n")
+        fh.write(f"# slope : {result['slope']:.10g}\n")
+        fh.write(f"# slope_err : {result['slope_err']:.10g}\n")
+        fh.write(f"# alpha : {result['alpha']:.10g}\n")
+        fh.write(f"# alpha_err : {result['alpha_err']:.10g}\n")
+        fh.write(f"# intercept : {result['intercept']:.10g}\n")
+        fh.write(f"# r2 : {result['r2']:.10g}\n")
+        if result.get("veff_um3") is not None:
+            fh.write(f"# veff_um3 : {result['veff_um3']:.10g}\n")
+        if np.isfinite(result.get("red_chi2", float("nan"))):
+            fh.write(f"# red_chi2 : {result['red_chi2']:.10g}\n")
+        if np.isfinite(result.get("gof_Q", float("nan"))):
+            fh.write(f"# gof_Q : {result['gof_Q']:.10g}\n")
+        fh.write(f"# n_used : {result['n_used']}\n")
+        fh.write(f"# n_total : {result['n_total']}\n")
+        fh.write(f"# corrected : {'yes' if result.get('corrected') else 'no'}\n")
+        sel = result.get("selection")
+        if sel is not None:
+            fh.write(f"# select_max_rel_dev : {sel.get('max_rel_dev')}\n")
+            fh.write(f"# select_max_rel_dev_edge : "
+                     f"{sel.get('max_rel_dev_edge')}\n")
+            fh.write(f"# select_fallback : "
+                     f"{'yes' if sel.get('fallback') else 'no'}\n")
         fh.write(f"# C = alpha * <N> ; alpha = {result['alpha']:.6g} {unit}/molecule\n")
         fh.write(f"# fit uses only rows with used=1 "
                  f"({result.get('n_used', '?')}/{result.get('n_total', '?')} points)\n")
@@ -966,14 +1144,29 @@ def run_calibration_dialog(parent=None, init_dir=None):
     tk.Checkbutton(sel_frame, text="Auto-select the linear range",
                    variable=auto_var, anchor="w").grid(
         row=0, column=0, columnspan=4, sticky="w")
-    tk.Label(sel_frame, text="metric:").grid(row=1, column=0, sticky="e", pady=(4, 0))
-    metric_var = tk.StringVar(value="veff_err")
-    tk.OptionMenu(sel_frame, metric_var, "veff_err", "gof").grid(
+    tk.Label(sel_frame, text="max dev %:").grid(row=1, column=0, sticky="e",
+                                               pady=(4, 0))
+    dev_var = tk.StringVar(value=f"{100*_MAX_REL_DEV:g}")
+    tk.Entry(sel_frame, textvariable=dev_var, width=5).grid(
         row=1, column=1, sticky="w", padx=(4, 12), pady=(4, 0))
-    tk.Label(sel_frame, text="min points:").grid(row=1, column=2, sticky="e", pady=(4, 0))
+    tk.Label(sel_frame, text="at ends %:").grid(row=1, column=2, sticky="e",
+                                                pady=(4, 0))
+    edge_var = tk.StringVar(value=f"{100*_MAX_REL_DEV_EDGE:g}")
+    tk.Entry(sel_frame, textvariable=edge_var, width=5).grid(
+        row=1, column=3, sticky="w", padx=4, pady=(4, 0))
+    tk.Label(sel_frame, text="min points:").grid(row=2, column=0, sticky="e",
+                                                 pady=(4, 0))
     nmin_var = tk.StringVar(value="3")
     tk.Entry(sel_frame, textvariable=nmin_var, width=5).grid(
-        row=1, column=3, sticky="w", padx=4, pady=(4, 0))
+        row=2, column=1, sticky="w", padx=4, pady=(4, 0))
+    tk.Label(sel_frame,
+             text="A point is kept when it sits within\n"
+                  "'max dev' of the fitted line; the two\n"
+                  "points at the ends of the range get\n"
+                  "the looser 'at ends' tolerance.",
+             font=("Helvetica", 8), fg="grey", justify="left",
+             anchor="w").grid(row=3, column=0, columnspan=4, sticky="w",
+                              pady=(6, 0))
 
     btns = tk.Frame(win)
     btns.pack(pady=10)
@@ -996,12 +1189,24 @@ def run_calibration_dialog(parent=None, init_dir=None):
         except ValueError:
             n_min = 3
         try:
+            max_dev = float(dev_var.get()) / 100.0
+            edge_dev = float(edge_var.get()) / 100.0
+            if not (0 < max_dev and 0 < edge_dev):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid input",
+                "The deviation tolerances must be positive percentages.",
+                parent=win)
+            return
+        try:
             result = calibrate(names, N, N_err if has_err else None, conc,
                                unit=unit, use_weights=weight_var.get(),
                                corrected=use_corr,
                                collapse=collapse_var.get(),
                                select=("auto" if auto_var.get() else "none"),
-                               select_metric=metric_var.get(), n_min=n_min)
+                               n_min=n_min, max_rel_dev=max_dev,
+                               max_rel_dev_edge=edge_dev)
         except Exception as e:
             messagebox.showerror("Calibration failed", str(e), parent=win)
             return
@@ -1025,7 +1230,8 @@ def run_calibration_dialog(parent=None, init_dir=None):
                     f"{result['n_total']} points\n")
         if result.get("select") == "auto":
             msg += (f"points used: {result['n_used']}/{result['n_total']}"
-                    f"  (metric: {result.get('select_metric')})\n")
+                    f"  (max dev {100*result.get('max_rel_dev', 0):.3g}% / "
+                    f"{100*result.get('max_rel_dev_edge', 0):.3g}% at ends)\n")
             if result["excluded"]:
                 msg += f"excluded: {', '.join(result['excluded'])}\n"
         msg += f"\nSaved to:\n{report_path.parent}"

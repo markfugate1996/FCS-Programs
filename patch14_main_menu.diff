@@ -1,0 +1,41 @@
+--- a/fcs_main.py
++++ b/fcs_main.py
+@@ -29,6 +29,7 @@
+ import fcs_pch
+ import fcs_fit
+ import fcs_calib
++import fcs_plotopen
+ 
+ 
+ # ── Global workspace state ────────────────────────────────────────────────────
+@@ -871,6 +872,22 @@
+     fcs_calib.run_calibration_dialog(parent=root, init_dir=init_dir)
+ 
+ 
++def task_open_plot():
++    """
++    Reopen a previously exported analysis as a live, interactive figure.
++
++    Opens the exported CSV, not a PNG: the result comes back as a real
++    matplotlib figure with the full plot-controls panel, so it can be
++    rescaled, restyled and re-saved.  See fcs_plotopen.
++    """
++    d = _active_data()
++    init_dir = None
++    if d is not None:
++        analysis = d.filepath.parent / "analysis"
++        init_dir = analysis if analysis.exists() else d.filepath.parent
++    fcs_plotopen.run_open_dialog(parent=root, initialdir=init_dir)
++
++
+ # ── Tasks panel (right) ───────────────────────────────────────────────────────
+ tasks = [
+     ("Plot Intensity",              task_plot_intensity),
+@@ -879,6 +896,7 @@
+     ("Photon Counting Histogram",   task_pch),
+     ("Model Data",                  task_model),
+     ("Calibrate Volume (⟨N⟩ vs C)", task_calibrate),
++    ("Reopen Saved Plot…",          task_open_plot),
+ ]
+ 
+ task_frame = tk.LabelFrame(mid_frame, text="Tasks", padx=10, pady=8)

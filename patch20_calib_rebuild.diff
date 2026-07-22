@@ -1,0 +1,150 @@
+--- a/fcs_calib.py
++++ b/fcs_calib.py
+@@ -676,9 +676,11 @@
+     if excl.any() and used.any():
+         lo, hi = float(conc[used].min()), float(conc[used].max())
+         if conc[excl].min() < lo:
+-            ax.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0)
++            ax.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0,
++                       label="_excluded range (low C)")
+         if conc[excl].max() > hi:
+-            ax.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5, zorder=0)
++            ax.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5,
++                       zorder=0, label="_excluded range (high C)")
+ 
+     def _pts(mask, **kw):
+         if not mask.any():
+@@ -733,6 +735,96 @@
+     return fig, ax
+ 
+ 
++# ── Rebuilding a plot from an exported CSV ────────────────────────────────────
++
++def _meta_num(meta: dict, key: str, default=None, cast=float):
++    v = meta.get(key)
++    if v is None or str(v).strip() == "":
++        return default
++    try:
++        return cast(float(v))
++    except (TypeError, ValueError):
++        return default
++
++
++def rebuild_plot(meta: dict, columns: dict, show: bool = True, path=None):
++    """
++    Rebuild a calibration figure from an exported *_calibration_points.csv.
++
++    Everything the plot needs is in that one file: the points and their
++    errors, which of them the fit used, and the fitted statistics.  No .fcs
++    file, no parameter table and no re-fitting are involved -- the numbers
++    shown are the ones that were actually fitted, not a re-derivation that
++    could differ if the selection rules changed in the meantime.
++
++    Older exports lack the statistics keys, since the header used to carry
++    only the unit and alpha.  In that case the slope is recovered from the
++    N_fit column (N_fit = slope . C) and the box shows what can be derived,
++    so an old calibration still reopens rather than refusing.
++
++    Parameters
++    ----------
++    meta, columns : from fcs_export.read_export
++    show : passed through to plot_calibration
++    path : unused; part of the rebuilder contract
++
++    Returns
++    -------
++    fig, ax
++    """
++    for need in ("concentration", "N"):
++        if need not in columns:
++            raise ValueError(
++                f"No '{need}' column: this does not look like a calibration "
++                f"points export."
++            )
++
++    conc = np.asarray(columns["concentration"], float)
++    N    = np.asarray(columns["N"], float)
++    N_err = (np.asarray(columns["N_err"], float)
++             if "N_err" in columns else np.zeros_like(N))
++    used = (np.asarray(columns["used"], float) > 0.5
++            if "used" in columns else np.ones(N.size, bool))
++
++    slope = _meta_num(meta, "slope")
++    if slope is None and "N_fit" in columns:
++        # Pre-dates the slope key: N_fit = slope . C, so any point with a
++        # non-zero concentration recovers it exactly.
++        nfit = np.asarray(columns["N_fit"], float)
++        ok = np.isfinite(nfit) & np.isfinite(conc) & (np.abs(conc) > 0)
++        if ok.any():
++            slope = float(np.median(nfit[ok] / conc[ok]))
++    if slope is None:
++        raise ValueError(
++            "This export records neither a slope nor an N_fit column, so the "
++            "calibration line cannot be drawn."
++        )
++
++    alpha = _meta_num(meta, "alpha", 1.0 / slope if slope else float("nan"))
++
++    result = {
++        "conc": conc,
++        "N": N,
++        "N_err": N_err,
++        "used": used,
++        "unit": meta.get("unit", "nM"),
++        "slope": slope,
++        "slope_err": _meta_num(meta, "slope_err", float("nan")),
++        "alpha": alpha,
++        "alpha_err": _meta_num(meta, "alpha_err", float("nan")),
++        "intercept": _meta_num(meta, "intercept", float("nan")),
++        "r2": _meta_num(meta, "r2", float("nan")),
++        "veff_um3": _meta_num(meta, "veff_um3"),
++        "red_chi2": _meta_num(meta, "red_chi2", float("nan")),
++        "gof_Q": _meta_num(meta, "gof_Q", float("nan")),
++        "n_used": _meta_num(meta, "n_used", int(np.count_nonzero(used)),
++                            cast=int),
++        "n_total": _meta_num(meta, "n_total", int(N.size), cast=int),
++        "corrected": str(meta.get("corrected", "")).strip().lower() == "yes",
++    }
++    return plot_calibration(result, show=show)
++
++
+ # ── Export ────────────────────────────────────────────────────────────────────
+ 
+ def _calib_dir(source_path: Path) -> Path:
+@@ -843,7 +935,36 @@
+     used = result.get("used")
+     with points_path.open("w", encoding="utf-8-sig", newline="") as fh:
+         fh.write("# FCS volume calibration points\n")
++        # Machine-readable header, so this file can be reopened as a live plot
++        # (see fcs_plotopen).  The banner above carries no colon, so a
++        # "key : value" parser cannot read it.  Everything the plot draws --
++        # the fit line, the statistics box, the shaded excluded regions --
++        # comes from these keys plus the columns below, so the figure is
++        # reconstructible from this file alone.
++        fh.write("# analysis : calibration points\n")
+         fh.write(f"# unit : {unit}\n")
++        fh.write(f"# slope : {result['slope']:.10g}\n")
++        fh.write(f"# slope_err : {result['slope_err']:.10g}\n")
++        fh.write(f"# alpha : {result['alpha']:.10g}\n")
++        fh.write(f"# alpha_err : {result['alpha_err']:.10g}\n")
++        fh.write(f"# intercept : {result['intercept']:.10g}\n")
++        fh.write(f"# r2 : {result['r2']:.10g}\n")
++        if result.get("veff_um3") is not None:
++            fh.write(f"# veff_um3 : {result['veff_um3']:.10g}\n")
++        if np.isfinite(result.get("red_chi2", float("nan"))):
++            fh.write(f"# red_chi2 : {result['red_chi2']:.10g}\n")
++        if np.isfinite(result.get("gof_Q", float("nan"))):
++            fh.write(f"# gof_Q : {result['gof_Q']:.10g}\n")
++        fh.write(f"# n_used : {result['n_used']}\n")
++        fh.write(f"# n_total : {result['n_total']}\n")
++        fh.write(f"# corrected : {'yes' if result.get('corrected') else 'no'}\n")
++        sel = result.get("selection")
++        if sel is not None:
++            fh.write(f"# select_max_rel_dev : {sel.get('max_rel_dev')}\n")
++            fh.write(f"# select_max_rel_dev_edge : "
++                     f"{sel.get('max_rel_dev_edge')}\n")
++            fh.write(f"# select_fallback : "
++                     f"{'yes' if sel.get('fallback') else 'no'}\n")
+         fh.write(f"# C = alpha * <N> ; alpha = {result['alpha']:.6g} {unit}/molecule\n")
+         fh.write(f"# fit uses only rows with used=1 "
+                  f"({result.get('n_used', '?')}/{result.get('n_total', '?')} points)\n")

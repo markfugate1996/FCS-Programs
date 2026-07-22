@@ -1,0 +1,58 @@
+--- a/fcs_corr.py
++++ b/fcs_corr.py
+@@ -1589,8 +1589,12 @@
+         meta["segmented"] = "no"
+ 
+     if full_trace_G is not None and n_segs > 1:
++        # Both a prose form (for a human reading the header) and a flag (for
++        # a reader rebuilding the plot -- string-matching the prose would be
++        # brittle).
+         meta["G_source"] = ("full trace (segments used only for G_std)"
+                             if full_trace_G else "mean of the per-segment G")
++        meta["G_from_full_trace"] = "yes" if full_trace_G else "no"
+ 
+     if have_std:
+         meta["G_std_definition"] = (
+@@ -1701,8 +1705,13 @@
+         ax.semilogx(tau_ms[mask_u], upper[mask_u],
+                     color="lightgrey", linewidth=1.0,
+                     label=f"±1 SEM  (n={n_segs} segments)")
++        # Labelled with a leading underscore: matplotlib keeps it out of the
++        # legend (the upper line already carries the entry), but the Traces
++        # panel in fcs_plottools strips the underscore and can name it,
++        # rather than listing it as an anonymous "unnamed trace".
+         ax.semilogx(tau_ms[mask_l], lower[mask_l],
+-                    color="lightgrey", linewidth=1.0)
++                    color="lightgrey", linewidth=1.0,
++                    label="_±1 SEM (lower)")
+ 
+     # ── Mean correlation ──────────────────────────────────────────────────────
+     mask_m = np.isfinite(G_mean)
+@@ -1721,8 +1730,16 @@
+     ax.set_xlabel("Lag time τ (ms)", fontsize=12)
+     ax.set_ylabel("G(τ)", fontsize=12)
+ 
+-    n_ch1 = len(fcs_data.ch1_deltas)
+-    n_ch2 = len(fcs_data.ch2_deltas)
++    # Photons ACTUALLY correlated, not every photon in the file.  Under a
++    # microtime gate or photon thinning the two differ substantially, and a
++    # subtitle quoting the file total under a curve computed from a gated
++    # subset overstates the statistics behind the curve.  It also makes the
++    # figure reconstructible from the CSV, which records the used counts.
++    # Falls back to the file totals when the caller did not supply them.
++    n_ch1 = (n_used_ch1 if n_used_ch1 is not None
++             else len(fcs_data.ch1_deltas))
++    n_ch2 = (n_used_ch2 if n_used_ch2 is not None
++             else len(fcs_data.ch2_deltas))
+     title = f"Correlation — {fcs_data.filepath.name}"
+     gate_str = (f"  ·  gate: {gate_min_ns:.2f}–{gate_max_ns:.2f} ns"
+                 if gate_min_ns is not None else "")
+@@ -1739,7 +1756,7 @@
+         f"τ: {tau_min_s*1e3:.3g}–{tau_max_s*1e3:.3g} ms  ·  "
+         f"{seg_str}"
+         f"{gate_str}  ·  "
+-        f"Ch1: {n_ch1:,}  Ch2: {n_ch2:,} photons"
++        f"Ch1: {n_ch1:,}  Ch2: {n_ch2:,} photons correlated"
+     )
+     ax.set_title(f"{title}\n{subtitle}", fontsize=10)
+     ax.set_xlim(tau_min_s * 1e3, tau_max_s * 1e3)

@@ -1,0 +1,77 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -39,6 +39,7 @@
+ 
+ import fcs_models
+ from fcs_models import FCSModel
++import fcs_export
+ from fcs_reader import read_fcs, FCSData
+ import fcs_lifetime
+ import fcs_lifetime_fit
+@@ -86,32 +87,11 @@
+     columns : dict of every column found, by name
+     meta  : dict of header ``# key : value`` fields (e.g. 'source file', 'type')
+     """
++    # Parsing lives in fcs_export.read_export -- the same reader the writer
++    # is paired with, so the format is defined in exactly one place.  This
++    # function keeps its own signature and its FCS-specific validation.
+     path = Path(path)
+-    header: Optional[list[str]] = None
+-    rows: list[list[str]] = []
+-    meta: Dict[str, str] = {}
+-    with path.open("r", encoding="utf-8") as fh:
+-        for line in fh:
+-            if line.startswith("#"):
+-                body = line[1:].strip()
+-                if ":" in body:
+-                    k, v = body.split(":", 1)
+-                    meta[k.strip()] = v.strip()
+-                continue
+-            if not line.strip():
+-                continue
+-            cells = [c.strip() for c in line.rstrip("\n").split(",")]
+-            if header is None:
+-                header = cells
+-                continue
+-            rows.append(cells)
+-
+-    if not header:
+-        raise ValueError(f"No header row found in {path.name}.")
+-
+-    data = (np.array(rows, dtype=np.float64)
+-            if rows else np.empty((0, len(header)), dtype=np.float64))
+-    columns = {name: data[:, i] for i, name in enumerate(header)}
++    meta, columns = fcs_export.read_export(path)
+ 
+     if "tau_s" in columns:
+         tau_s = columns["tau_s"]
+@@ -691,8 +671,29 @@
+     header = ["dataset", "tau_s", "tau_ms", "G_data", "G_fit", "residual"]
+     if weighted:
+         header.append("sigma")
++    linked_names = [n for n in result["names"] if result["linked"].get(n)]
++    fixed_names  = [n for n in result["names"] if result["fixed"].get(n)]
+     with curve_path.open("w", encoding="utf-8-sig", newline="") as fh:
+         fh.write(f"# FCS global fit curves — {model.key}\n")
++        # Machine-readable header, so this file can be reopened as a live plot
++        # (see fcs_plotopen).  The banner above uses an em-dash and no colon,
++        # so a "key : value" parser cannot read it.  Which parameters were
++        # linked and which were fixed is recorded here because it is not
++        # recoverable from the numbers alone: a linked parameter merely has
++        # equal values across datasets, which can also happen by coincidence.
++        fh.write("# analysis   : global fit curves\n")
++        fh.write(f"# model_key  : {model.key}\n")
++        fh.write(f"# model      : {model.name}\n")
++        fh.write(f"# weighted   : {'yes' if weighted else 'no'}\n")
++        fh.write(f"# n_datasets : {result['n_datasets']}\n")
++        fh.write(f"# n_free     : {result['n_free']}\n")
++        fh.write(f"# linked     : {', '.join(linked_names)}\n")
++        fh.write(f"# fixed      : {', '.join(fixed_names)}\n")
++        if weighted:
++            fh.write(f"# red_chi2   : {result['red_chi2']:.10g}\n")
++        else:
++            fh.write(f"# r2_global  : "
++                     f"{1 - result['ss_res'] / _grand_ss_tot(result['datasets']):.10g}\n")
+         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
+         fh.write(",".join(header) + "\n")
+         for ds in result["datasets"]:

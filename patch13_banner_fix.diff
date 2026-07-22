@@ -1,0 +1,23 @@
+--- a/fcs_export.py
++++ b/fcs_export.py
+@@ -224,8 +224,18 @@
+                     key, val = body.split(":", 1)
+                     meta[key.strip()] = val.strip()
+                 elif "\u2014" in body:
+-                    meta.setdefault("analysis",
+-                                    body.split("\u2014", 1)[1].strip())
++                    # Legacy banners, for files written before the analysis
++                    # key existed.  Matched on the text LEFT of the dash --
++                    # the fit banner is "FCS global fit curves — <model key>",
++                    # so splitting blindly would record the model key as the
++                    # analysis name.
++                    left, right = body.split("\u2014", 1)
++                    banner, tail = left.strip().lower(), right.strip()
++                    if banner == "fcs analysis export":
++                        meta.setdefault("analysis", tail)
++                    elif banner == "fcs global fit curves":
++                        meta.setdefault("analysis", "global fit curves")
++                        meta.setdefault("model_key", tail)
+                 continue
+             if header is None:
+                 header = [c.strip() for c in raw]

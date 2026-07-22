@@ -1,0 +1,108 @@
+diff --git a/fcs_corr.py b/fcs_corr.py
+--- a/fcs_corr.py
++++ b/fcs_corr.py
+@@ -_cps_meta -> _export_correlation
+         "cps_ch1": f"{n1 / T:.6g}",
+         "cps_ch2": f"{n2 / T:.6g}",
+     }
+ 
++# ── Background (Koppel) amplitude correction ──────────────────────────────────
++# Uncorrelated background dilutes the measured amplitude as
++#   G(0)_meas = (1 - B/F)^2 * G(0)_true,
++# so the corrective factor is (1 - B/F)^-2 == (F/S)^2, with F = total rate,
++# B = background rate, S = F - B = sample rate.  For a cross-correlation the
++# dilution is (S1/F1)(S2/F2), so the factor is the product (F1/S1)(F2/S2).
++#
++# Rates come from the per-channel microtime (TCSPC) histogram at native
++# 4096-bin resolution (so bin 0 cleanly isolates the untimed catch-all):
++#   total      = timed photons / T   (bin 0 dropped)
++#   background = flat baseline in the window below, scaled from the window
++#                width up to the full laser period (background is uniform in
++#                microtime)
++#   sample     = total - background
++
++# Baseline window (ns): past the decay but short of the final-bin artifacts.
++# Targets the ~20 MHz rep rate; guarded against the laser period below.
++_BG_WINDOW_MIN_NS = 40.0
++_BG_WINDOW_MAX_NS = 41.0
++
++# Bin 0 (untimed photons) is always dropped from the total.  The final bin is
++# the same kind of tagger catch-all (clamped records); set True to drop it too.
++_DROP_LAST_MICRO_BIN = False
++
++
++def _bg_rates_one_channel(fcs_data, channel):
++    """Return (total_hz, sample_hz, background_hz) for one channel, or None."""
++    bin_times_ns, counts = fcs_data.lifetime_histogram(channel=channel,
++                                                        n_bins=4096)
++    counts = counts.astype(np.float64)
++    T = fcs_data.duration_s
++    if counts.sum() <= 0 or T <= 0:
++        return None
++
++    # Total: drop bin 0 (untimed catch-all); optionally the final bin too.
++    hi_idx = -1 if _DROP_LAST_MICRO_BIN else counts.size
++    total_hz = float(counts[1:hi_idx].sum()) / T
++
++    # Background baseline window, guarded against the laser period.
++    period = fcs_data.laser_period_ns
++    lo_ns, hi_ns = _BG_WINDOW_MIN_NS, _BG_WINDOW_MAX_NS
++    if hi_ns >= period:
++        hi_ns = 0.85 * period       # higher rep rate than the default targets
++        lo_ns = hi_ns - 1.0
++        if lo_ns <= 0:
++            return None
++
++    win = (bin_times_ns >= lo_ns) & (bin_times_ns < hi_ns)
++    if not win.any():
++        return None
++    win_width_ns     = float(win.sum()) * fcs_data.microtime_resolution_ns
++    bg_counts_window = float(counts[win].sum())
++
++    # Scale the windowed baseline up to the full period (uniform background).
++    background_hz = (bg_counts_window * period / win_width_ns) / T
++    sample_hz     = total_hz - background_hz
++    return total_hz, sample_hz, background_hz
++
++
++def _bg_correction_meta(fcs_data, corr_type):
++    """
++    Metadata fields for the Koppel amplitude correction: total / sample /
++    background rates for the channel(s) the correlation type uses, plus the
++    type-appropriate correction factor.  Cross-correlation writes both
++    channels; an autocorrelation writes only its own.
++    """
++    channels = ((1,) if corr_type == "auto_ch1" else
++                (2,) if corr_type == "auto_ch2" else (1, 2))
++    meta: dict = {}
++    base: dict = {}                 # per-channel (F/S) = total/sample
++    for ch in channels:
++        r = _bg_rates_one_channel(fcs_data, ch)
++        if r is None:
++            continue
++        total_hz, sample_hz, background_hz = r
++        meta[f"bg_total_rate_ch{ch}_hz"]      = f"{total_hz:.6g}"
++        meta[f"bg_sample_rate_ch{ch}_hz"]     = f"{sample_hz:.6g}"
++        meta[f"bg_background_rate_ch{ch}_hz"]  = f"{background_hz:.6g}"
++        if sample_hz > 0:
++            base[ch] = total_hz / sample_hz
++
++    if corr_type == "auto_ch1" and 1 in base:
++        meta["bg_correction_factor"] = f"{base[1] ** 2:.6g}"
++    elif corr_type == "auto_ch2" and 2 in base:
++        meta["bg_correction_factor"] = f"{base[2] ** 2:.6g}"
++    elif corr_type == "cross" and 1 in base and 2 in base:
++        meta["bg_correction_factor"] = f"{base[1] * base[2]:.6g}"
++    return meta
++
++
+ def _export_correlation(
+@@ -_export_correlation meta assembly
+     if gate_min_ns is not None:
+         meta["gate_min_ns"] = f"{gate_min_ns:.3f}"
+         meta["gate_max_ns"] = f"{gate_max_ns:.3f}"
++    # Koppel background-correction rates + amplitude factor.
++    meta.update(_bg_correction_meta(fcs_data, corr_type))
+     fcs_export.safe_export(
+         fcs_data, "correlation", cols, meta=meta, suffix=corr_type,
+     )

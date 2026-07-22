@@ -1,0 +1,22 @@
+--- a/fcs_corr.py
++++ b/fcs_corr.py
+@@ -2086,7 +2086,8 @@
+     return v.strip().lower() in ("yes", "true", "1")
+ 
+ 
+-def rebuild_plot(meta: dict, columns: dict, show: bool = True):
++def rebuild_plot(meta: dict, columns: dict, show: bool = True,
++                 path=None):
+     """
+     Rebuild a correlation figure from a CSV written by this module.
+ 
+@@ -2108,6 +2109,9 @@
+     meta    : header mapping from fcs_export.read_export
+     columns : column mapping from fcs_export.read_export
+     show    : passed through to plot_correlation
++    path    : the source CSV, part of the rebuilder contract so that a
++              rebuilder can find sibling files.  A correlation export is
++              self-contained, so this one ignores it.
+ 
+     Returns
+     -------
