@@ -188,23 +188,36 @@ def show_figure(
     panel.update_idletasks()
     _panel_w = max(300, body.winfo_reqwidth() + _vsb.winfo_reqwidth() + 6)
     _content_h = body.winfo_reqheight() + 8
-    _panel_h = min(_content_h, int(panel.winfo_screenheight() * 0.85))
+    _panel_h = min(_content_h,
+                   panel.winfo_screenheight() - _SCREEN_MARGIN
+                   - _SCREEN_MARGIN_BOTTOM)
     panel.geometry(f"{_panel_w}x{_panel_h}")
     panel.minsize(_panel_w, min(_content_h, 320))
 
-    # ── Position panel to the right of the figure (deferred) ─────────────
+    # ── Position both windows fully on screen (deferred) ──────────────────
     def _position_panel():
         try:
+            # The figure window first: matplotlib leaves its placement to the
+            # window manager, which can open it partly below the desktop and
+            # take the navigation toolbar with it.  The panel is then placed
+            # relative to wherever the figure actually ended up.
+            place_figure_window(fig)
             tk_win.update_idletasks()
             fx = tk_win.winfo_x()
             fy = tk_win.winfo_y()
             fw = tk_win.winfo_width()
             sw = tk_win.winfo_screenwidth()
-            panel_w = _panel_w
+
             px = fx + fw + 6
-            if px + panel_w > sw:
-                px = max(0, fx - panel_w - 6)
-            panel.geometry(f"+{px}+{fy}")
+            if px + _panel_w > sw - _SCREEN_MARGIN:
+                # No room to the right; try the left, else overlap the figure
+                # rather than run off the edge.
+                px = fx - _panel_w - 6
+                if px < _SCREEN_MARGIN:
+                    px = max(_SCREEN_MARGIN, sw - _panel_w - _SCREEN_MARGIN)
+            # place_window clamps y as well, so a panel taller than the space
+            # below the figure is pulled up instead of hanging off the bottom.
+            place_window(panel, x=px, y=fy, w=_panel_w, h=_panel_h)
             panel.lift()
         except Exception:
             pass
@@ -234,6 +247,123 @@ def show_figure(
         fig.canvas.draw()
     except Exception:
         pass
+
+
+# ── Window placement ──────────────────────────────────────────────────────────
+
+# Keep this much of the screen clear at the bottom for a taskbar / dock, so a
+# window placed flush against the screen edge does not hide its own buttons
+# behind it.
+_SCREEN_MARGIN_BOTTOM = 64
+_SCREEN_MARGIN = 8
+
+
+def place_window(win, x=None, y=None, w=None, h=None) -> tuple:
+    """
+    Position *win* so that all of it is on screen.
+
+    Windows that open partly off-screen are not merely untidy: a dialog whose
+    lower edge falls below the desktop takes its OK button with it, and there
+    is no way to reach it without moving the window first.  This clamps the
+    requested geometry to the visible desktop and shrinks the window if it is
+    larger than the screen.
+
+    Any of x, y, w, h may be None, in which are taken from the window itself.
+
+    Returns the (x, y, w, h) actually applied.
+    """
+    try:
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        w = int(w if w is not None else (win.winfo_width() or
+                                         win.winfo_reqwidth()))
+        h = int(h if h is not None else (win.winfo_height() or
+                                         win.winfo_reqheight()))
+        x = int(x if x is not None else win.winfo_x())
+        y = int(y if y is not None else win.winfo_y())
+
+        # A window taller or wider than the desktop can never be fully
+        # reachable, so shrink it rather than leave part of it inaccessible.
+        avail_h = sh - _SCREEN_MARGIN - _SCREEN_MARGIN_BOTTOM
+        w = max(200, min(w, sw - 2 * _SCREEN_MARGIN))
+        h = max(150, min(h, avail_h))
+
+        x = max(_SCREEN_MARGIN, min(x, sw - w - _SCREEN_MARGIN))
+        y = max(_SCREEN_MARGIN, min(y, sh - h - _SCREEN_MARGIN_BOTTOM))
+
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        return x, y, w, h
+    except Exception:
+        return (0, 0, 0, 0)
+
+
+def place_figure_window(fig, x=None, y=None) -> None:
+    """
+    Bring a matplotlib figure window fully on screen.
+
+    Matplotlib leaves placement to the window manager, which on Windows
+    happily opens a figure with its lower portion below the desktop -- taking
+    the navigation toolbar with it on some styles.
+    """
+    try:
+        mgr = fig.canvas.manager
+        win = getattr(mgr, "window", None)
+        if win is None or not hasattr(win, "winfo_screenwidth"):
+            return
+        place_window(win, x=x, y=y)
+    except Exception:
+        pass
+
+
+# ── Adaptive legends ──────────────────────────────────────────────────────────
+
+# Above this many entries the legend is shrunk and split into columns.
+_LEGEND_SHRINK_ABOVE = 10
+# Above this many it is built but hidden, since at that point it covers more
+# of the plot than it explains.  The Legend section of the controls panel can
+# switch it back on.
+_LEGEND_HIDE_ABOVE = 24
+
+
+def adaptive_legend(ax, handles=None, labels=None, *,
+                    base_fontsize: int = 10, **kw):
+    """
+    Add a legend whose size is scaled to the number of entries.
+
+    A twenty-file overlay with a fixed 9 pt single-column legend produces a
+    legend box TALLER than the axes it sits in -- measured at 409 px against
+    316 px of plot -- so it hides the very data it is labelling.  Entry count
+    is known only at draw time, so the sizing has to be decided here rather
+    than fixed at the call site.
+
+    Above ``_LEGEND_HIDE_ABOVE`` entries the legend is created but hidden.
+    Creating it (rather than skipping it) matters: the Legend section of the
+    plot-controls panel keys off ``ax.get_legend()``, so a legend that was
+    never created could not be switched back on.
+
+    Returns the Legend, or None when there is nothing to label.
+    """
+    if handles is None or labels is None:
+        handles, labels = ax.get_legend_handles_labels()
+    if not handles:
+        return None
+
+    n = len(handles)
+    if n <= _LEGEND_SHRINK_ABOVE:
+        fontsize, ncol = base_fontsize, 1
+    elif n <= _LEGEND_HIDE_ABOVE:
+        fontsize = max(6, base_fontsize - 3)
+        ncol = 2 if n <= 16 else 3
+    else:
+        fontsize = max(6, base_fontsize - 4)
+        ncol = 3
+
+    kw.setdefault("framealpha", 0.85)
+    leg = ax.legend(handles, labels, fontsize=fontsize, ncol=ncol, **kw)
+    if leg is not None and n > _LEGEND_HIDE_ABOVE:
+        leg.set_visible(False)
+    return leg
 
 
 # ── Section builders ──────────────────────────────────────────────────────────
@@ -313,7 +443,13 @@ def collect_artists(axes_list: list) -> list:
                 clbl = cont.get_label() or ""
             except Exception:
                 clbl = ""
-            if not clbl or clbl.startswith("_"):
+            # A leading underscore means "keep out of the legend", not
+            # "unnamed" -- the same convention individual artists follow
+            # below, where it is stripped rather than treated as absent.
+            # Skipping such containers here would leave every member of an
+            # underscore-labelled errorbar anonymous, which is exactly what
+            # happened to the calibration deviation panel.
+            if not clbl or _AUTO_LABEL.match(clbl):
                 continue
             try:
                 kids = list(cont.get_children())
@@ -973,7 +1109,23 @@ def _build_legend_section(
         current_size = 10
     current_size = min(20, max(4, current_size))
 
-    show_var = tk.BooleanVar(master=panel, value=True)
+    # Column count, so a rebuild does not collapse a 3-column legend back to
+    # one enormous column.  The private attribute moved in matplotlib 3.6.
+    _ncol = 1
+    for _attr in ("_ncols", "_ncol"):
+        _v = getattr(leg, _attr, None)
+        if isinstance(_v, int) and _v > 0:
+            _ncol = _v
+            break
+
+    # Read the real visibility rather than assuming True: adaptive_legend
+    # hides legends with very many entries, and a checkbox that claimed
+    # "shown" over a hidden legend would be simply wrong.
+    try:
+        _vis = bool(leg.get_visible())
+    except Exception:
+        _vis = True
+    show_var = tk.BooleanVar(master=panel, value=_vis)
     loc_var  = tk.StringVar(master=panel, value=current_loc)
     size_var = tk.IntVar(master=panel, value=current_size)
 
@@ -1046,6 +1198,7 @@ def _build_legend_section(
             title=title_text,
             title_fontsize=size_var.get(),
             framealpha=framealpha,
+            ncol=_ncol,
         )
         new.set_visible(show_var.get())
         try:
@@ -1054,11 +1207,19 @@ def _build_legend_section(
             pass
 
     # ── Show / hide ───────────────────────────────────────────────────────────
+    _n_entries = len(handles)
     show_cb = tk.Checkbutton(
-        lf, text="Show legend", variable=show_var,
+        lf, text=f"Show legend  ({_n_entries} entries)", variable=show_var,
         command=_apply_legend, anchor="w", font=("Helvetica", 9),
     )
     show_cb.pack(fill="x")
+    if _n_entries > _LEGEND_HIDE_ABOVE:
+        tk.Label(
+            lf,
+            text=("      hidden by default — at this many entries the legend\n"
+                  "      covers more of the plot than it explains"),
+            font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
+        ).pack(fill="x")
 
     # ── Position ──────────────────────────────────────────────────────────────
     row = tk.Frame(lf)

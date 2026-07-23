@@ -1,0 +1,73 @@
+--- a/fcs_main.py
++++ b/fcs_main.py
+@@ -595,9 +595,46 @@
+     return result["mode"]
+ 
+ 
++# A batch of at least this many files is worth confirming before running it
++# without saving anything.
++_BATCH_EXPORT_WARN_AT = 3
++
++
++def _confirm_batch_export(n_files: int, label: str) -> bool:
++    """
++    Check before running a multi-file batch with exporting switched off.
++
++    Returns True to proceed.  Answering "Yes" turns exporting on for this run
++    and every later one, which is almost always what was meant -- the box is
++    on by default, so finding it off usually means it was cleared by accident
++    rather than deliberately.
++    """
++    if export_var.get() or n_files < _BATCH_EXPORT_WARN_AT:
++        return True
++
++    ans = messagebox.askyesnocancel(
++        "Save results?",
++        f"About to run {label} on {n_files} files, but "
++        f"“Export plotted data to CSV” is not ticked, so nothing will be "
++        f"written to disk.\n\n"
++        f"Yes\t— turn saving on and run\n"
++        f"No\t— run anyway without saving\n"
++        f"Cancel\t— go back",
++        parent=root,
++    )
++    if ans is None:
++        return False
++    if ans:
++        export_var.set(True)
++    return True
++
++
+ def _run_separate(datasets, label: str, plot_one):
+     """Loop the selected files, plotting each into its own window."""
+     total = len(datasets)
++    if not _confirm_batch_export(total, label):
++        status_refresh()
++        return
+     for i, d in enumerate(datasets, 1):
+         status_set(f"Batch {label} — file {i} of {total}:\n{d.filepath.name}")
+         root.update_idletasks()   # flush status before each plot opens
+@@ -658,7 +695,13 @@
+ 
+ # Global toggle: when checked, each analysis also writes its plotted data
+ # to a CSV in an 'analysis' folder beside the source file.
+-export_var = tk.BooleanVar(value=False)
++#
++# Defaults ON.  Exporting is cheap and non-destructive -- a CSV per analysis
++# in a subfolder -- whereas discovering after a long batch that nothing was
++# written means running the whole thing again.  The asymmetry is large enough
++# that saving by default is the right failure mode; _confirm_batch_export
++# catches the case where it has been deliberately switched off.
++export_var = tk.BooleanVar(value=True)
+ 
+ # Title
+ tk.Label(root, text="FCS Analysis Suite",
+@@ -722,6 +765,8 @@
+             return
+ 
+         if mode == "combined":
++            if not _confirm_batch_export(len(datasets), "correlation"):
++                return
+             # Ask the correlation parameters once (using the first file to
+             # populate the dialog), then apply them to every selection.
+             params = fcs_corr.run_correlation_dialog(

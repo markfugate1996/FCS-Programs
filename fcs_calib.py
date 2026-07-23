@@ -285,6 +285,10 @@ def _through_origin_stats(x, y, yerr=None) -> dict:
 _MAX_REL_DEV      = 0.15        # interior points
 _MAX_REL_DEV_EDGE = 0.20        # the first and last point of the window
 
+# Sentinel shown in the error-column dropdown when the calibration is to
+# run unweighted.
+_NO_ERR_COL = "(none — unweighted)"
+
 
 def _window_linearity(x, y, yerr, max_dev, max_dev_edge):
     """
@@ -585,12 +589,27 @@ def calibrate(
     n_min: int = 3,
     max_rel_dev: float = _MAX_REL_DEV,
     max_rel_dev_edge: float = _MAX_REL_DEV_EDGE,
+    y_label: str = "⟨N⟩",
+    y_is_occupancy: bool = True,
 ) -> dict:
     """
-    Fit <N> = s·C through the origin and derive alpha (C = alpha·<N>) and,
-    when the unit is recognised, the effective volume V_eff.
+    Fit Y = s·C through the origin and derive alpha (C = alpha·Y).
 
-    ``corrected`` records whether the supplied <N> is background-corrected
+    Y is normally the mean occupancy <N>, in which case the slope also gives
+    the effective volume V_eff.  Any other column from the fit parameter table
+    may be supplied instead -- tauD against viscosity, brightness against
+    labelling ratio, and so on -- and the straight-line calibration is done the
+    same way.
+
+    ``y_is_occupancy`` MUST be False for any Y that is not a molecule count.
+    V_eff is derived as s / f(unit), an operation that silently assumes the
+    slope carries units of molecules per concentration unit; applied to, say, a
+    diffusion time it would return a confident number of cubic micrometres that
+    means nothing at all.  When the flag is False, V_eff is left as None and
+    every V_eff-specific label is suppressed.
+
+    ``y_label`` is used for axis labels, the report, and the CSV header.
+    ``corrected`` records whether a supplied <N> is background-corrected
     (for labelling only).
     """
     n_raw = len(names)
@@ -631,10 +650,14 @@ def calibrate(
     alpha = 1.0 / s
     alpha_err = s_err / (s * s)
 
+    # V_eff only means anything when the slope is molecules per concentration
+    # unit.  See the docstring: deriving it from an arbitrary Y would produce
+    # an authoritative-looking volume with no physical content.
     veff = None
-    f = _CONC_FACTOR.get(unit)
-    if f:
-        veff = s / f                    # µm³
+    if y_is_occupancy:
+        f = _CONC_FACTOR.get(unit)
+        if f:
+            veff = s / f                # µm³
 
     excluded = [names[i] for i in range(len(names)) if not used[i]]
 
@@ -647,6 +670,7 @@ def calibrate(
         "intercept": intercept, "slope_free": slope_free,
         "veff_um3": veff, "weighted": yeru is not None,
         "corrected": corrected,
+        "y_label": y_label, "y_is_occupancy": bool(y_is_occupancy),
         "groups": groups, "collapsed": bool(collapse), "n_raw": int(n_raw),
         "red_chi2": st["red_chi2"], "gof_Q": st["gof_Q"],
         "slope_err_ext": st["s_err_ext"],
@@ -665,8 +689,19 @@ def plot_calibration(result: dict, show: bool = True):
     N = result["N"]
     N_err = result["N_err"]
     unit = result["unit"]
+    ylab = result.get("y_label") or "⟨N⟩"
+    is_occ = result.get("y_is_occupancy", True)
 
-    fig, ax = plt.subplots(figsize=(7.5, 5.5), layout="constrained")
+    # Two panels sharing the concentration axis: the calibration itself, and
+    # the relative deviation of each point from the fitted line.  The lower
+    # panel is what the linear-range selection actually thresholds on, so
+    # plotting it makes the selection inspectable -- and a systematic trend
+    # (curvature, roll-off, a drifting standard) is visible there long before
+    # it is obvious in the calibration plot, where a straight line through
+    # points spanning two decades hides a great deal.
+    fig, (ax, axr) = plt.subplots(
+        2, 1, sharex=True, figsize=(7.5, 6.8), layout="constrained",
+        gridspec_kw={"height_ratios": [3, 1]})
 
     used = np.asarray(result.get("used", np.ones(len(conc), bool)), bool)
     excl = (~used) & np.isfinite(conc) & np.isfinite(N)
@@ -675,12 +710,13 @@ def plot_calibration(result: dict, show: bool = True):
     # Shade the trimmed low-/high-C regions.
     if excl.any() and used.any():
         lo, hi = float(conc[used].min()), float(conc[used].max())
-        if conc[excl].min() < lo:
-            ax.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0,
-                       label="_excluded range (low C)")
-        if conc[excl].max() > hi:
-            ax.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5,
-                       zorder=0, label="_excluded range (high C)")
+        for _a in (ax, axr):
+            if conc[excl].min() < lo:
+                _a.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0,
+                           label="_excluded range (low C)")
+            if conc[excl].max() > hi:
+                _a.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5,
+                           zorder=0, label="_excluded range (high C)")
 
     def _pts(mask, **kw):
         if not mask.any():
@@ -698,13 +734,14 @@ def plot_calibration(result: dict, show: bool = True):
 
     xline = np.linspace(0, conc.max() * 1.05, 100)
     ax.plot(xline, result["slope"] * xline, color="tomato", linewidth=1.6,
-            label="fit ⟨N⟩ = s·C", zorder=2)
+            label=f"fit {ylab} = s·C", zorder=2)
     ax.axhline(0, color="grey", linewidth=0.6)
     ax.axvline(0, color="grey", linewidth=0.6)
 
     box = [
-        f"s     = {result['slope']:.4g} ± {result['slope_err']:.2g}  ⟨N⟩/{unit}",
-        f"α     = {result['alpha']:.4g} ± {result['alpha_err']:.2g}  {unit}/molecule",
+        f"s     = {result['slope']:.4g} ± {result['slope_err']:.2g}  {ylab}/{unit}",
+        f"α     = {result['alpha']:.4g} ± {result['alpha_err']:.2g}  "
+        f"{unit}/{'molecule' if is_occ else ylab}",
     ]
     if result["veff_um3"] is not None:
         box.append(f"V_eff = {result['veff_um3']:.4g} µm³")
@@ -720,19 +757,83 @@ def plot_calibration(result: dict, show: bool = True):
             ha="left", va="top", fontsize=9, family="monospace",
             bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.9))
 
-    ax.set_xlabel(f"Known concentration C ({unit})", fontsize=12)
-    ax.set_ylabel("Mean occupancy ⟨N⟩"
-                  + ("  (bg-corrected)" if result.get("corrected") else " = 1/G0"),
-                  fontsize=12)
-    ax.set_title("Effective-volume calibration  ·  C = α·⟨N⟩", fontsize=11)
+    axr.set_xlabel(f"Known concentration C ({unit})", fontsize=12)
+    if is_occ:
+        ax.set_ylabel("Mean occupancy ⟨N⟩"
+                      + ("  (bg-corrected)" if result.get("corrected")
+                         else " = 1/G0"),
+                      fontsize=12)
+        ax.set_title("Effective-volume calibration  ·  C = α·⟨N⟩", fontsize=11)
+    else:
+        # Not an occupancy, so neither "mean occupancy" nor "effective volume"
+        # applies; say what is actually plotted.
+        ax.set_ylabel(ylab, fontsize=12)
+        ax.set_title(f"Linear calibration  ·  C = α·{ylab}", fontsize=11)
     ax.legend(loc="lower right", fontsize=10, framealpha=0.85)
     ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
+
+    # ── Lower panel: relative deviation from the fitted line ─────────────────
+    # This is exactly the quantity select_linear_subset thresholds on:
+    #     rel = (N - s.C) / (s.C)
+    # Signed rather than absolute, because the SHAPE carries the diagnosis.
+    # Random scatter about zero means the linear model holds; a smooth trend
+    # away from zero at one end is roll-off; a bow across the whole range
+    # means the model is wrong everywhere, which a single alpha would hide.
+    slope = result["slope"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        N_fit = slope * conc
+        rel = np.where(np.abs(N_fit) > 0, (N - N_fit) / N_fit, np.nan) * 100.0
+        rel_err = (np.where(np.abs(N_fit) > 0, N_err / N_fit, np.nan) * 100.0
+                   if have_err else None)
+
+    tol_int = result.get("max_rel_dev")
+    tol_edge = result.get("max_rel_dev_edge")
+    sel = result.get("selection") or {}
+    if tol_int is None:
+        tol_int = sel.get("max_rel_dev", _MAX_REL_DEV)
+    if tol_edge is None:
+        tol_edge = sel.get("max_rel_dev_edge", _MAX_REL_DEV_EDGE)
+
+    for lvl, style, lab in ((tol_int, ":", "interior"),
+                            (tol_edge, "-.", "ends")):
+        if lvl is None or not np.isfinite(lvl):
+            continue
+        for sign in (+1.0, -1.0):
+            axr.axhline(sign * lvl * 100.0, color="tomato", linewidth=0.9,
+                        linestyle=style, alpha=0.75, zorder=1,
+                        label=f"_±{lvl*100:g}% tolerance ({lab})")
+    axr.axhline(0.0, color="grey", linewidth=0.8, zorder=1,
+                label="_zero deviation")
+
+    def _rpts(mask, **kw):
+        if not mask.any():
+            return
+        if rel_err is not None:
+            axr.errorbar(conc[mask], rel[mask], yerr=rel_err[mask], fmt="o",
+                         capsize=3, markersize=5, zorder=3, **kw)
+        else:
+            axr.plot(conc[mask], rel[mask], "o", markersize=5, zorder=3, **kw)
+
+    _rpts(used, color="steelblue", label="_deviation (fit)")
+    _rpts(excl, color="0.6", markerfacecolor="none", label="_deviation (excluded)")
+
+    axr.set_ylabel("deviation\nfrom fit (%)", fontsize=10)
+    axr.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
+
+    # Keep the tolerance lines in view even when every point sits well inside
+    # them, so the scale of the deviations is always readable against the
+    # criterion rather than against the scatter.
+    finite = rel[np.isfinite(rel)]
+    if finite.size:
+        span = max(float(np.nanmax(np.abs(finite))) * 1.25,
+                   float(tol_edge) * 100.0 * 1.4 if tol_edge else 1.0)
+        axr.set_ylim(-span, span)
 
     if show:
         #plt.show was static; now dynamic w/ fcs_plottools
         #plt.show()
-        fcs_plottools.show_figure(fig, ax)
-    return fig, ax
+        fcs_plottools.show_figure(fig, (ax, axr))
+    return fig, (ax, axr)
 
 
 # ── Rebuilding a plot from an exported CSV ────────────────────────────────────
@@ -821,6 +922,18 @@ def rebuild_plot(meta: dict, columns: dict, show: bool = True, path=None):
                             cast=int),
         "n_total": _meta_num(meta, "n_total", int(N.size), cast=int),
         "corrected": str(meta.get("corrected", "")).strip().lower() == "yes",
+        # Default to occupancy so calibrations exported before Y became
+        # selectable reopen exactly as they always did.
+        "y_label": meta.get("y_label") or "⟨N⟩",
+        "y_is_occupancy": str(
+            meta.get("y_is_occupancy", "yes")).strip().lower() != "no",
+        "y_column": meta.get("y_column"),
+        "y_err_column": meta.get("y_err_column"),
+        # Tolerances the range was selected with, so the reopened deviation
+        # panel draws the criterion that was actually applied rather than
+        # whatever the current defaults happen to be.
+        "max_rel_dev": _meta_num(meta, "select_max_rel_dev"),
+        "max_rel_dev_edge": _meta_num(meta, "select_max_rel_dev_edge"),
     }
     return plot_calibration(result, show=show)
 
@@ -851,7 +964,13 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
     L.append(f"source     : {source_path.name}")
     L.append(f"fitted     : {datetime.now().isoformat(timespec='seconds')}")
     L.append(f"model      : <N> = s·C through the origin")
-    L.append(f"<N> source : {'background-corrected (N_corr)' if result.get('corrected') else 'raw (1/G0)'}")
+    _ylab = result.get("y_label") or "⟨N⟩"
+    if result.get("y_is_occupancy", True):
+        L.append(f"<N> source : "
+                 f"{'background-corrected (N_corr)' if result.get('corrected') else 'raw (1/G0)'}")
+    else:
+        L.append(f"Y column   : {result.get('y_column') or _ylab}   "
+                 f"(not an occupancy — no V_eff derived)")
     L.append(f"weighted   : {'yes (1/N_err²)' if result['weighted'] else 'no'}")
     L.append("")
     L.append(f"  slope s        = {result['slope']:.6g} ± {result['slope_err']:.3g}"
@@ -958,6 +1077,15 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
         fh.write(f"# n_used : {result['n_used']}\n")
         fh.write(f"# n_total : {result['n_total']}\n")
         fh.write(f"# corrected : {'yes' if result.get('corrected') else 'no'}\n")
+        # Which column was calibrated, so a reopened plot is labelled with the
+        # quantity that was actually fitted rather than assuming occupancy.
+        fh.write(f"# y_label : {result.get('y_label') or '⟨N⟩'}\n")
+        fh.write(f"# y_is_occupancy : "
+                 f"{'yes' if result.get('y_is_occupancy', True) else 'no'}\n")
+        if result.get("y_column"):
+            fh.write(f"# y_column : {result['y_column']}\n")
+        if result.get("y_err_column"):
+            fh.write(f"# y_err_column : {result['y_err_column']}\n")
         sel = result.get("selection")
         if sel is not None:
             fh.write(f"# select_max_rel_dev : {sel.get('max_rel_dev')}\n")
@@ -1024,16 +1152,53 @@ def run_calibration_dialog(parent=None, init_dir=None):
     # Prefer background-corrected occupancy when the table provides it.
     use_corr = ("N_corr" in rows[0]
                 and np.all(np.isfinite([r.get("N_corr", np.nan) for r in rows])))
-    ncol  = "N_corr" if use_corr else "N"
-    necol = "N_corr_err" if use_corr else "N_err"
+
+    # Every numeric column is a candidate Y.  <N> stays the default, but a
+    # calibration is just a straight line through the origin, so any fitted
+    # quantity can be calibrated against concentration the same way.
+    def _numeric_cols(rr):
+        out = []
+        for k in rr[0]:
+            if k == "dataset":
+                continue
+            vals = [r.get(k, np.nan) for r in rr]
+            if any(np.isfinite(v) for v in vals if isinstance(v, float)):
+                out.append(k)
+        return out
+
+    all_cols = _numeric_cols(rows)
+    y_choices = [c for c in all_cols if not c.endswith("_err")] or all_cols
+    err_choices = [_NO_ERR_COL] + all_cols
+
+    default_y = "N_corr" if use_corr else "N"
+    if default_y not in y_choices:
+        default_y = y_choices[0]
+
+    def _pair_err(ycol):
+        """The natural error column for *ycol*, if the table has one."""
+        cand = f"{ycol}_err"
+        return cand if cand in all_cols else _NO_ERR_COL
+
+    ycol_var  = tk.StringVar(value=default_y)
+    yerr_var  = tk.StringVar(value=_pair_err(default_y))
 
     names = [r["dataset"] for r in rows]
-    N     = np.array([r.get(ncol, np.nan) for r in rows], float)
-    N_err = np.array([r.get(necol, np.nan) for r in rows], float)
-    #has_err = np.all(np.isfinite(N_err)) and np.all(N_err > 0)
+
+    def _read_y():
+        """Current Y and its error, straight from the loaded table."""
+        yc = ycol_var.get()
+        ec = yerr_var.get()
+        y = np.array([r.get(yc, np.nan) for r in rows], float)
+        if ec and ec != _NO_ERR_COL:
+            ye = np.array([r.get(ec, np.nan) for r in rows], float)
+        else:
+            ye = np.full(len(rows), np.nan)
+        return y, ye
+
+    N, N_err = _read_y()
     has_err = bool(np.all(np.isfinite(N_err)) and np.all(N_err > 0))
     win = tk.Toplevel(parent)
-    win.title("Volume calibration — ⟨N⟩ vs concentration")
+    win.title("Calibration — Y vs concentration")
     win.resizable(True, True)
     win.grab_set()
 
@@ -1041,11 +1206,18 @@ def run_calibration_dialog(parent=None, init_dir=None):
              font=("Helvetica", 12, "bold"), pady=6).pack()
     tk.Label(win, text=f"Source: {csv_path.name}",
              font=("Helvetica", 9), fg="grey").pack()
-    tk.Label(win,
-             text=("Using background-corrected ⟨N⟩ (N_corr)" if use_corr
-                   else "Using raw ⟨N⟩ = 1/G0"),
-             font=("Helvetica", 9),
-             fg=("seagreen" if use_corr else "grey")).pack()
+    ysel = tk.Frame(win, padx=12, pady=2)
+    ysel.pack(fill="x")
+    tk.Label(ysel, text="Y column:", anchor="e",
+             font=("Helvetica", 9)).pack(side="left")
+    tk.OptionMenu(ysel, ycol_var, *y_choices).pack(side="left", padx=(4, 12))
+    tk.Label(ysel, text="its error:", anchor="e",
+             font=("Helvetica", 9)).pack(side="left")
+    tk.OptionMenu(ysel, yerr_var, *err_choices).pack(side="left", padx=4)
+
+    ynote_var = tk.StringVar(value="")
+    tk.Label(win, textvariable=ynote_var, font=("Helvetica", 9),
+             justify="left", anchor="w").pack(fill="x", padx=12)
 
     top = tk.Frame(win, padx=12, pady=4)
     top.pack(fill="x")
@@ -1109,30 +1281,72 @@ def run_calibration_dialog(parent=None, init_dir=None):
     #table.pack(fill="x")
     tk.Label(table, text="dataset", font=("Helvetica", 10, "bold")).grid(
         row=0, column=0, sticky="w", padx=4, pady=(0, 4))
-    tk.Label(table, text="⟨N⟩", font=("Helvetica", 10, "bold")).grid(
-        row=0, column=1, padx=4)
+    yhdr_var = tk.StringVar(value=default_y)
+    tk.Label(table, textvariable=yhdr_var,
+             font=("Helvetica", 10, "bold")).grid(row=0, column=1, padx=4)
     tk.Label(table, text="concentration", font=("Helvetica", 10, "bold")).grid(
         row=0, column=2, padx=4)
 
     conc_vars = []
+    yval_vars = []
     for r, nm in enumerate(names, start=1):
         tk.Label(table, text=nm, anchor="w", width=22,
                  font=("Courier", 9)).grid(row=r, column=0, sticky="w", padx=4)
-        nstr = f"{N[r-1]:.3g}" + (f" ± {N_err[r-1]:.2g}" if has_err else "")
-        tk.Label(table, text=nstr, anchor="e", width=14, fg="grey").grid(
-            row=r, column=1, padx=4)
+        yv = tk.StringVar(value="")
+        yval_vars.append(yv)
+        tk.Label(table, textvariable=yv, anchor="e", width=16,
+                 fg="grey").grid(row=r, column=1, padx=4)
         cv = tk.StringVar(value="")
         tk.Entry(table, textvariable=cv, width=12).grid(row=r, column=2, padx=4)
         conc_vars.append(cv)
 
     weight_var = tk.BooleanVar(value=has_err)
-    tk.Checkbutton(
-        win,
-        text="Weight by 1/⟨N⟩_err²" if has_err
-        else "Weight — unavailable (no N_err column)",
-        variable=weight_var, anchor="w",
-        state="normal" if has_err else "disabled",
-    ).pack(fill="x", padx=12, pady=(4, 0))
+    weight_cb = tk.Checkbutton(
+        win, text="Weight by 1/err²", variable=weight_var, anchor="w",
+    )
+    weight_cb.pack(fill="x", padx=12, pady=(4, 0))
+
+    # ── Keep the table and the weighting option in step with the Y choice ────
+    def _refresh_y(*_):
+        nonlocal N, N_err, has_err
+        N, N_err = _read_y()
+        has_err = bool(np.all(np.isfinite(N_err)) and np.all(N_err > 0))
+
+        yc = ycol_var.get()
+        yhdr_var.set(yc)
+        for i, v in enumerate(yval_vars):
+            val = N[i]
+            if not np.isfinite(val):
+                v.set("—")
+            elif has_err:
+                v.set(f"{val:.4g} ± {N_err[i]:.2g}")
+            else:
+                v.set(f"{val:.4g}")
+
+        weight_var.set(has_err)
+        weight_cb.config(
+            state="normal" if has_err else "disabled",
+            text=("Weight by 1/err²  (from "
+                  f"{yerr_var.get()})" if has_err
+                  else "Weight — unavailable (no usable error column)"),
+        )
+
+        # V_eff is only meaningful when Y is an occupancy.  Say so plainly
+        # rather than quietly producing a volume from, say, a diffusion time.
+        if yc in ("N", "N_corr"):
+            ynote_var.set(
+                "Using background-corrected ⟨N⟩ (N_corr)" if yc == "N_corr"
+                else "Using raw ⟨N⟩ = 1/G0")
+        else:
+            ynote_var.set(
+                f"Calibrating '{yc}' — not an occupancy, so no V_eff is "
+                f"derived (slope and α are still reported)")
+
+    ycol_var.trace_add("write",
+                       lambda *_: (yerr_var.set(_pair_err(ycol_var.get())),
+                                   _refresh_y()))
+    yerr_var.trace_add("write", _refresh_y)
+    _refresh_y()
 
     collapse_var = tk.BooleanVar(value=True)
     tk.Checkbutton(win, text="Collapse repeated concentrations",
@@ -1200,13 +1414,21 @@ def run_calibration_dialog(parent=None, init_dir=None):
                 parent=win)
             return
         try:
+            _yc = ycol_var.get()
+            _is_occ = _yc in ("N", "N_corr")
+            _ylab = "⟨N⟩" if _is_occ else _yc
             result = calibrate(names, N, N_err if has_err else None, conc,
                                unit=unit, use_weights=weight_var.get(),
-                               corrected=use_corr,
+                               corrected=(_yc == "N_corr"),
                                collapse=collapse_var.get(),
                                select=("auto" if auto_var.get() else "none"),
                                n_min=n_min, max_rel_dev=max_dev,
-                               max_rel_dev_edge=edge_dev)
+                               max_rel_dev_edge=edge_dev,
+                               y_label=_ylab, y_is_occupancy=_is_occ)
+            result["y_column"] = _yc
+            result["y_err_column"] = (yerr_var.get()
+                                      if yerr_var.get() != _NO_ERR_COL
+                                      else None)
         except Exception as e:
             messagebox.showerror("Calibration failed", str(e), parent=win)
             return

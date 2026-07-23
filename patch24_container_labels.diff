@@ -1,0 +1,17 @@
+--- a/fcs_plottools.py
++++ b/fcs_plottools.py
+@@ -313,7 +313,13 @@
+                 clbl = cont.get_label() or ""
+             except Exception:
+                 clbl = ""
+-            if not clbl or clbl.startswith("_"):
++            # A leading underscore means "keep out of the legend", not
++            # "unnamed" -- the same convention individual artists follow
++            # below, where it is stripped rather than treated as absent.
++            # Skipping such containers here would leave every member of an
++            # underscore-labelled errorbar anonymous, which is exactly what
++            # happened to the calibration deviation panel.
++            if not clbl or _AUTO_LABEL.match(clbl):
+                 continue
+             try:
+                 kids = list(cont.get_children())

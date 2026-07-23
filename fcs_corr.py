@@ -1816,7 +1816,15 @@ def plot_correlation(
         )
 
 
-    fig, ax = plt.subplots(figsize=(9, 4.5))
+    # Constrained layout, NOT tight_layout: tight_layout runs once and then
+    # freezes the margins as fixed FRACTIONS of the figure, so enlarging the
+    # window scales the bottom margin up with it -- 0.67 in of margin at the
+    # default size becomes 1.19 in on a tall window, and all that extra height
+    # goes to whitespace rather than to the plot.  Constrained layout re-runs
+    # on every draw and holds the margin at a constant absolute size, so a
+    # resized window puts the gain into the axes.  It also keeps accounting
+    # for the legend and the two-line title, which tight_layout did only once.
+    fig, ax = plt.subplots(figsize=(9, 5.2), layout="constrained")
 
     label = _CORR_LABEL.get(corr_type, corr_type)
     tau_ms = tau * 1e3   # display in milliseconds
@@ -1927,7 +1935,7 @@ def plot_correlation(
     )
     ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
     ax.grid(True, which="minor", linestyle=":",  linewidth=0.3, alpha=0.3)
-    ax.legend(fontsize=10, framealpha=0.85)
+    fcs_plottools.adaptive_legend(ax, base_fontsize=10)
 
     # Bottom-right: method + the parameters that change the numbers
     method_str = _method_annotation(method, mt_channels, mt_coarsen,
@@ -1935,7 +1943,6 @@ def plot_correlation(
     fig.text(0.99, 0.01, method_str,
              ha="right", va="bottom", fontsize=7, color="grey")
 
-    fig.tight_layout()
     if show:
         #plt.show was static; now dynamic w/ fcs_plottools
         #plt.show()
@@ -2332,7 +2339,7 @@ def plot_correlation_overlay(
         cmap = plt.get_cmap("tab10")
         colours = [cmap(i % 10) for i in range(len(results))]
 
-    fig, ax = plt.subplots(figsize=(9, 4.5))
+    fig, ax = plt.subplots(figsize=(9, 5.2), layout="constrained")
     label = _CORR_LABEL.get(corr_type, corr_type)
 
     y_tops: list[float] = []
@@ -2387,7 +2394,9 @@ def plot_correlation_overlay(
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:.3g}"))
     ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
     ax.grid(True, which="minor", linestyle=":",  linewidth=0.3, alpha=0.3)
-    ax.legend(fontsize=9, framealpha=0.85, title="File")
+    # One entry per file: with twenty files a fixed single-column legend is
+    # taller than the axes it sits in, so size it from the entry count.
+    fcs_plottools.adaptive_legend(ax, base_fontsize=9, title="File")
 
     _first = next((r for _d, r in results), {}) if results else {}
     method_str = _method_annotation(method,
@@ -2397,7 +2406,6 @@ def plot_correlation_overlay(
     fig.text(0.99, 0.01, method_str,
              ha="right", va="bottom", fontsize=7, color="grey")
 
-    fig.tight_layout()
     if show:
         fcs_plottools.show_figure(fig, ax)
     return fig, ax

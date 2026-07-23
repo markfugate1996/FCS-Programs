@@ -1,0 +1,286 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -122,6 +122,34 @@
+     it is that channel's rate; for a cross-correlation it is the average of the
+     two channels (not a fitted quantity, but a convenient brightness summary).
+ 
++    Uncertainties
++    -------------
++    Each rate gets a companion ``*_err`` from Poisson counting statistics,
++
++        sigma_R = sqrt(N) / T        so   sigma_R / R = 1 / sqrt(N)
++
++    The cross-correlation "fit CPS" is the GEOMETRIC mean sqrt(R1.R2), not the
++    arithmetic one, so its error propagates as
++
++        sigma_g / g = 0.5 * sqrt(1/N1 + 1/N2)
++
++    which reduces to sqrt(N1 + N2) / (2T) -- exactly what the arithmetic mean
++    would give.  The two conventions coincide for Poisson errors, since
++    sqrt(N1.N2) . sqrt(1/N1 + 1/N2) = sqrt(N1 + N2), so this column does not
++    depend on which mean the fit CPS uses.
++
++    Treat these as a SHOT-NOISE FLOOR rather than the full uncertainty on the
++    rate.  A fluorescing sample fluctuates by more than Poisson -- the excess
++    is exactly the bunching that G(tau) measures -- so the true variance is
++
++        Var(N) = <N> * (1 + 2.<I>.integral G(tau) dtau)
++
++    At low amplitude the two agree closely (G0 = 0.1 at 10 kcps gives only a
++    1.25x underestimate), but at G0 ~ 1 and 100 kcps the real spread is about
++    7.6x larger than sqrt(N)/T.  The quoted error is therefore a lower bound,
++    and a useful one for spotting a mis-set acquisition time or a dead
++    channel, but it is not a substitute for repeat measurements.
++
+     Returns a dict with floats (None where a field is absent), or None when the
+     header carries no CPS at all — e.g. a correlation file written before this
+     field existed — so callers can simply skip the section.
+@@ -158,14 +186,42 @@
+             cps_fit = present[0] if present else None
+             label = "Ch1" if cps1 else ("Ch2" if cps2 else "n/a")
+             
++    T  = _num("acquisition_time_s")
++    n1 = _num("n_photons_ch1")
++    n2 = _num("n_photons_ch2")
++
++    def _rate_err(n_ph):
++        """Poisson counting error on a rate: sqrt(N)/T."""
++        if n_ph is None or T is None or T <= 0 or n_ph < 0:
++            return None
++        return float(np.sqrt(n_ph) / T)
++
++    err1 = _rate_err(n1)
++    err2 = _rate_err(n2)
++
++    # Error on the reported "fit CPS", following whichever combination was
++    # used above.
++    if ctype == "auto_ch1":
++        err_fit = err1
++    elif ctype == "auto_ch2":
++        err_fit = err2
++    elif cps1 and cps2 and n1 and n2 and cps_fit is not None:
++        # Geometric mean: sigma_g/g = 0.5*sqrt(1/N1 + 1/N2)
++        err_fit = float(cps_fit * 0.5 * np.sqrt(1.0 / n1 + 1.0 / n2))
++    else:
++        err_fit = err1 if cps1 else (err2 if cps2 else None)
++
+     return {
+         "cps_ch1":       cps1,
+         "cps_ch2":       cps2,
+         "cps_fit":       cps_fit,
+         "cps_label":     label,
+-        "acq_time_s":    _num("acquisition_time_s"),
+-        "n_photons_ch1": _num("n_photons_ch1"),
+-        "n_photons_ch2": _num("n_photons_ch2"),
++        "cps_ch1_err":   err1,
++        "cps_ch2_err":   err2,
++        "cps_fit_err":   err_fit,
++        "acq_time_s":    T,
++        "n_photons_ch1": n1,
++        "n_photons_ch2": n2,
+     }
+ 
+ 
+@@ -176,6 +232,23 @@
+     return f"{x:,.0f}"
+ 
+ 
++def _fmt_cps_err(x: Optional[float], err: Optional[float]) -> str:
++    """
++    Format a rate with its uncertainty.
++
++    Rates below 1000 cps keep a decimal place: at 10 cps a whole-number
++    format would render the value and its error identically useless
++    ("10 ± 0").
++    """
++    if x is None or (isinstance(x, float) and not np.isfinite(x)):
++        return "n/a"
++    dec = 0 if abs(x) >= 1000 else 2
++    base = f"{x:,.{dec}f}"
++    if err is None or not np.isfinite(err):
++        return base
++    return f"{base} ± {err:,.{dec}f}"
++
++
+ def _bg_corr_from_meta(meta: Optional[dict]) -> Optional[Tuple[float, float]]:
+     """
+     Read the Koppel amplitude correction (kappa, sigma_kappa) from a
+@@ -666,8 +739,24 @@
+     empty: tuple = ({}, {}, [])
+     if path is None:
+         return empty
+-    pp = Path(path).with_name("globalfit_params.csv")
+-    if not pp.is_file():
++
++    # The four files of one fit share a stem and differ only by suffix, so the
++    # parameter table is found by swapping "_curves.csv" for "_params.csv".
++    # Fall back to the old fixed name, then to any *_params.csv in the folder,
++    # so fits exported before filenames were timestamped still reopen.
++    cp = Path(path)
++    candidates = []
++    if cp.name.endswith("_curves.csv"):
++        candidates.append(cp.with_name(cp.name[:-len("_curves.csv")]
++                                       + "_params.csv"))
++    candidates.append(cp.with_name("globalfit_params.csv"))
++    try:
++        candidates.extend(sorted(cp.parent.glob("*_params.csv")))
++    except Exception:
++        pass
++
++    pp = next((c for c in candidates if c.is_file()), None)
++    if pp is None:
+         return empty
+     try:
+         _meta, cols = fcs_export.read_export(pp)
+@@ -867,20 +956,58 @@
+     return float(np.sum((allG - allG.mean()) ** 2)) or float("nan")
+ 
+ 
+-def export_global_fit(result: dict, out_source: str | Path) -> Tuple[Path, Path, Path]:
++def _fit_file_stem(name_override: Optional[str] = None,
++                   when: Optional[datetime] = None) -> str:
++    """
++    Build the shared stem for one fit's output files.
++
++    Every fit used to write globalfit_report.txt / _curves.csv / _params.csv
++    under exactly those names, distinguished only by their folder.  Excel
++    refuses to hold two open workbooks with the same filename regardless of
++    path, so comparing two fits meant renaming one by hand first.  A
++    timestamp makes the names unique, and an optional label makes them
++    meaningful.
++    """
++    stamp = (when or datetime.now()).strftime("%Y%m%d_%H%M%S")
++    slug = _slug_name(name_override)
++    return f"{slug}_{stamp}" if slug else f"globalfit_{stamp}"
++
++
++def _slug_name(text: Optional[str]) -> str:
++    """Reduce a user-supplied label to a filesystem-safe token."""
++    if not text:
++        return ""
++    out = []
++    for ch in str(text).strip():
++        out.append(ch if (ch.isalnum() or ch in "-_") else "_")
++    slug = "".join(out).strip("_")
++    while "__" in slug:
++        slug = slug.replace("__", "_")
++    return slug[:60]
++
++
++def export_global_fit(result: dict, out_source: str | Path,
++                      name_override: Optional[str] = None,
++                      ) -> Tuple[Path, Path, Path]:
+     """
+     Write a global-fit report (.txt) and a combined long-format curve CSV.
+ 
+     ``out_source`` is only used to locate the output folder (its 'fits'
+-    sibling, via fcs_fitcommon.new_fit_dir); the written filenames are fixed.
+-    It may be any file that sits in the right place — the caller passes the
+-    first selected correlation CSV, so no .fcs file is required.
++    sibling, via fcs_fitcommon.new_fit_dir).  It may be any file that sits in
++    the right place — the caller passes the first selected correlation CSV, so
++    no .fcs file is required.
++
++    Filenames carry a timestamp, and optionally *name_override*, so that two
++    fits can be open in Excel at once.  The four files of one fit share a stem
++    and differ only in their suffix, which is what lets the reopener find a
++    curves file's matching parameter table.
+     """
+     out_source = Path(out_source)
+     model = result["model"]
+     out_dir = _new_fit_dir(out_source)
+-    report_path = out_dir / "globalfit_report.txt"
+-    curve_path  = out_dir / "globalfit_curves.csv"
++    stem = _fit_file_stem(name_override)
++    report_path = out_dir / f"{stem}_report.txt"
++    curve_path  = out_dir / f"{stem}_curves.csv"
+ 
+ 
+     L: list[str] = []
+@@ -934,9 +1061,12 @@
+                  f"R² = {ds['r2']:.5f}{_drop}")
+         cps = _cps_from_meta(ds.get("meta"))
+         if cps is not None:
+-            L.append(f"    CPS      : Ch1 {_fmt_cps(cps['cps_ch1'])}   "
+-                     f"Ch2 {_fmt_cps(cps['cps_ch2'])}   "
+-                     f"{cps['cps_label']} {_fmt_cps(cps['cps_fit'])}")
++            L.append(f"    CPS      : Ch1 {_fmt_cps_err(cps['cps_ch1'], cps.get('cps_ch1_err'))}   "
++                     f"Ch2 {_fmt_cps_err(cps['cps_ch2'], cps.get('cps_ch2_err'))}   "
++                     f"{cps['cps_label']} "
++                     f"{_fmt_cps_err(cps['cps_fit'], cps.get('cps_fit_err'))}")
++            L.append("               (± is the Poisson floor sqrt(N)/T; a "
++                     "fluctuating sample exceeds it)")
+         for n in result["names"]:
+             if result["linked"].get(n):
+                 continue  # already reported above
+@@ -1039,8 +1169,8 @@
+     # concentration): each dataset is a row, each parameter a value+error pair.
+     # ── Wide parameter table (one row per dataset) for spreadsheets ───────────
+     # Calibrate Volume reads the .csv; the .xlsx is the convenient view.
+-    params_path = out_dir / "globalfit_params.csv"
+-    xlsx_path   = out_dir / "globalfit_params.xlsx"
++    params_path = out_dir / f"{stem}_params.csv"
++    xlsx_path   = out_dir / f"{stem}_params.xlsx"
+     linked_names = [n for n in result["names"] if result["linked"].get(n)]
+     fixed_names  = [n for n in result["names"] if result["fixed"].get(n)]
+ 
+@@ -1060,7 +1190,9 @@
+     has_cps = any(_cps_from_meta(ds.get("meta")) is not None
+                   for ds in result["datasets"])
+     if has_cps:
+-        p_header += ["cps_ch1", "cps_ch2", "cps_fit", "acq_time_s"]
++        p_header += ["cps_ch1", "cps_ch1_err",
++                     "cps_ch2", "cps_ch2_err",
++                     "cps_fit", "cps_fit_err", "acq_time_s"]
+     p_header += ["r2", "n_points"]
+ 
+     # Build native-typed rows ONCE, then render to both .csv and .xlsx.
+@@ -1095,7 +1227,9 @@
+                 
+         if has_cps:
+             cps = _cps_from_meta(ds.get("meta")) or {}
+-            for key in ("cps_ch1", "cps_ch2", "cps_fit", "acq_time_s"):
++            for key in ("cps_ch1", "cps_ch1_err",
++                        "cps_ch2", "cps_ch2_err",
++                        "cps_fit", "cps_fit_err", "acq_time_s"):
+                 v = cps.get(key)
+                 row.append(float(v) if v is not None else float("nan"))
+         row.append(float(ds["r2"]))
+@@ -1753,6 +1887,24 @@
+             font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
+         ).pack(fill="x", padx=12)
+ 
++    # Optional label folded into the output filenames, so a set of fits can
++    # be told apart in a file listing (and in Excel's window list) without
++    # opening them.
++    name_row = tk.Frame(win)
++    name_row.pack(fill="x", padx=12, pady=(8, 0))
++    tk.Label(name_row, text="Save as:", anchor="w",
++             font=("Helvetica", 9)).pack(side="left")
++    name_var = tk.StringVar(value="")
++    tk.Entry(name_row, textvariable=name_var,
++             font=("Helvetica", 9)).pack(side="left", fill="x", expand=True,
++                                         padx=(4, 0))
++    tk.Label(
++        win,
++        text=("      optional label; a timestamp is always appended, e.g.\n"
++              "      «myLabel»_20260723_142530_params.csv"),
++        font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
++    ).pack(fill="x", padx=12)
++
+     btns = tk.Frame(win)
+     btns.pack(pady=10)
+ 
+@@ -1784,8 +1936,11 @@
+             messagebox.showerror("Fit failed", str(e), parent=win)
+             return
+ 
++        # Read the label before the window goes away.
++        _name = name_var.get().strip()
+         win.destroy()
+-        report_path, _curve, _params = export_global_fit(result, out_source)
++        report_path, _curve, _params = export_global_fit(
++            result, out_source, name_override=_name)
+         
+         
+         fig, _axes = plot_global_fit(result, show=False)

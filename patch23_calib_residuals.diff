@@ -1,0 +1,132 @@
+--- a/fcs_calib.py
++++ b/fcs_calib.py
+@@ -666,7 +666,16 @@
+     N_err = result["N_err"]
+     unit = result["unit"]
+ 
+-    fig, ax = plt.subplots(figsize=(7.5, 5.5), layout="constrained")
++    # Two panels sharing the concentration axis: the calibration itself, and
++    # the relative deviation of each point from the fitted line.  The lower
++    # panel is what the linear-range selection actually thresholds on, so
++    # plotting it makes the selection inspectable -- and a systematic trend
++    # (curvature, roll-off, a drifting standard) is visible there long before
++    # it is obvious in the calibration plot, where a straight line through
++    # points spanning two decades hides a great deal.
++    fig, (ax, axr) = plt.subplots(
++        2, 1, sharex=True, figsize=(7.5, 6.8), layout="constrained",
++        gridspec_kw={"height_ratios": [3, 1]})
+ 
+     used = np.asarray(result.get("used", np.ones(len(conc), bool)), bool)
+     excl = (~used) & np.isfinite(conc) & np.isfinite(N)
+@@ -675,12 +684,13 @@
+     # Shade the trimmed low-/high-C regions.
+     if excl.any() and used.any():
+         lo, hi = float(conc[used].min()), float(conc[used].max())
+-        if conc[excl].min() < lo:
+-            ax.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0,
+-                       label="_excluded range (low C)")
+-        if conc[excl].max() > hi:
+-            ax.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5,
+-                       zorder=0, label="_excluded range (high C)")
++        for _a in (ax, axr):
++            if conc[excl].min() < lo:
++                _a.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0,
++                           label="_excluded range (low C)")
++            if conc[excl].max() > hi:
++                _a.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5,
++                           zorder=0, label="_excluded range (high C)")
+ 
+     def _pts(mask, **kw):
+         if not mask.any():
+@@ -720,7 +730,7 @@
+             ha="left", va="top", fontsize=9, family="monospace",
+             bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.9))
+ 
+-    ax.set_xlabel(f"Known concentration C ({unit})", fontsize=12)
++    axr.set_xlabel(f"Known concentration C ({unit})", fontsize=12)
+     ax.set_ylabel("Mean occupancy ⟨N⟩"
+                   + ("  (bg-corrected)" if result.get("corrected") else " = 1/G0"),
+                   fontsize=12)
+@@ -728,11 +738,68 @@
+     ax.legend(loc="lower right", fontsize=10, framealpha=0.85)
+     ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
+ 
++    # ── Lower panel: relative deviation from the fitted line ─────────────────
++    # This is exactly the quantity select_linear_subset thresholds on:
++    #     rel = (N - s.C) / (s.C)
++    # Signed rather than absolute, because the SHAPE carries the diagnosis.
++    # Random scatter about zero means the linear model holds; a smooth trend
++    # away from zero at one end is roll-off; a bow across the whole range
++    # means the model is wrong everywhere, which a single alpha would hide.
++    slope = result["slope"]
++    with np.errstate(divide="ignore", invalid="ignore"):
++        N_fit = slope * conc
++        rel = np.where(np.abs(N_fit) > 0, (N - N_fit) / N_fit, np.nan) * 100.0
++        rel_err = (np.where(np.abs(N_fit) > 0, N_err / N_fit, np.nan) * 100.0
++                   if have_err else None)
++
++    tol_int = result.get("max_rel_dev")
++    tol_edge = result.get("max_rel_dev_edge")
++    sel = result.get("selection") or {}
++    if tol_int is None:
++        tol_int = sel.get("max_rel_dev", _MAX_REL_DEV)
++    if tol_edge is None:
++        tol_edge = sel.get("max_rel_dev_edge", _MAX_REL_DEV_EDGE)
++
++    for lvl, style, lab in ((tol_int, ":", "interior"),
++                            (tol_edge, "-.", "ends")):
++        if lvl is None or not np.isfinite(lvl):
++            continue
++        for sign in (+1.0, -1.0):
++            axr.axhline(sign * lvl * 100.0, color="tomato", linewidth=0.9,
++                        linestyle=style, alpha=0.75, zorder=1,
++                        label=f"_±{lvl*100:g}% tolerance ({lab})")
++    axr.axhline(0.0, color="grey", linewidth=0.8, zorder=1,
++                label="_zero deviation")
++
++    def _rpts(mask, **kw):
++        if not mask.any():
++            return
++        if rel_err is not None:
++            axr.errorbar(conc[mask], rel[mask], yerr=rel_err[mask], fmt="o",
++                         capsize=3, markersize=5, zorder=3, **kw)
++        else:
++            axr.plot(conc[mask], rel[mask], "o", markersize=5, zorder=3, **kw)
++
++    _rpts(used, color="steelblue", label="_deviation (fit)")
++    _rpts(excl, color="0.6", markerfacecolor="none", label="_deviation (excluded)")
++
++    axr.set_ylabel("deviation\nfrom fit (%)", fontsize=10)
++    axr.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
++
++    # Keep the tolerance lines in view even when every point sits well inside
++    # them, so the scale of the deviations is always readable against the
++    # criterion rather than against the scatter.
++    finite = rel[np.isfinite(rel)]
++    if finite.size:
++        span = max(float(np.nanmax(np.abs(finite))) * 1.25,
++                   float(tol_edge) * 100.0 * 1.4 if tol_edge else 1.0)
++        axr.set_ylim(-span, span)
++
+     if show:
+         #plt.show was static; now dynamic w/ fcs_plottools
+         #plt.show()
+-        fcs_plottools.show_figure(fig, ax)
+-    return fig, ax
++        fcs_plottools.show_figure(fig, (ax, axr))
++    return fig, (ax, axr)
+ 
+ 
+ # ── Rebuilding a plot from an exported CSV ────────────────────────────────────
+@@ -821,6 +888,11 @@
+                             cast=int),
+         "n_total": _meta_num(meta, "n_total", int(N.size), cast=int),
+         "corrected": str(meta.get("corrected", "")).strip().lower() == "yes",
++        # Tolerances the range was selected with, so the reopened deviation
++        # panel draws the criterion that was actually applied rather than
++        # whatever the current defaults happen to be.
++        "max_rel_dev": _meta_num(meta, "select_max_rel_dev"),
++        "max_rel_dev_edge": _meta_num(meta, "select_max_rel_dev_edge"),
+     }
+     return plot_calibration(result, show=show)
+ 
