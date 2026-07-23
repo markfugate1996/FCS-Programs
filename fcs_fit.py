@@ -361,55 +361,15 @@ def auto_guess(model: FCSModel, tau_s: np.ndarray, G: np.ndarray) -> Dict[str, f
 def _write_params_xlsx(path: Path, comments: list, header: list,
                         rows: list) -> Optional[Path]:
     """
-    Mirror the parameter table as a real .xlsx for convenient viewing in Excel.
-    Numbers are written as numbers (so Excel sorts/formats them natively) and no
-    text-encoding step is involved, so there's no mojibake.  The .csv remains
-    the machine-readable copy that 'Calibrate Volume' reads; this .xlsx is
-    purely for the human.  Requires openpyxl; if it's missing this is a no-op
-    and the .csv is unaffected.
+    Mirror the parameter table as a real .xlsx for viewing in Excel.
+
+    Delegates to fcs_export.write_table_xlsx so the fit and the calibration
+    produce identically formatted spreadsheets from one implementation; the
+    .csv remains the machine-readable copy.
     """
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Font
-        from openpyxl.utils import get_column_letter
-    except ImportError:
-        print("[globalfit] openpyxl not installed — wrote .csv only "
-              "(pip install openpyxl to also get .xlsx).")
-        return None
-
-    import math
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "fit parameters"
-    grey = Font(color="808080", italic=True)
-    bold = Font(bold=True)
-
-    r = 1
-    for line in comments:
-        ws.cell(row=r, column=1, value=line).font = grey
-        r += 1
-    for j, h in enumerate(header, start=1):
-        ws.cell(row=r, column=j, value=h).font = bold
-    header_row = r
-    r += 1
-    for row in rows:
-        for j, v in enumerate(row, start=1):
-            if isinstance(v, float) and not math.isfinite(v):
-                v = None                              # NaN/inf -> blank cell
-            ws.cell(row=r, column=j, value=v)
-        r += 1
-
-    for j, h in enumerate(header, start=1):
-        ws.column_dimensions[get_column_letter(j)].width = max(len(str(h)) + 2, 12)
-    ws.freeze_panes = f"A{header_row + 1}"
-
-    try:
-        wb.save(path)
-    except Exception as e:
-        print(f"[globalfit] could not write .xlsx ({e}); .csv is unaffected.")
-        return None
-    print(f"[globalfit] wrote {path}")
-    return path
+    return fcs_export.write_table_xlsx(
+        path, comments, header, rows,
+        sheet_title="fit parameters", log_tag="globalfit")
 
 
 # ── Global / linked fitting ───────────────────────────────────────────────────
@@ -684,7 +644,12 @@ def plot_global_fit(result: dict, show: bool = True):
                 fontsize=8.5, family="monospace",
                 bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
 
-    ax.legend(loc="lower left", fontsize=8, framealpha=0.85, ncol=1)
+    # One entry per dataset, so a 30-dataset global fit produced a legend
+    # 2.4x taller than the axes (497 px against 208 px measured) which
+    # constrained layout then shrank the plot to accommodate.  Size it from
+    # the entry count instead; above the threshold it is built but hidden and
+    # the plot-controls Legend section can switch it back on.
+    fcs_plottools.adaptive_legend(ax, base_fontsize=8, loc="lower left")
     ax.set_title(
         f"Global FCS fit — {model.name}\n"
         f"{result['n_datasets']} datasets  ·  {result['n_free']} free params  ·  "

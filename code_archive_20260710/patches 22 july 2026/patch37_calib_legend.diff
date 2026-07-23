@@ -1,0 +1,11 @@
+--- a/fcs_calib.py
++++ b/fcs_calib.py
+@@ -814,7 +814,7 @@
+         # applies; say what is actually plotted.
+         ax.set_ylabel(ylab, fontsize=12)
+         ax.set_title(f"Linear calibration  ·  C = α·{ylab}", fontsize=11)
+-    ax.legend(loc="lower right", fontsize=10, framealpha=0.85)
++    fcs_plottools.adaptive_legend(ax, base_fontsize=10, loc="lower right")
+     ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
+ 
+     # ── Lower panel: relative deviation from the fitted line ─────────────────

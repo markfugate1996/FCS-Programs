@@ -1,0 +1,16 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -644,7 +644,12 @@
+                 fontsize=8.5, family="monospace",
+                 bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
+ 
+-    ax.legend(loc="lower left", fontsize=8, framealpha=0.85, ncol=1)
++    # One entry per dataset, so a 30-dataset global fit produced a legend
++    # 2.4x taller than the axes (497 px against 208 px measured) which
++    # constrained layout then shrank the plot to accommodate.  Size it from
++    # the entry count instead; above the threshold it is built but hidden and
++    # the plot-controls Legend section can switch it back on.
++    fcs_plottools.adaptive_legend(ax, base_fontsize=8, loc="lower left")
+     ax.set_title(
+         f"Global FCS fit — {model.name}\n"
+         f"{result['n_datasets']} datasets  ·  {result['n_free']} free params  ·  "

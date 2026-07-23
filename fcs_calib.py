@@ -814,7 +814,7 @@ def plot_calibration(result: dict, show: bool = True):
         # applies; say what is actually plotted.
         ax.set_ylabel(ylab, fontsize=12)
         ax.set_title(f"Linear calibration  ·  C = α·{ylab}", fontsize=11)
-    ax.legend(loc="lower right", fontsize=10, framealpha=0.85)
+    fcs_plottools.adaptive_legend(ax, base_fontsize=10, loc="lower right")
     ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
 
     # ── Lower panel: relative deviation from the fitted line ─────────────────
@@ -997,22 +997,50 @@ def rebuild_plot(meta: dict, columns: dict, show: bool = True, path=None):
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
-def _calib_dir(source_path: Path) -> Path:
+def _calib_dir(source_path: Path, when: Optional[datetime] = None) -> Path:
+    """
+    Folder for one calibration run, stamped with the time it was made.
+
+    Every calibration used to land in a single folder called "calibration",
+    so a second run silently overwrote the first -- including its report and
+    its points table.  Recalibrating to compare two ranges, or two Y columns,
+    destroyed the earlier result with no warning.  A timestamp makes each run
+    a separate folder, and they sort chronologically in a file listing.
+    """
     base = source_path.parent
     if base.name.lower() == "fits":
         base = base.parent
-    out = base / "calibration"
+    stamp = (when or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    out = base / f"calibration_{stamp}"
+    # Two calibrations inside the same second would otherwise share a folder
+    # and the second would overwrite the first -- the very failure the stamp
+    # exists to prevent, just narrowed to a one-second window.  Unreachable
+    # by hand, but a scripted sweep hits it easily.
+    if out.exists() and any(out.iterdir()):
+        for k in range(2, 1000):
+            cand = base / f"calibration_{stamp}_{k}"
+            if not cand.exists():
+                out = cand
+                break
     out.mkdir(parents=True, exist_ok=True)
     return out
 
 
 def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
-    """Write a calibration report (.txt) and the plotted points (.csv)."""
+    """
+    Write a calibration report (.txt), the plotted points (.csv) and a
+    spreadsheet mirror (.xlsx).
+
+    The CSV is the machine-readable copy -- it is what reopens as a live plot
+    (see rebuild_plot) -- while the .xlsx is for reading, matching what the
+    global fit already writes.
+    """
     source_path = Path(source_path)
     out_dir = _calib_dir(source_path)
     stem = f"{source_path.stem}_calibration"
     report_path = out_dir / f"{stem}.txt"
     points_path = out_dir / f"{stem}_points.csv"
+    xlsx_path   = out_dir / f"{stem}_points.xlsx"
 
     unit = result["unit"]
     L = []
@@ -1162,6 +1190,51 @@ def export_calibration(result: dict, source_path) -> Tuple[Path, Path]:
             nr = groups[i]["n"] if groups else 1
             fh.write(f"{nm},{result['conc'][i]:.10g},{result['N'][i]:.10g},"
                      f"{ne:.10g},{nfit:.10g},{u},{nr}\n")
+
+    # ── Spreadsheet mirror ───────────────────────────────────────────────────
+    # Same table as the CSV plus the per-point deviation, which is the
+    # quantity the linear-range selection thresholds on and the one plotted in
+    # the residual panel -- having it in the sheet saves recomputing it by
+    # hand to check a marginal point.
+    _ylab = result.get("y_label") or "⟨N⟩"
+    x_comments = [
+        f"FCS calibration — {source_path.name}",
+        f"exported   : {datetime.now().isoformat(timespec='seconds')}",
+        f"Y column   : {result.get('y_column') or _ylab}",
+        f"model      : {_ylab} = s·C through the origin",
+        f"s          = {result['slope']:.6g} ± {result['slope_err']:.3g} "
+        f"{_ylab}/{unit}",
+        f"alpha      = {result['alpha']:.6g} ± {result['alpha_err']:.3g} "
+        f"{unit}/{'molecule' if result.get('y_is_occupancy', True) else _ylab}",
+    ]
+    if result.get("veff_um3") is not None:
+        x_comments.append(f"V_eff      = {result['veff_um3']:.6g} µm³")
+    x_comments += [
+        f"R²         = {result['r2']:.6f}",
+        f"points     = {result.get('n_used', '?')}/{result.get('n_total', '?')} "
+        f"used in the fit",
+        "",
+    ]
+
+    x_header = ["dataset", f"concentration ({unit})", _ylab, f"{_ylab}_err",
+                f"{_ylab}_fit", "deviation_%", "used", "n_rep"]
+    x_rows = []
+    for i, nm in enumerate(result["names"]):
+        ne = (result["N_err"][i] if result["N_err"] is not None
+              else float("nan"))
+        nfit = result["slope"] * result["conc"][i]
+        dev = ((result["N"][i] - nfit) / nfit * 100.0
+               if nfit not in (0.0,) and np.isfinite(nfit) else float("nan"))
+        x_rows.append([
+            nm, float(result["conc"][i]), float(result["N"][i]), float(ne),
+            float(nfit), float(dev),
+            1 if (used is None or bool(used[i])) else 0,
+            groups[i]["n"] if groups else 1,
+        ])
+
+    fcs_export.write_table_xlsx(
+        xlsx_path, x_comments, x_header, x_rows,
+        sheet_title="calibration points", log_tag="calib")
 
     print(f"[calib] wrote {report_path}")
     print(f"[calib] wrote {points_path}")

@@ -40,6 +40,8 @@ Public API
     analysis_dir(d)                                  -> Path
     export_columns(d, analysis, columns, meta, ...)  -> Path   (raises)
     safe_export(d, analysis, columns, meta, ...)     -> Path | None
+    read_export(path)                                -> (meta, columns)
+    write_table_xlsx(path, comments, header, rows)   -> Path | None
 """
 
 from __future__ import annotations
@@ -257,6 +259,90 @@ def read_export(path) -> Tuple[dict, dict]:
             columns[name] = np.array([c.strip() for c in cell], dtype=object)
 
     return meta, columns
+
+
+# ── Spreadsheet mirror ────────────────────────────────────────────────────────
+
+def write_table_xlsx(
+    path,
+    comments: list,
+    header: list,
+    rows: list,
+    *,
+    sheet_title: str = "data",
+    log_tag: str = "export",
+):
+    """
+    Mirror a table as a real .xlsx for convenient reading in Excel.
+
+    Numbers are written as numbers, so Excel sorts and formats them natively
+    and there is no text-encoding step to produce mojibake.  The CSV remains
+    the machine-readable copy that the rest of the suite reads; this is purely
+    for the human.
+
+    Requires openpyxl.  If it is missing, or the write fails, this is a no-op
+    that returns None -- an unwritable spreadsheet must never cost you the CSV
+    that was already written.
+
+    Parameters
+    ----------
+    path : str | Path
+        Destination .xlsx.
+    comments : list of str
+        Header block, written in grey italics above the table.
+    header : list of str
+        Column titles, written bold and frozen.
+    rows : list of sequences
+        Table body.  Non-finite floats become blank cells rather than the
+        string "nan", which Excel would treat as text and refuse to plot.
+    sheet_title : str
+        Worksheet name.
+    log_tag : str
+        Prefix for the console messages, e.g. "globalfit" or "calib".
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print(f"[{log_tag}] openpyxl not installed — wrote .csv only "
+              f"(pip install openpyxl to also get .xlsx).")
+        return None
+
+    import math
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_title
+    grey = Font(color="808080", italic=True)
+    bold = Font(bold=True)
+
+    r = 1
+    for line in comments:
+        ws.cell(row=r, column=1, value=line).font = grey
+        r += 1
+    for j, h in enumerate(header, start=1):
+        ws.cell(row=r, column=j, value=h).font = bold
+    header_row = r
+    r += 1
+    for row in rows:
+        for j, v in enumerate(row, start=1):
+            if isinstance(v, float) and not math.isfinite(v):
+                v = None                              # NaN/inf -> blank cell
+            ws.cell(row=r, column=j, value=v)
+        r += 1
+
+    for j, h in enumerate(header, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = max(
+            len(str(h)) + 2, 12)
+    ws.freeze_panes = f"A{header_row + 1}"
+
+    try:
+        wb.save(path)
+    except Exception as e:
+        print(f"[{log_tag}] could not write .xlsx ({e}); .csv is unaffected.")
+        return None
+    print(f"[{log_tag}] wrote {path}")
+    return Path(path)
 
 
 def safe_export(
