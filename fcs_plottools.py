@@ -859,6 +859,26 @@ def _build_traces_section(
     _on_select()
 
 
+def _panel_names(axes_list: list) -> list:
+    """
+    Short, recognisable names for each panel of a multi-panel figure.
+
+    Named from the y-label where there is one -- "deviation from fit (%)"
+    beats "Panel 2" when deciding which axis to rescale.
+    """
+    names = []
+    for i, ax in enumerate(axes_list, start=1):
+        try:
+            lbl = (ax.get_ylabel() or "").replace("\n", " ").strip()
+        except Exception:
+            lbl = ""
+        names.append(f"{i}: {lbl[:28]}" if lbl else f"Panel {i}")
+    # Duplicate labels would make the menu ambiguous.
+    if len(set(names)) != len(names):
+        names = [f"Panel {i}" for i in range(1, len(axes_list) + 1)]
+    return names
+
+
 def _build_scale_section(
     panel,
     fig: plt.Figure,
@@ -867,9 +887,12 @@ def _build_scale_section(
     """
     Add the "Axis scale" LabelFrame to *panel*.
 
-    X-scale changes are applied to every axis in axes_list (so shared-x
-    subplot pairs stay in sync).  Y-scale changes are applied to axes[0]
-    only (keeps residuals / overlay panels at their intended scale).
+    X-scale changes are applied to every axis in axes_list, so a shared-x
+    subplot pair stays in sync.  Y is per-panel: a residuals panel has its own
+    scale and its own sensible range, and forcing it to follow the main axis
+    would be wrong.  When the figure has more than one panel a selector
+    chooses which panel the Y controls act on -- previously they always acted
+    on axes[0], leaving a residuals panel with no Y control at all.
     """
     import tkinter as tk
     from tkinter import messagebox
@@ -879,8 +902,13 @@ def _build_scale_section(
     sf = tk.LabelFrame(panel, text="Axis scale", padx=10, pady=6)
     sf.pack(fill="x", padx=10, pady=(10, 4))
 
+    y_target = {"i": 0}
+
     x_var = tk.StringVar(master=panel, value=ax0.get_xscale())
     y_var = tk.StringVar(master=panel, value=ax0.get_yscale())
+
+    def _yax():
+        return axes_list[min(y_target["i"], len(axes_list) - 1)]
 
     def _apply(*_args):
         xs = x_var.get()
@@ -902,9 +930,9 @@ def _build_scale_section(
 
         y_failed = False
         try:
-            axes_list[0].set_yscale(ys)
+            _yax().set_yscale(ys)
         except Exception as e:
-            y_var.set(axes_list[0].get_yscale())
+            y_var.set(_yax().get_yscale())
             messagebox.showwarning(
                 "Y scale not applied",
                 f"Could not set Y axis to {ys!r}:\n\n{e}\n\n"
@@ -933,6 +961,30 @@ def _build_scale_section(
                 command=_apply,
             ).pack(side="left", padx=5)
 
+    # Panel selector, only where there is more than one panel to choose from.
+    if len(axes_list) > 1:
+        prow = tk.Frame(sf)
+        prow.pack(fill="x", pady=(4, 0))
+        tk.Label(prow, text="Y of:", width=5, anchor="e",
+                 font=("Helvetica", 9)).pack(side="left")
+        pv = tk.StringVar(master=panel, value=_panel_names(axes_list)[0])
+
+        def _on_panel(*_):
+            names = _panel_names(axes_list)
+            try:
+                y_target["i"] = names.index(pv.get())
+            except ValueError:
+                y_target["i"] = 0
+            # Show the newly selected panel's current scale, without
+            # re-applying the previous panel's setting to it.
+            y_var.set(_yax().get_yscale())
+
+        om = tk.OptionMenu(prow, pv, *_panel_names(axes_list))
+        om.config(font=("Helvetica", 9))
+        om["menu"].config(font=("Helvetica", 9))
+        om.pack(side="left", padx=4)
+        pv.trace_add("write", _on_panel)
+
 
 def _build_limits_section(
     panel,
@@ -942,13 +994,21 @@ def _build_limits_section(
     """
     Add the "Axis limits" LabelFrame to *panel*.
 
-    X-limits are applied to all axes; Y-limits to axes[0] only.
+    X-limits are applied to all axes, since a multi-panel figure shares its
+    x-axis.  Y-limits act on ONE panel, chosen by the selector when the figure
+    has several -- a residuals panel needs its own range, and it previously
+    had no way to be rescaled at all because these controls were wired to
+    axes[0] unconditionally.
     "Auto" calls autoscale_view() and refreshes the displayed values.
     """
     import tkinter as tk
     from tkinter import messagebox
 
     ax = axes_list[0]
+    y_target = {"i": 0}
+
+    def _yax():
+        return axes_list[min(y_target["i"], len(axes_list) - 1)]
 
     lf = tk.LabelFrame(panel, text="Axis limits", padx=10, pady=6)
     lf.pack(fill="x", padx=10, pady=4)
@@ -991,7 +1051,7 @@ def _build_limits_section(
             ylo, yhi = float(ylo_var.get()), float(yhi_var.get())
             if ylo >= yhi:
                 raise ValueError("min must be less than max")
-            axes_list[0].set_ylim(ylo, yhi)
+            _yax().set_ylim(ylo, yhi)
         except Exception as e:
             messagebox.showwarning("Y limits", f"Invalid Y limits:\n{e}",
                                    parent=panel)
@@ -1008,7 +1068,7 @@ def _build_limits_section(
             a.relim()
             a.autoscale_view()
         xlo, xhi = axes_list[0].get_xlim()
-        ylo, yhi = axes_list[0].get_ylim()
+        ylo, yhi = _yax().get_ylim()
         xlo_var.set(f"{xlo:.6g}")
         xhi_var.set(f"{xhi:.6g}")
         ylo_var.set(f"{ylo:.6g}")
@@ -1017,6 +1077,31 @@ def _build_limits_section(
             fig.canvas.draw()
         except Exception:
             pass
+
+    if len(axes_list) > 1:
+        prow = tk.Frame(lf)
+        prow.pack(fill="x", pady=(4, 0))
+        tk.Label(prow, text="Y of:", width=5, anchor="e",
+                 font=("Helvetica", 9)).pack(side="left")
+        pv = tk.StringVar(master=panel, value=_panel_names(axes_list)[0])
+
+        def _on_panel(*_):
+            names = _panel_names(axes_list)
+            try:
+                y_target["i"] = names.index(pv.get())
+            except ValueError:
+                y_target["i"] = 0
+            # Show the selected panel's own limits rather than carrying the
+            # previous panel's numbers across.
+            lo, hi = _yax().get_ylim()
+            ylo_var.set(f"{lo:.6g}")
+            yhi_var.set(f"{hi:.6g}")
+
+        om = tk.OptionMenu(prow, pv, *_panel_names(axes_list))
+        om.config(font=("Helvetica", 9))
+        om["menu"].config(font=("Helvetica", 9))
+        om.pack(side="left", padx=4)
+        pv.trace_add("write", _on_panel)
 
     btn_row = tk.Frame(lf)
     btn_row.pack(fill="x", pady=(6, 0))

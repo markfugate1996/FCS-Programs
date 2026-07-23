@@ -1,0 +1,124 @@
+--- a/fcs_calib.py
++++ b/fcs_calib.py
+@@ -289,6 +289,14 @@
+ # run unweighted.
+ _NO_ERR_COL = "(none — unweighted)"
+ 
++# Residual panel: half-height as a multiple of the edge tolerance.  1.5 keeps
++# the +/-15% and +/-20% guides comfortably inside the frame while leaving room
++# to see how far a marginal point sits beyond them.
++_RESID_SPAN_FACTOR = 1.5
++
++# Use log axes once the concentration series spans at least this many decades.
++_LOG_SCALE_DECADES = 10.0
++
+ 
+ def _window_linearity(x, y, yerr, max_dev, max_dev_edge):
+     """
+@@ -705,6 +713,21 @@
+ 
+     used = np.asarray(result.get("used", np.ones(len(conc), bool)), bool)
+     excl = (~used) & np.isfinite(conc) & np.isfinite(N)
++
++    # Decide the axis scales up front: the shaded "excluded" regions below
++    # need a positive lower bound on a log axis, where zero is not a
++    # representable coordinate.
++    pos_c = conc[np.isfinite(conc)]
++    pos_y = N[np.isfinite(N)]
++    log_x = bool(pos_c.size and np.all(pos_c > 0)
++                 and pos_c.max() / max(pos_c.min(), 1e-300)
++                 >= _LOG_SCALE_DECADES)
++    log_y = bool(log_x and pos_y.size and np.all(pos_y > 0))
++    if log_x:
++        lo_x = float(pos_c.min()) / 2.0
++        hi_x = float(pos_c.max()) * 2.0
++    else:
++        lo_x, hi_x = 0.0, float(conc.max() * 1.05)
+     have_err = N_err is not None and np.all(np.isfinite(N_err))
+ 
+     # Shade the trimmed low-/high-C regions.
+@@ -712,10 +735,10 @@
+         lo, hi = float(conc[used].min()), float(conc[used].max())
+         for _a in (ax, axr):
+             if conc[excl].min() < lo:
+-                _a.axvspan(0, lo, color="0.9", alpha=0.5, zorder=0,
++                _a.axvspan(lo_x, lo, color="0.9", alpha=0.5, zorder=0,
+                            label="_excluded range (low C)")
+             if conc[excl].max() > hi:
+-                _a.axvspan(hi, conc.max() * 1.05, color="0.9", alpha=0.5,
++                _a.axvspan(hi, hi_x, color="0.9", alpha=0.5,
+                            zorder=0, label="_excluded range (high C)")
+ 
+     def _pts(mask, **kw):
+@@ -732,11 +755,33 @@
+          label=("data (fit)" if excl.any() else "data"))
+     _pts(excl, color="0.6", markerfacecolor="none", label="excluded")
+ 
+-    xline = np.linspace(0, conc.max() * 1.05, 100)
++    # A calibration series normally spans decades of concentration, so log
++    # axes are the sensible default: on a linear axis the low-concentration
++    # points pile up against the origin and the very deviations the fit is
++    # judged on become invisible.  Log needs strictly positive data, so fall
++    # back to linear whenever anything is non-positive (a blank, a
++    # background-subtracted <N> that went negative).
++    if log_x:
++        xline = np.logspace(np.log10(lo_x), np.log10(hi_x), 200)
++    else:
++        xline = np.linspace(lo_x, hi_x, 100)
++
+     ax.plot(xline, result["slope"] * xline, color="tomato", linewidth=1.6,
+             label=f"fit {ylab} = s·C", zorder=2)
+-    ax.axhline(0, color="grey", linewidth=0.6)
+-    ax.axvline(0, color="grey", linewidth=0.6)
++
++    # Zero reference lines are meaningless on a log axis (and matplotlib
++    # cannot draw them), so they are only added on linear axes.
++    if not log_y:
++        ax.axhline(0, color="grey", linewidth=0.6)
++    if not log_x:
++        ax.axvline(0, color="grey", linewidth=0.6)
++
++    if log_x:
++        for _a in (ax, axr):
++            _a.set_xscale("log")
++        ax.set_xlim(lo_x, hi_x)
++    if log_y:
++        ax.set_yscale("log")
+ 
+     box = [
+         f"s     = {result['slope']:.4g} ± {result['slope_err']:.2g}  {ylab}/{unit}",
+@@ -820,14 +865,26 @@
+     axr.set_ylabel("deviation\nfrom fit (%)", fontsize=10)
+     axr.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
+ 
+-    # Keep the tolerance lines in view even when every point sits well inside
+-    # them, so the scale of the deviations is always readable against the
+-    # criterion rather than against the scatter.
+-    finite = rel[np.isfinite(rel)]
+-    if finite.size:
+-        span = max(float(np.nanmax(np.abs(finite))) * 1.25,
+-                   float(tol_edge) * 100.0 * 1.4 if tol_edge else 1.0)
+-        axr.set_ylim(-span, span)
++    # Fixed scale, set by the TOLERANCE rather than by the data.
++    #
++    # Scaling to the data max is useless here: a point at the bottom of the
++    # concentration range can sit thousands of percent off the line, which
++    # compresses the +/-15% and +/-20% criteria into a hairline at the centre
++    # and hides exactly the structure this panel exists to show.  The axis is
++    # therefore pinned to a fixed multiple of the edge tolerance and outliers
++    # are allowed to run off it, with a count annotated so nothing is silently
++    # invisible.
++    _tol_span = float(tol_edge) * 100.0 if tol_edge else 20.0
++    span = _tol_span * _RESID_SPAN_FACTOR
++    axr.set_ylim(-span, span)
++
++    n_off = int(np.count_nonzero(np.isfinite(rel) & (np.abs(rel) > span)))
++    if n_off:
++        axr.annotate(
++            f"{n_off} point{'s' if n_off != 1 else ''} beyond ±{span:.0f}%",
++            xy=(0.99, 0.06), xycoords="axes fraction", ha="right", va="bottom",
++            fontsize=8, color="tomato",
++        )
+ 
+     if show:
+         #plt.show was static; now dynamic w/ fcs_plottools
