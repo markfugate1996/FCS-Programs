@@ -1,0 +1,117 @@
+--- a/fcs_plottools.py
++++ b/fcs_plottools.py
+@@ -249,6 +249,73 @@
+         pass
+ 
+ 
++# ── Figure export ─────────────────────────────────────────────────────────────
++
++# Default format for saved figures.  SVG is vector: it stays sharp at any
++# magnification, survives a journal's resizing, and can be opened in
++# Illustrator or Inkscape to adjust a label.  A PNG can do none of that, and
++# re-running an analysis to regenerate a figure at a different size is a poor
++# substitute.  PNG and PDF remain available in the save dialog.
++_FIGURE_FORMAT = "svg"
++
++# Raster resolution.  Ignored for svg/pdf, which have no pixel grid.
++_FIGURE_DPI = 150
++
++# Keep SVG text as real <text> elements rather than converting it to outlines.
++#
++# Matplotlib defaults to svg.fonttype='path', which traces every glyph as a
++# vector path: the file renders identically anywhere, but the text can no
++# longer be selected or edited, and the file is roughly 40% larger.  With
++# 'none' the text stays editable downstream -- normally the whole reason for
++# exporting SVG rather than PNG -- at the cost of needing the font present on
++# the machine that opens it (matplotlib's DejaVu Sans, or a substitute).
++_SVG_EDITABLE_TEXT = True
++
++_RASTER_FORMATS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
++
++
++def save_figure(fig, path, *, fmt: str = None, dpi: int = None,
++                tight: bool = True):
++    """
++    Save *fig*, defaulting to vector SVG.
++
++    *path* may be given with or without a suffix; when it has none, or when
++    *fmt* is supplied, the format decides the extension.  DPI is applied only
++    to raster formats, where it means something.
++
++    Returns the Path written, or None on failure -- a figure that cannot be
++    saved must never take down the analysis that produced it.
++    """
++    from pathlib import Path as _P
++    import matplotlib as _mpl
++
++    p = _P(path)
++    ext = (f".{fmt.lstrip('.')}" if fmt
++           else (p.suffix if p.suffix else f".{_FIGURE_FORMAT}"))
++    p = p.with_suffix(ext)
++
++    kw = {}
++    if tight:
++        kw["bbox_inches"] = "tight"
++    if ext.lower() in _RASTER_FORMATS:
++        kw["dpi"] = dpi if dpi is not None else _FIGURE_DPI
++
++    # Scope the rcParam change to this call so it cannot leak into any other
++    # figure the session goes on to draw.
++    old_ft = _mpl.rcParams.get("svg.fonttype")
++    try:
++        if ext.lower() == ".svg" and _SVG_EDITABLE_TEXT:
++            _mpl.rcParams["svg.fonttype"] = "none"
++        fig.savefig(p, **kw)
++        return p
++    except Exception as exc:
++        print(f"[plot] could not save figure ({exc})")
++        return None
++    finally:
++        if old_ft is not None:
++            _mpl.rcParams["svg.fonttype"] = old_ft
++
++
+ # ── Window placement ──────────────────────────────────────────────────────────
+ 
+ # Keep this much of the screen clear at the bottom for a taskbar / dock, so a
+@@ -1393,7 +1460,9 @@
+ def _build_save_section(panel, fig: plt.Figure) -> None:
+     """
+     Add a "Save figure…" button that opens a file-save dialog.
+-    Supports PNG, PDF, and SVG.
++
++    Defaults to SVG (see _FIGURE_FORMAT); PNG and PDF remain available from
++    the file-type list.
+     """
+     import tkinter as tk
+     from tkinter import filedialog
+@@ -1404,21 +1473,22 @@
+     def _save():
+         path = filedialog.asksaveasfilename(
+             title="Save figure",
+-            defaultextension=".png",
++            defaultextension=f".{_FIGURE_FORMAT}",
+             filetypes=[
+-                ("PNG image",    "*.png"),
+-                ("PDF document", "*.pdf"),
+                 ("SVG vector",   "*.svg"),
++                ("PDF document", "*.pdf"),
++                ("PNG image",    "*.png"),
+                 ("All files",    "*.*"),
+             ],
+         )
+         if not path:
+             return
+-        try:
+-            fig.savefig(path, dpi=150, bbox_inches="tight")
+-        except Exception as exc:
++        if save_figure(fig, path) is None:
+             from tkinter import messagebox
+-            messagebox.showerror("Save failed", str(exc), parent=panel)
++            messagebox.showerror(
++                "Save failed",
++                f"Could not write {path}.\n\nSee the console for details.",
++                parent=panel)
+ 
+     tk.Button(sf, text="Save figure\u2026", command=_save,
+               width=14, pady=3).pack()

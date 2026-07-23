@@ -1,0 +1,17 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -1909,10 +1909,10 @@
+         
+         
+         fig, _axes = plot_global_fit(result, show=False)
+-        try:
+-            fig.savefig(report_path.with_suffix(".png"), dpi=150)
+-        except Exception as e:
+-            print(f"[globalfit] could not save figure: {e}")
++        # Vector by default: see fcs_plottools._FIGURE_FORMAT.  save_figure
++        # swallows its own failures, so a figure that cannot be written never
++        # costs us the report and tables already on disk.
++        fcs_plottools.save_figure(fig, report_path.with_suffix(""))
+ 
+         linked_lines = [
+             f"{n} = {result['datasets'][0]['values'][n]:.4g} (linked)"

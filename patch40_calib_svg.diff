@@ -1,0 +1,15 @@
+--- a/fcs_calib.py
++++ b/fcs_calib.py
+@@ -1566,10 +1566,8 @@
+         win.destroy()
+         report_path, _pts = export_calibration(result, csv_path)
+         fig, _ax = plot_calibration(result, show=False)
+-        try:
+-            fig.savefig(report_path.with_suffix(".png"), dpi=150)
+-        except Exception as e:
+-            print(f"[calib] could not save figure: {e}")
++        # Vector by default: see fcs_plottools._FIGURE_FORMAT.
++        fcs_plottools.save_figure(fig, report_path.with_suffix(""))
+ 
+         msg = (f"C = α·⟨N⟩\n\n"
+                f"α = {result['alpha']:.4g} ± {result['alpha_err']:.2g} {unit}/molecule\n"
