@@ -1,0 +1,193 @@
+--- a/fcs_corr.py
++++ b/fcs_corr.py
+@@ -78,7 +78,7 @@
+ import matplotlib.ticker as ticker
+ import fcs_plottools
+ 
+-from fcs_reader import FCSData, read_fcs
++from fcs_reader import FCSData, read_fcs, require_channels
+ import fcs_lifetime
+ import fcs_export
+ 
+@@ -987,6 +987,35 @@
+     "auto_ch2": "Autocorr Ch2",
+     "cross":    "Ch1xCh2",
+ }
++
++# Which detector channels each correlation type requires.  Single-channel
++# acquisitions can only run the autocorrelation of the channel they recorded;
++# the dialog uses this to disable the other options and the compute paths use
++# it to gate (see require_channels).
++_CORR_NEEDS = {
++    "auto_ch1": (1,),
++    "auto_ch2": (2,),
++    "cross":    (1, 2),
++}
++_CORR_FEATURE = {
++    "auto_ch1": "Autocorrelation of Ch1",
++    "auto_ch2": "Autocorrelation of Ch2",
++    "cross":    "Cross-correlation",
++}
++
++
++def supported_corr_types(fcs_data) -> tuple:
++    """
++    The correlation types *fcs_data* can actually support, in dialog order.
++
++    Driven by which channels the file RECORDED, not by how many photons they
++    hold: a dual-channel file with a silent detector still supports every
++    type, and the resulting flat G(tau) is the user's evidence that the
++    detector was silent.
++    """
++    available = tuple(getattr(fcs_data, "channels", (1, 2)))
++    return tuple(v for v in ("cross", "auto_ch1", "auto_ch2")
++                 if all(c in available for c in _CORR_NEEDS[v]))
+ def multitau_lag_grid(dt0: float, m: int, coarsen: int,
+                       tau_max: float) -> np.ndarray:
+     """
+@@ -1490,7 +1519,7 @@
+     return s
+ 
+ 
+-def _cps_meta(n1: int, n2: int, T: float) -> dict:
++def _cps_meta(n1: int, n2: int, T: float, channels=(1, 2)) -> dict:
+     """
+     CPS / acquisition-time header fields, consumed by fcs_fit._cps_from_meta
+     (and hence fcs_noise's shot-noise term).
+@@ -1501,15 +1530,31 @@
+     pair count matches the estimator's own rateA·rateB·(T−τ)·Δτ normalisation.
+     Returns {} when the fields cannot be trusted, so the fit report says
+     "not available" rather than reporting a wrong rate.
++
++    *channels* is the tuple of channels the file actually recorded.  The
++    column set does NOT change for a single-channel file -- every field is
++    still written, so downstream readers (fcs_fit._cps_from_meta among them)
++    keep the layout they expect -- but the fields belonging to a channel that
++    was never recorded are written BLANK rather than as "0".  A blank reads
++    back as None; a zero would read back as a real measurement of no light,
++    which is what a dead detector looks like and is a different claim.
+     """
+     if T <= 0 or (n1 == 0 and n2 == 0):
+         return {}
++
++    def _fields(n, ch):
++        if ch not in channels:
++            return "", ""
++        return n, f"{n / T:.6g}"
++
++    n_ph1, cps1 = _fields(n1, 1)
++    n_ph2, cps2 = _fields(n2, 2)
+     return {
+         "acquisition_time_s": f"{T:.6g}",
+-        "n_photons_ch1": n1,
+-        "n_photons_ch2": n2,
+-        "cps_ch1": f"{n1 / T:.6g}",
+-        "cps_ch2": f"{n2 / T:.6g}",
++        "n_photons_ch1": n_ph1,
++        "n_photons_ch2": n_ph2,
++        "cps_ch1": cps1,
++        "cps_ch2": cps2,
+     }
+ 
+ # ── Background (Koppel) amplitude correction ──────────────────────────────────
+@@ -1727,8 +1772,15 @@
+         if mt_compress is not None:
+             meta["mt_compress"] = mt_compress
+     if None not in (n_used_ch1, n_used_ch2, T_used):
+-            meta.update(_cps_meta(n_used_ch1, n_used_ch2, T_used))
++            meta.update(_cps_meta(n_used_ch1, n_used_ch2, T_used,
++                                  getattr(fcs_data, "channels", (1, 2))))
+     
++    # Self-describing: a blank cps_ch2 means "never recorded", and this line
++    # is what lets a reader tell that from a field that is blank for some
++    # other reason.
++    meta["channels_recorded"] = "+".join(
++        f"Ch{c}" for c in getattr(fcs_data, "channels", (1, 2)))
++
+     if gate_min_ns is not None:
+         meta["gate_min_ns"] = f"{gate_min_ns:.3f}"
+         meta["gate_max_ns"] = f"{gate_max_ns:.3f}"
+@@ -2018,6 +2070,20 @@
+     from tkinter import messagebox
+ 
+     corr_type   = params["corr_type"]
++
++    # Robustness net, batch counterpart of the check in the dialog's OK
++    # handler.  The batch dialogs disable unsupported types, so this should
++    # not fire; when it does -- most likely a mixed selection where one file
++    # is single-channel and the shared parameters were collected from a
++    # dual-channel one -- the file is skipped and the batch continues, which
++    # is the same contract as a cancelled gate.
++    try:
++        require_channels(fcs_data, _CORR_NEEDS.get(corr_type, ()),
++                         _CORR_FEATURE.get(corr_type, "This correlation"))
++    except ValueError as _e:
++        messagebox.showerror("Channel not available", str(_e), parent=parent)
++        return None
++
+     method      = params["method"]
+     segment     = params["segment"]
+     use_gate    = params["gate"]
+@@ -2524,14 +2590,36 @@
+     type_frame = tk.LabelFrame(type_range_row, text="Type", padx=10, pady=4)
+     type_frame.pack(side="left", fill="both", expand=True)
+ 
+-    type_var = tk.StringVar(value=_defaults["corr_type"])
++    # A single-channel acquisition cannot be cross-correlated and has nothing
++    # to autocorrelate on the channel it never recorded, so those options are
++    # disabled up front rather than offered and then rejected on OK.
++    _supported = supported_corr_types(fcs_data)
++
++    # The remembered default is per-session, not per-file, so it can easily be
++    # a type this file does not support.  Fall back to something it does.
++    _default_type = _defaults["corr_type"]
++    if _default_type not in _supported:
++        _default_type = _supported[0] if _supported else "auto_ch1"
++
++    type_var = tk.StringVar(value=_default_type)
+     for text, value in [
+         ("Cross-correlation  Ch1 → Ch2", "cross"),
+         ("Autocorrelation  Ch1",         "auto_ch1"),
+         ("Autocorrelation  Ch2",         "auto_ch2"),
+     ]:
+-        tk.Radiobutton(type_frame, text=text, variable=type_var,
+-                       value=value, anchor="w").pack(fill="x")
++        _rb = tk.Radiobutton(type_frame, text=text, variable=type_var,
++                             value=value, anchor="w")
++        if value not in _supported:
++            _rb.configure(state="disabled")
++        _rb.pack(fill="x")
++
++    if len(getattr(fcs_data, "channels", (1, 2))) < 2:
++        tk.Label(type_frame,
++                 text=f"Single-channel file "
++                      f"({getattr(fcs_data, 'channel_summary', 'one channel')})"
++                      f" — options needing the other channel are disabled.",
++                 font=("Helvetica", 8), fg="grey", anchor="w",
++                 justify="left", wraplength=230).pack(fill="x", pady=(4, 0))
+ 
+     # ── Lag range ─────────────────────────────────────────────────────────────
+     range_frame = tk.LabelFrame(type_range_row, text="Lag range (ms)",padx=10, pady=6)
+@@ -2864,6 +2952,22 @@
+             return
+ 
+         corr_type = type_var.get()
++
++        # Robustness net.  The Type radios for channels this file does not
++        # have are disabled above, so this should never fire from the GUI --
++        # it is here to catch the paths that bypass the greying-out: a
++        # persisted default, a programmatic caller, or a future edit that adds
++        # a correlation type without updating supported_corr_types().  Failing
++        # here with an explanation beats correlating against an empty array
++        # and returning a plausible-looking flat curve.
++        try:
++            require_channels(fcs_data, _CORR_NEEDS.get(corr_type, ()),
++                             _CORR_FEATURE.get(corr_type, "This correlation"))
++        except ValueError as _e:
++            messagebox.showerror("Channel not available", str(_e),
++                                 parent=dialog)
++            return
++
+         method    = method_var.get()
+         segment   = segment_var.get()
+         use_gate  = gate_var.get()

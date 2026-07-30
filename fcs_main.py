@@ -107,14 +107,23 @@ def _file_summary(d) -> str:
             f"  Bins     : {d.n_bins}  (laser period {d.laser_period_ns:.3f} ns)\n"
             f"  IRF      : {'present' if d.has_irf else 'none'}"
         )
-    return (
-        f"{d.filepath.name}\n"
-        f"  Duration : {d.duration_s:.2f} s\n"
-        f"  Ch1      : {len(d.ch1_deltas):,} photons  "
-        f"({d.count_rate_ch1_hz:,.0f} CPS)\n"
-        f"  Ch2      : {len(d.ch2_deltas):,} photons  "
-        f"({d.count_rate_ch2_hz:,.0f} CPS)"
-    )
+    # List only the channels the file actually recorded.  Showing
+    # "Ch2 : 0 photons" for a single-channel acquisition would be
+    # indistinguishable from a dual-channel one with a dead detector, and
+    # those need to stay distinguishable at a glance.
+    channels = tuple(getattr(d, "channels", (1, 2)))
+    lines = [
+        f"{d.filepath.name}",
+        f"  Duration : {d.duration_s:.2f} s",
+    ]
+    for ch in channels:
+        n_ph = len(d.ch1_deltas if ch == 1 else d.ch2_deltas)
+        cps  = d.count_rate_ch1_hz if ch == 1 else d.count_rate_ch2_hz
+        lines.append(f"  Ch{ch}      : {n_ph:,} photons  ({cps:,.0f} CPS)")
+    if len(channels) < 2:
+        lines.append(f"  Channels : single-channel file "
+                     f"({getattr(d, 'channel_summary', 'one channel')})")
+    return "\n".join(lines)
 
 
 
@@ -514,8 +523,21 @@ def _ask_lifetime_batch(n: int):
     return result["val"]
 
 
-def _ask_pch_batch(n: int):
-    """Dialog for a batch PCH plot.  Returns (channel, bin_width_s, mode) or None."""
+# Which detector channels each batch-PCH channel choice needs.
+_PCH_NEEDS = {"ch1": (1,), "ch2": (2,), "both": (1, 2), "combined": (1, 2)}
+
+
+def _ask_pch_batch(n: int, datasets=None):
+    """
+    Dialog for a batch PCH plot.  Returns (channel, bin_width_s, mode) or None.
+
+    When *datasets* is given, channel options that not every selected file can
+    satisfy are disabled.  The rule is the INTERSECTION of the selection's
+    channels, not the union: one parameter set is applied to every file in the
+    batch, so an option is only offered if it works for all of them.  A
+    selection mixing a Ch1-only and a Ch2-only file therefore offers nothing,
+    and the dialog says so rather than failing per file at compute time.
+    """
     if _batch_defaults["pch_bw_label"] is None:
         _batch_defaults["pch_bw_label"] = fcs_pch._DEFAULT_BIN_WIDTH_LABEL
 
@@ -528,15 +550,42 @@ def _ask_pch_batch(n: int):
 
     ch_frame = tk.LabelFrame(dialog, text="Channel(s)", padx=10, pady=4)
     ch_frame.pack(fill="x", padx=12, pady=6)
-    ch_var = tk.StringVar(value=_batch_defaults["pch_channel"])
+
+    if datasets:
+        common = set((1, 2))
+        for _d in datasets:
+            common &= set(getattr(_d, "channels", (1, 2)))
+    else:
+        common = set((1, 2))
+    supported = tuple(v for v, need in _PCH_NEEDS.items()
+                      if all(c in common for c in need))
+
+    default_ch = _batch_defaults["pch_channel"]
+    if supported and default_ch not in supported:
+        default_ch = supported[0]
+    ch_var = tk.StringVar(value=default_ch)
+
     for text, value in [
         ("Ch1 only",                              "ch1"),
         ("Ch2 only",                              "ch2"),
         ("Both channels — overlay",               "both"),
         ("Both channels — combined (Ch1 + Ch2)",  "combined"),
     ]:
-        tk.Radiobutton(ch_frame, text=text, variable=ch_var, value=value,
-                       anchor="w").pack(fill="x")
+        rb = tk.Radiobutton(ch_frame, text=text, variable=ch_var, value=value,
+                            anchor="w")
+        if value not in supported:
+            rb.configure(state="disabled")
+        rb.pack(fill="x")
+
+    if len(supported) < len(_PCH_NEEDS):
+        msg = ("No channel is common to every selected file — deselect the "
+               "files that use a different detector."
+               if not supported else
+               "Some files in this selection are single-channel; options "
+               "needing a channel they lack are disabled.")
+        tk.Label(ch_frame, text=msg, font=("Helvetica", 8), fg="grey",
+                 anchor="w", justify="left", wraplength=260).pack(
+                     fill="x", pady=(4, 0))
 
     bw_frame = tk.LabelFrame(dialog, text="Bin width", padx=10, pady=6)
     bw_frame.pack(fill="x", padx=12, pady=6)
@@ -547,6 +596,19 @@ def _ask_pch_batch(n: int):
     result = {"val": None}
 
     def _ok():
+        # Robustness net: the radios for unavailable channels are disabled
+        # above, so this should be unreachable from the GUI.  It is kept
+        # because the remembered default is per-session rather than
+        # per-selection, and because a future edit could add a channel option
+        # without updating _PCH_NEEDS.
+        if ch_var.get() not in supported:
+            messagebox.showerror(
+                "Channel not available",
+                "The selected files do not all have the channel this option "
+                "needs.  Pick one of the enabled options, or change the "
+                "selection.",
+                parent=dialog)
+            return
         _batch_defaults["pch_channel"]  = ch_var.get()
         _batch_defaults["pch_bw_label"] = bw_var.get()
         _batch_defaults["mode"]         = mode_var.get()
@@ -816,7 +878,7 @@ def task_pch():
     """Open the PCH dialog for the active dataset, or batch over a selection."""
     datasets = _selected_datasets()
     if len(datasets) >= 2:
-        params = _ask_pch_batch(len(datasets))
+        params = _ask_pch_batch(len(datasets), datasets)
         if params is None:
             return
         channel_choice, bin_width_s, mode = params
