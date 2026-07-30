@@ -1,0 +1,119 @@
+--- a/fcs_corr.py
++++ b/fcs_corr.py
+@@ -1004,6 +1004,44 @@
+ }
+ 
+ 
++def require_usable_channels(fcs_data, corr_type: str) -> None:
++    """
++    Raise a descriptive ValueError unless *fcs_data* can support *corr_type*.
++
++    Two separate failures, deliberately reported differently:
++
++    * the channel was never RECORDED -- a single-channel file.  Handled by
++      require_channels; the fix is to choose a different correlation type.
++    * the channel was recorded but holds NO PHOTONS -- a dead detector, a
++      shutter left closed, an empty sample.  The file is perfectly valid and
++      loads normally by design, but correlating against it produces
++      "index 0 is out of bounds for axis 0 with size 0" from deep inside the
++      estimator, which tells the user nothing about what went wrong.
++    """
++    needs = _CORR_NEEDS.get(corr_type, ())
++    require_channels(fcs_data, needs,
++                     _CORR_FEATURE.get(corr_type, "This correlation"))
++
++    def _n(ch):
++        getter = getattr(fcs_data, "deltas", None)
++        arr = getter(ch) if getter else (fcs_data.ch1_deltas if ch == 1
++                                         else fcs_data.ch2_deltas)
++        return len(arr)
++
++    empty = [c for c in needs if _n(c) == 0]
++    if empty:
++        name = getattr(getattr(fcs_data, "filepath", None), "name",
++                       "This dataset")
++        which = " and ".join(f"Ch{c}" for c in empty)
++        raise ValueError(
++            f"{_CORR_FEATURE.get(corr_type, 'This correlation')} needs photons "
++            f"on {which}, but {name} recorded none on "
++            f"{'that channel' if len(empty) == 1 else 'those channels'}.\n\n"
++            f"The channel is present in the file but empty -- a detector that "
++            f"saw no light, rather than a channel that was never recorded."
++        )
++
++
+ def supported_corr_types(fcs_data) -> tuple:
+     """
+     The correlation types *fcs_data* can actually support, in dialog order.
+@@ -1519,6 +1557,30 @@
+     return s
+ 
+ 
++def _photon_span_s(*time_arrays) -> float:
++    """
++    Wall-clock span (s) covered by the photons actually correlated.
++
++    This is the T that pairs with the photon counts in _cps_meta, so it must be
++    measured the same way the correlator measures it: first to last arrival
++    across the channels that HAVE arrivals.  Empty channels are skipped rather
++    than indexed -- a single-channel file has one empty array, and so does a
++    dual-channel file whose second detector was dead or whose microtime gate
++    excluded every photon on it.
++
++    Returns 0.0 when nothing was correlated at all, which _cps_meta already
++    treats as "cannot be trusted" and drops.
++
++    The single-file and batch paths previously each computed this inline and
++    had drifted apart: the single-file version skipped empty channels, the
++    batch version indexed [-1] unconditionally and raised IndexError.  Both now
++    call this, so they cannot diverge again.
++    """
++    starts = [t[0]  for t in time_arrays if len(t)]
++    stops  = [t[-1] for t in time_arrays if len(t)]
++    return float(max(stops) - min(starts)) if starts else 0.0
++
++
+ def _cps_meta(n1: int, n2: int, T: float, channels=(1, 2)) -> dict:
+     """
+     CPS / acquisition-time header fields, consumed by fcs_fit._cps_from_meta
+@@ -2078,8 +2140,7 @@
+     # dual-channel one -- the file is skipped and the batch continues, which
+     # is the same contract as a cancelled gate.
+     try:
+-        require_channels(fcs_data, _CORR_NEEDS.get(corr_type, ()),
+-                         _CORR_FEATURE.get(corr_type, "This correlation"))
++        require_usable_channels(fcs_data, corr_type)
+     except ValueError as _e:
+         messagebox.showerror("Channel not available", str(_e), parent=parent)
+         return None
+@@ -2234,8 +2295,7 @@
+         "tau_min_s": tau_min_s, "tau_max_s": tau_max_s,
+         "gate_min_ns": gate_min_ns, "gate_max_ns": gate_max_ns,
+         "n_used_ch1": len(times_ch1), "n_used_ch2": len(times_ch2),
+-        "T_used": float(max(times_ch1[-1], times_ch2[-1])
+-                        - min(times_ch1[0], times_ch2[0])),
++        "T_used": _photon_span_s(times_ch1, times_ch2),
+         # Provenance, so the batch export writes the same header as the
+         # single-file path rather than re-deriving it from _defaults (which
+         # the user may have changed since).
+@@ -2961,8 +3021,7 @@
+         # here with an explanation beats correlating against an empty array
+         # and returning a plausible-looking flat curve.
+         try:
+-            require_channels(fcs_data, _CORR_NEEDS.get(corr_type, ()),
+-                             _CORR_FEATURE.get(corr_type, "This correlation"))
++            require_usable_channels(fcs_data, corr_type)
+         except ValueError as _e:
+             messagebox.showerror("Channel not available", str(_e),
+                                  parent=dialog)
+@@ -3240,9 +3299,7 @@
+ 
+ 
+         _n1, _n2 = len(times_ch1), len(times_ch2)
+-        _starts = [t[0]  for t in (times_ch1, times_ch2) if len(t)]
+-        _stops  = [t[-1] for t in (times_ch1, times_ch2) if len(t)]
+-        _T = (max(_stops) - min(_starts)) if _starts else 0.0
++        _T = _photon_span_s(times_ch1, times_ch2)
+ 
+         plot_correlation(
+             tau, G_mean, G_std,

@@ -322,7 +322,7 @@ class FCSData:
 
     def lifetime_histogram(
         self,
-        channel: int = 0,
+        channel: int = 1,
         n_bins: int = _MICROTIME_BINS,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -331,7 +331,7 @@ class FCSData:
         Parameters
         ----------
         channel : int
-            1 or 2.
+            1 or 2.  Defaults to 1.
         n_bins : int
             Number of histogram bins (default: 4096, one per microtime bin).
 
@@ -342,13 +342,20 @@ class FCSData:
         counts : np.ndarray (uint32)
             Photon counts per bin.
         """
-        # NB: the existing mapping is preserved exactly — anything that is not
-        # literally 1 selects Ch2, including the legacy ``channel=0`` default.
-        ch = 1 if channel == 1 else 2
-        if ch not in self.channels:
+        # The default used to be 0, which fell through to Ch2 because the
+        # selection was written as "Ch1 if channel == 1 else Ch2" -- so a
+        # bare lifetime_histogram() silently returned the WRONG channel and
+        # contradicted this docstring.  Every call site in the suite passes
+        # channel= explicitly, so correcting the default is safe, and an
+        # out-of-range channel is now an error rather than a silent Ch2.
+        if channel not in (1, 2):
+            raise ValueError(
+                f"channel must be 1 or 2, got {channel!r}."
+            )
+        if channel not in self.channels:
             raise ValueError(
                 f"{self.filepath.name} recorded {self.channel_summary}; "
-                f"there are no Ch{ch} microtimes to histogram."
+                f"there are no Ch{channel} microtimes to histogram."
             )
         micro = self.ch1_micro if channel == 1 else self.ch2_micro
         counts, edges = np.histogram(micro, bins=n_bins,

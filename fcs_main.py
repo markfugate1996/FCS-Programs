@@ -842,7 +842,21 @@ def task_correlation():
                 status_set(f"Correlation overlay — file {i} of {total}:\n"
                            f"{d.filepath.name}")
                 root.update_idletasks()
-                res = fcs_corr.compute_correlation_for(d, params, parent=root)
+                # compute_correlation_for reports its own expected failures
+                # (cancelled gate, unusable channel) by returning None, but an
+                # UNEXPECTED exception used to escape this loop entirely.  In
+                # tkinter that unwinds into Tk's default callback handler,
+                # which prints a traceback to stderr and shows nothing at all
+                # -- so the batch silently produced no plot with no message.
+                # The separate-plots path has always caught per file here
+                # (see _run_separate); this makes the overlay path match, so
+                # one bad file costs that file and not the whole batch.
+                try:
+                    res = fcs_corr.compute_correlation_for(d, params, parent=root)
+                except Exception as e:
+                    messagebox.showerror("Computation error",
+                                         f"{d.filepath.name}:\n{e}")
+                    res = None
                 if res is not None:        # None → gate cancelled / too narrow
                     results.append((d, res))
             if results:
@@ -857,6 +871,14 @@ def task_correlation():
                     )
                 except Exception as e:
                     messagebox.showerror("Plot error", str(e))
+            else:
+                # Every file was skipped or failed.  Saying so beats a window
+                # that simply never appears.
+                messagebox.showwarning(
+                    "Nothing to plot",
+                    f"No correlation curves could be computed for the "
+                    f"{total} selected file(s), so there is nothing to "
+                    f"overlay.")
             status_refresh()
         else:
             _run_separate(

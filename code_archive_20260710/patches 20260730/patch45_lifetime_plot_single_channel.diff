@@ -1,0 +1,335 @@
+--- a/fcs_lifetime.py
++++ b/fcs_lifetime.py
+@@ -43,7 +43,7 @@
+ import fcs_plottools
+ import numpy as np
+ 
+-from fcs_reader import FCSData, load_dataset
++from fcs_reader import FCSData, load_dataset, require_channels
+ import fcs_export
+ 
+ # ── Type alias ────────────────────────────────────────────────────────────────
+@@ -64,6 +64,88 @@
+ 
+ 
+ # ── Helpers ───────────────────────────────────────────────────────────────────
++
++def _resolve_channels(d, channels) -> tuple[int, ...]:
++    """
++    Turn a caller's *channels* argument into the channels to actually draw.
++
++    ``None`` means "whatever this file recorded", which is what every caller
++    in the suite wants: a single-channel file plots its one decay, a
++    dual-channel file plots both, and nobody has to ask first.  This is the
++    default precisely because it is not a fallback -- it is the correct answer
++    for the file in hand.
++
++    An EXPLICIT request is different and is checked, not quietly trimmed.
++    Asking for Ch2 on a Ch1-only file is a mistake worth hearing about; if it
++    were silently dropped the plot would come back empty with no explanation,
++    or -- worse, in the fitting path -- a decay would be fitted to a histogram
++    that contains nothing.
++    """
++    available = tuple(getattr(d, "channels", (1, 2)))
++    if channels is None:
++        return available
++    channels = tuple(channels)
++    if not channels or not all(c in (1, 2) for c in channels):
++        raise ValueError(
++            "channels must be None, or a non-empty tuple containing 1, 2, "
++            "or both.")
++    require_channels(d, channels, "This lifetime plot")
++    return channels
++
++
++def _lifetime_export_columns(d, n_bins: int, channels: tuple[int, ...]):
++    """
++    Build the (time_ns, columns) pair for a lifetime CSV export.
++
++    The schema is FIXED: ``time_ns``, ``ch1_counts``, ``ch2_counts``, always,
++    in that order, whatever the file recorded and whatever was plotted.  A
++    channel with no data gets a column of NaN rather than being dropped, so
++    every lifetime export -- single-channel, dual-channel, one channel of two
++    plotted -- has the same header and can be read by the same code without
++    inspecting it first.
++
++    NaN is the right filler rather than 0: fcs_export.read_export already maps
++    an empty CSV cell to NaN, so NaN is exactly the value a blank cell reads
++    back as, and it round-trips.  A 0 would read back as a real measurement of
++    no photons.  (fcs_export.export_columns currently renders NaN as the text
++    "nan"; the ``channels`` and ``channels_recorded`` metadata keys say which
++    columns are meaningful either way.)
++    """
++    time_ns  = None
++    counts_by_ch: dict[int, np.ndarray] = {}
++    for ch in channels:
++        bin_times_ns, counts = d.lifetime_histogram(channel=ch, n_bins=n_bins)
++        if time_ns is None:
++            time_ns = bin_times_ns
++        counts_by_ch[ch] = counts
++
++    if time_ns is None:
++        return None, {}
++
++    blank   = np.full(len(time_ns), np.nan, dtype=np.float64)
++    columns = {
++        f"ch{ch}_counts": (counts_by_ch[ch].astype(np.float64)
++                           if ch in counts_by_ch else blank.copy())
++        for ch in (1, 2)
++    }
++    return time_ns, columns
++
++
++def _lifetime_export_meta(d, n_bins: int, channels: tuple[int, ...]) -> dict:
++    """Metadata block shared by the single-file and overlay export paths."""
++    return {
++        "n_bins":            n_bins,
++        "bin_width_ps":      f"{d.laser_period_ns / n_bins * 1000:.4f}",
++        "laser_period_ns":   f"{d.laser_period_ns:.4f}",
++        # What was drawn ...
++        "channels":          "+".join(f"Ch{c}" for c in channels),
++        # ... versus what the file has.  A blank ch2_counts means "not
++        # plotted" when Ch2 appears here and "never recorded" when it does not.
++        "channels_recorded": "+".join(
++            f"Ch{c}" for c in getattr(d, "channels", (1, 2))),
++    }
++
++
+ def _load(data: DataOrPath):
+     # Bare paths get dispatched by type (.ifx → LifetimeData, .fcs → FCSData);
+     # anything already loaded (FCSData, LifetimeData, …) passes straight through.
+@@ -83,7 +165,8 @@
+     """
+     Compute default gate boundaries from the lifetime histogram.
+ 
+-    Uses the combined Ch1+Ch2 histogram to find the peak, then sets:
++    Uses the combined histogram of every RECORDED channel to find the peak,
++    then sets:
+       gate_min = time of peak + 1 ns   (just past the IRF-dominated rise)
+       gate_max = gate_min + 20 ns      (covers the fluorescence decay)
+ 
+@@ -99,10 +182,21 @@
+     -------
+     gate_min_ns, gate_max_ns : float
+     """
+-    # Use combined counts from both channels to find the peak robustly
+-    bin_times, counts1 = d.lifetime_histogram(channel=1, n_bins=n_bins)
+-    _,          counts2 = d.lifetime_histogram(channel=2, n_bins=n_bins)
+-    combined    = counts1.astype(np.float64) + counts2.astype(np.float64)
++    # Combine counts across the channels the file recorded, to find the peak
++    # robustly.  This used to histogram Ch1 and Ch2 unconditionally, which
++    # raises on a single-channel file -- and this function is on the
++    # correlation gating path, so that crash was reachable from Compute with
++    # "Gate" ticked, not just from the lifetime menu.
++    channels    = tuple(getattr(d, "channels", (1, 2)))
++    bin_times   = None
++    combined    = None
++    for ch in channels:
++        times, counts = d.lifetime_histogram(channel=ch, n_bins=n_bins)
++        if bin_times is None:
++            bin_times = times
++            combined  = counts.astype(np.float64)
++        else:
++            combined = combined + counts.astype(np.float64)
+ 
+     peak_idx    = int(np.argmax(combined))
+     peak_ns     = float(bin_times[peak_idx])
+@@ -123,7 +217,7 @@
+ def plot_lifetime(
+     data: DataOrPath,
+     n_bins: int = 4096,
+-    channels: tuple[int, ...] = (1, 2),
++    channels: tuple[int, ...] | None = None,
+     show: bool = True,
+     export: bool = False,
+ ) -> tuple[plt.Figure, plt.Axes]:
+@@ -136,8 +230,10 @@
+     data : FCSData, str, or Path
+     n_bins : int
+         Histogram bins (must be in _VALID_N_BINS).
+-    channels : tuple of int
+-        Channels to plot: (1,), (2,), or (1, 2).
++    channels : tuple of int, or None
++        Channels to plot: (1,), (2,), or (1, 2).  None (the default) plots
++        every channel the file recorded, so a single-channel file plots its
++        one decay without the caller having to know which detector it used.
+     show : bool
+         Call plt.show() if True.
+ 
+@@ -147,8 +243,6 @@
+     """
+     if n_bins not in _VALID_N_BINS:
+         raise ValueError(f"n_bins must be one of {_VALID_N_BINS}; got {n_bins}.")
+-    if not channels or not all(c in (1, 2) for c in channels):
+-        raise ValueError("channels must be a non-empty tuple containing 1, 2, or both.")
+ 
+     #d   = _load(data)
+     #fig, ax = plt.subplots(figsize=(9, 4))
+@@ -162,6 +256,8 @@
+     if getattr(d, "kind", None) == "lifetime_decay":
+         return _plot_decay_ifx(d, show=show, export=export)
+ 
++    channels = _resolve_channels(d, channels)
++
+     fig, ax = plt.subplots(figsize=(9, 4))
+     _draw_histogram(ax, d, n_bins, channels)
+ 
+@@ -171,23 +267,12 @@
+     # The time axis is identical across channels (same n_bins / range), so a
+     # single time column is shared and each plotted channel adds a counts column.
+     if export:
+-        time_ns = None
+-        columns: dict[str, np.ndarray] = {}
+-        for ch in channels:
+-            bin_times_ns, counts = d.lifetime_histogram(channel=ch, n_bins=n_bins)
+-            if time_ns is None:
+-                time_ns = bin_times_ns
+-            columns[f"ch{ch}_counts"] = counts
++        time_ns, columns = _lifetime_export_columns(d, n_bins, channels)
+         if time_ns is not None:
+             fcs_export.safe_export(
+                 d, "lifetime",
+                 {"time_ns": time_ns, **columns},
+-                meta={
+-                    "n_bins":         n_bins,
+-                    "bin_width_ps":   f"{d.laser_period_ns / n_bins * 1000:.4f}",
+-                    "laser_period_ns": f"{d.laser_period_ns:.4f}",
+-                    "channels":       "+".join(f"Ch{c}" for c in channels),
+-                },
++                meta=_lifetime_export_meta(d, n_bins, channels),
+                 suffix=f"{n_bins}bins",
+             )
+ 
+@@ -250,7 +335,7 @@
+ def select_gate(
+     data: DataOrPath,
+     n_bins: int = 512,
+-    channels: tuple[int, ...] = (1, 2),
++    channels: tuple[int, ...] | None = None,
+     initial_gate: Optional[Tuple[float, float]] = None,
+     title: str = "Set time gate",
+     gate_label: str = "Gate",
+@@ -270,8 +355,9 @@
+     n_bins : int
+         Histogram resolution for the gate view.  512 is a good balance of
+         speed and detail.
+-    channels : tuple of int
+-        Which channels to draw.
++    channels : tuple of int, or None
++        Which channels to draw.  None (the default) draws every channel the
++        file recorded.
+     initial_gate : (gate_min_ns, gate_max_ns) or None
+         Starting gate positions.  If None, defaults are computed from the
+         histogram peak (peak + 1 ns, peak + 21 ns).
+@@ -285,6 +371,7 @@
+     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+ 
+     d = _load(data)
++    channels = _resolve_channels(d, channels)
+ 
+     if initial_gate is None:
+         gate_min_ns, gate_max_ns = _default_gate(d)
+@@ -544,7 +631,7 @@
+ def plot_lifetime_overlay(
+     datasets,
+     n_bins: int = 4096,
+-    channels: tuple[int, ...] = (1, 2),
++    channels: tuple[int, ...] | None = None,
+     show: bool = True,
+     export: bool = False,
+ ) -> tuple[plt.Figure, plt.Axes]:
+@@ -562,8 +649,16 @@
+         Files to overlay (must be non-empty).
+     n_bins : int
+         Histogram bins (must be in _VALID_N_BINS); shared by all files.
+-    channels : tuple of int
+-        Channels to draw for every file.
++    channels : tuple of int, or None
++        Channels to draw for every file.  None (the default) resolves
++        PER FILE, so each dataset contributes the channels it recorded and a
++        mixed selection overlays a single-channel file's one decay alongside a
++        dual-channel file's two.  This differs deliberately from the batch PCH
++        dialog, which takes the intersection across the selection: there one
++        parameter set is applied to every file, whereas here each file is drawn
++        and exported independently, so there is nothing to reconcile.
++        An explicit tuple still applies to every file and is checked against
++        each one.
+ 
+     Returns
+     -------
+@@ -574,8 +669,6 @@
+         raise ValueError("plot_lifetime_overlay requires at least one dataset.")
+     if n_bins not in _VALID_N_BINS:
+         raise ValueError(f"n_bins must be one of {_VALID_N_BINS}; got {n_bins}.")
+-    if not channels or not all(c in (1, 2) for c in channels):
+-        raise ValueError("channels must be a non-empty tuple containing 1, 2, or both.")
+ 
+     colours = fcs_plottools.palette(len(datasets))
+     fig, ax = plt.subplots(figsize=(9, 4.5))
+@@ -584,19 +677,21 @@
+     nonzero_mins: list[float] = []
+     period_max = 0.0
+ 
++    # Resolve once per file so a mixed selection works; drawn_channels is the
++    # union actually plotted, used for the marker legend below.
++    drawn_channels: list[int] = []
++
+     for d, colour in zip(datasets, colours):
+         period_max = max(period_max, d.laser_period_ns)
+         first = True
+-        time_ns_export = None
+-        export_cols: dict[str, np.ndarray] = {}
++        file_channels = _resolve_channels(d, channels)
+ 
+-        for ch in channels:
++        for ch in file_channels:
+             bin_times_ns, counts = d.lifetime_histogram(channel=ch, n_bins=n_bins)
+-            if time_ns_export is None:
+-                time_ns_export = bin_times_ns
+-            export_cols[f"ch{ch}_counts"] = counts
+             if counts.sum() == 0:
+                 continue
++            if ch not in drawn_channels:
++                drawn_channels.append(ch)
+             peak_counts.append(int(counts.max()))
+             nz = counts[counts > 0]
+             if len(nz):
+@@ -609,18 +704,16 @@
+             )
+             first = False
+ 
+-        if export and time_ns_export is not None:
+-            fcs_export.safe_export(
+-                d, "lifetime",
+-                {"time_ns": time_ns_export, **export_cols},
+-                meta={
+-                    "n_bins":          n_bins,
+-                    "bin_width_ps":    f"{d.laser_period_ns / n_bins * 1000:.4f}",
+-                    "laser_period_ns": f"{d.laser_period_ns:.4f}",
+-                    "channels":        "+".join(f"Ch{c}" for c in channels),
+-                },
+-                suffix=f"{n_bins}bins",
+-            )
++        if export:
++            time_ns_export, export_cols = _lifetime_export_columns(
++                d, n_bins, file_channels)
++            if time_ns_export is not None:
++                fcs_export.safe_export(
++                    d, "lifetime",
++                    {"time_ns": time_ns_export, **export_cols},
++                    meta=_lifetime_export_meta(d, n_bins, file_channels),
++                    suffix=f"{n_bins}bins",
++                )
+ 
+     ax.set_yscale("log")
+     if peak_counts:
+@@ -631,7 +724,8 @@
+     ax.set_ylabel("Photon counts", fontsize=12)
+ 
+     ch_note = "   ·   ".join(
+-        f"{_CH_MARKER[c]} = Ch{c}" for c in channels if c in _CH_MARKER
++        f"{_CH_MARKER[c]} = Ch{c}" for c in sorted(drawn_channels)
++        if c in _CH_MARKER
+     )
+     ax.set_title(
+         f"TCSPC decay overlay — {len(datasets)} files  ·  {_format_n_bins(n_bins)}\n"

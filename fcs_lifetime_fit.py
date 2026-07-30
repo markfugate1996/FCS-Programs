@@ -498,15 +498,27 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
     body.pack(fill="x")
 
     # Channel — photon data has Ch1/Ch2; an .ifx decay is a single curve.
-    ch_var = tk.IntVar(value=1)
+    # For photon data the choice is limited to the channels the file actually
+    # recorded: a single-channel acquisition has no decay to fit on the other
+    # detector, and offering it would produce a fit to an empty histogram.
+    available_ch = tuple(getattr(fcs_data, "channels", (1, 2)))
+    ch_var = tk.IntVar(value=(available_ch[0] if available_ch else 1))
     tk.Label(body, text="Channel:", anchor="w").grid(row=0, column=0, sticky="w", pady=3)
     if is_lt:
         tk.Label(body, text="decay (.ifx)", anchor="w").grid(row=0, column=1, sticky="w")
     else:
         ch_frame = tk.Frame(body)
         ch_frame.grid(row=0, column=1, sticky="w")
-        tk.Radiobutton(ch_frame, text="Ch1", variable=ch_var, value=1).pack(side="left")
-        tk.Radiobutton(ch_frame, text="Ch2", variable=ch_var, value=2).pack(side="left")
+        for _ch in (1, 2):
+            _rb = tk.Radiobutton(ch_frame, text=f"Ch{_ch}",
+                                 variable=ch_var, value=_ch)
+            if _ch not in available_ch:
+                _rb.configure(state="disabled")
+            _rb.pack(side="left")
+        if len(available_ch) < 2:
+            tk.Label(ch_frame,
+                     text=f"({getattr(fcs_data, 'channel_summary', 'one channel')})",
+                     font=("Helvetica", 8), fg="grey").pack(side="left", padx=(6, 0))
 
     # Bins — only meaningful for photon data; an .ifx decay is already binned.
     bin_var = tk.IntVar(value=4096)
@@ -582,7 +594,22 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
         # Remember this window so the next dataset opens pre-filled with it.
         _last_fit_window["start"], _last_fit_window["end"] = lo, hi
         channel = ch_var.get()
-        
+
+        # Robustness net.  The radio for a channel this file lacks is disabled
+        # above, so this should be unreachable from the GUI; it is kept for the
+        # paths that bypass the greying-out (a programmatic caller, or a future
+        # edit that adds a channel control without consulting available_ch).
+        # Fitting an absent channel would otherwise fit an empty histogram and
+        # report a lifetime with no data behind it.
+        if not is_lt and channel not in available_ch:
+            messagebox.showerror(
+                "Channel not available",
+                f"{fcs_data.filepath.name} recorded "
+                f"{getattr(fcs_data, 'channel_summary', 'one channel')}; "
+                f"there is no Ch{channel} decay to fit.",
+                parent=win)
+            return
+
         n_bins  = _nbins()
         t_ns, counts = fcs_data.lifetime_histogram(channel=channel, n_bins=n_bins)
         win.destroy()
@@ -790,10 +817,17 @@ if __name__ == "__main__":
 
     path = Path(sys.argv[1])
     key  = sys.argv[2] if len(sys.argv) > 2 else fcs_models.list_lifetime_models()[0].key
-    ch   = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    ch   = int(sys.argv[3]) if len(sys.argv) > 3 else None
     model = fcs_models.get_lifetime_model(key)
 
     d = read_fcs(path)
+    # Default to the first channel the file recorded rather than a hard-coded
+    # Ch1, so a Ch2-only file works without having to name the channel.
+    if ch is None:
+        ch = d.channels[0]
+    elif ch not in d.channels:
+        sys.exit(f"{path.name} recorded {d.channel_summary}; "
+                 f"there is no Ch{ch} decay to fit.")
     t_ns, counts = d.lifetime_histogram(channel=ch, n_bins=4096)
     lo, hi = default_window(d, ch, 4096)
     t_, c_, trel = prepare_decay(t_ns, counts, lo, hi)
