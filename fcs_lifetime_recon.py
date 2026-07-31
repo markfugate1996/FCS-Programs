@@ -52,11 +52,14 @@ import fcs_lifetime_models
 from fcs_lifetime_models import LifetimeModel
 from fcs_ifx import LifetimeData
 
+import fcs_export
+
 from fcs_fitcommon import (
     fits_dir as _fits_dir,
     new_fit_dir as _new_fit_dir,
     fmt_bound as _fmt,
     parse_bound as _parse_bound,
+    slug_name as _slug_name,
 )
 
 # ── IRF preparation ───────────────────────────────────────────────────────────
@@ -371,12 +374,22 @@ def _jacobian_errors(sol, n_points: int, n_free: int) -> np.ndarray:
 
 def _derived_lifetimes(model: LifetimeModel, values: Dict[str, float]) -> dict:
     """
-    Compute fractional intensity contributions and mean lifetimes from the
-    fitted amplitudes/lifetimes.
+    Compute fractional contributions and mean lifetimes from the fitted
+    amplitudes/lifetimes.
 
-        fᵢ = aᵢτᵢ / Σ aⱼτⱼ                 fractional intensity
+        αᵢ = aᵢ / Σ aⱼ                     fractional AMPLITUDE
+        fᵢ = aᵢτᵢ / Σ aⱼτⱼ                 fractional INTENSITY
         ⟨τ⟩_amp = Σ aᵢτᵢ / Σ aᵢ           amplitude-weighted mean
         ⟨τ⟩_int = Σ aᵢτᵢ² / Σ aᵢτᵢ        intensity-weighted mean
+
+    Both fractions are reported because they answer different questions and a
+    fit can make them diverge sharply.  α is proportional to the NUMBER of
+    emitters in that state (each contributes aᵢ at t = 0); f is the share of
+    the emitted PHOTONS, since an exponential's integrated area is aᵢτᵢ.  A
+    dim long-lived species and a bright short-lived one can be 90/10 by
+    amplitude and 45/55 by intensity, so quoting one unlabelled "fraction"
+    invites the wrong reading.  This matches the tail fitter in
+    fcs_lifetime_fit.component_fractions.
     """
     amps = np.array([values[a] for a in model.amp_names], dtype=np.float64)
     taus = np.array([values[t] for t in model.tau_names], dtype=np.float64)
@@ -384,10 +397,12 @@ def _derived_lifetimes(model: LifetimeModel, values: Dict[str, float]) -> dict:
     sum_a = float(np.sum(amps))
     sum_at = float(np.sum(at))
     fracs = (at / sum_at) if sum_at > 0 else np.full_like(at, np.nan)
+    alphas = (amps / sum_a) if sum_a > 0 else np.full_like(amps, np.nan)
     tau_amp = (sum_at / sum_a) if sum_a > 0 else float("nan")
     tau_int = (float(np.sum(amps * taus ** 2)) / sum_at) if sum_at > 0 else float("nan")
     return {
         "fractions": {model.tau_names[i]: float(fracs[i]) for i in range(len(taus))},
+        "alphas": {model.tau_names[i]: float(alphas[i]) for i in range(len(taus))},
         "tau_mean_amp": tau_amp,
         "tau_mean_int": tau_int,
     }
@@ -438,9 +453,17 @@ def plot_lifetime_fit(
         tv, te = result["values"][tn], result["errors"][tn]
         tag = "  (fixed)" if result["fixed"].get(tn) else f" ± {te:.3g}"
         frac = result["derived"]["fractions"].get(tn, float("nan"))
-        lines.append(f"τ{i+1} = {tv:.3g}{tag} ns   (f={frac:.2f})")
+        if model.n_exp > 1:
+            # α = amplitude fraction (molecules), f = intensity fraction
+            # (photons).  Both, because they are not interchangeable.
+            alpha = result["derived"].get("alphas", {}).get(tn, float("nan"))
+            lines.append(f"τ{i+1} = {tv:.3g}{tag} ns   "
+                         f"(α={alpha:.2f}, f={frac:.2f})")
+        else:
+            lines.append(f"τ{i+1} = {tv:.3g}{tag} ns")
     if model.n_exp > 1:
         lines.append(f"⟨τ⟩amp = {result['derived']['tau_mean_amp']:.3g} ns")
+        lines.append(f"⟨τ⟩int = {result['derived']['tau_mean_int']:.3g} ns")
     bgv = result["values"].get("bg", 0.0)
     lines.append(f"bg = {bgv:.3g} cnt")
     if not result["fixed"].get("shift", True):
@@ -485,17 +508,45 @@ def plot_lifetime_fit(
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
-def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
+def _recon_file_stem(name_override: Optional[str] = None,
+                     when: Optional[datetime] = None) -> str:
     """
-    Write a human-readable .txt report plus a .csv of the fitted curve.
+    Shared stem for one reconvolution fit's output files.
 
-    Returns ``(report_path, curve_path)``.
+    Mirrors fcs_fit._fit_file_stem and fcs_lifetime_fit._lifetime_file_stem:
+    timestamp, then the user's label.  The default tag says WHICH fitter
+    produced the files, because a reconvolution fit and a tail fit of the same
+    decay are different analyses that can easily end up side by side.
+    """
+    stamp = (when or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    slug = _slug_name(name_override)
+    return f"{stamp}_{slug}" if slug else f"reconvfit_{stamp}"
+
+
+def export_lifetime_fit(result: dict, source_path: str | Path,
+                        name_override: Optional[str] = None,
+                        ) -> Tuple[Path, Path, Path]:
+    """
+    Write a reconvolution fit's report (.txt), fitted curve (.csv) and
+    parameter table (.csv + .xlsx).
+
+    Returns ``(report_path, curve_path, params_path)``.
+
+    Both the folder and the filenames carry the timestamp and, when given,
+    *name_override*, exactly as the correlation and tail-fit exports do.  The
+    files used to be named lifetime_fit_report.txt / lifetime_fit_curve.csv --
+    identical for every fit AND identical to what the tail fitter wrote, so
+    two different analyses of the same decay produced indistinguishable
+    filenames.
     """
     source_path = Path(source_path)
     model = result["model"]
-    out_dir = _new_fit_dir(source_path)
-    report_path = out_dir / "lifetime_fit_report.txt"
-    curve_path  = out_dir / "lifetime_fit_curve.csv"
+    out_dir = _new_fit_dir(source_path, name_override)
+    stem = _recon_file_stem(name_override)
+    report_path = out_dir / f"{stem}_report.txt"
+    curve_path  = out_dir / f"{stem}_curve.csv"
+    params_path = out_dir / f"{stem}_params.csv"
+    xlsx_path   = out_dir / f"{stem}_params.xlsx"
 
 
     der = result["derived"]
@@ -528,11 +579,23 @@ def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Pa
     L.append("")
     L.append("Derived")
     L.append("-" * 60)
-    for tn in model.tau_names:
-        L.append(f"  fractional intensity f({tn}) : {der['fractions'].get(tn, float('nan')):.4f}")
     if model.n_exp > 1:
+        L.append("  alpha = a_i / sum(a)        amplitude fraction "
+                 "(fraction of molecules)")
+        L.append("  f     = a_i t_i / sum(a t)  intensity fraction "
+                 "(fraction of photons)")
+        L.append("")
+        L.append(f"{'component':<12}{'alpha':>12}{'f':>12}")
+        for i, tn in enumerate(model.tau_names):
+            L.append(f"{tn:<12}"
+                     f"{der.get('alphas', {}).get(tn, float('nan')):>12.4f}"
+                     f"{der['fractions'].get(tn, float('nan')):>12.4f}")
+        L.append("")
         L.append(f"  amplitude-weighted <tau>   : {der['tau_mean_amp']:.4f} ns")
         L.append(f"  intensity-weighted <tau>   : {der['tau_mean_int']:.4f} ns")
+    else:
+        L.append(f"  lifetime                   : "
+                 f"{result['values'][model.tau_names[0]]:.4f} ns")
     L.append("")
     L.append("Goodness of fit")
     L.append("-" * 60)
@@ -559,11 +622,95 @@ def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Pa
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
         fh.write(",".join(names) + "\n")
         for row in zip(*(cols[n] for n in names)):
-            fh.write(",".join(f"{v:.10g}" for v in row) + "\n")
+            fh.write(",".join(fcs_export._csv_value(v) for v in row) + "\n")
 
-    print(f"[lifetime] wrote {report_path}")
-    print(f"[lifetime] wrote {curve_path}")
-    return report_path, curve_path
+    print(f"[reconv fit] wrote {report_path}")
+    print(f"[reconv fit] wrote {curve_path}")
+
+    # ── Wide parameter table (one row) for spreadsheets ──────────────────────
+    # Same shape as the global fit and the tail fit: one row per fitted
+    # dataset, each parameter a value + error pair with the "_err" suffix used
+    # throughout the suite, so a series of fits concatenates into a table you
+    # can plot a parameter against a variable from.
+    der = result["derived"]
+    win = result.get("fit_window_ns")
+
+    p_header = ["dataset", "model", "n_exp", "irf",
+                "fit_start_ns", "fit_end_ns"]
+    for nm in result["names"]:
+        p_header += [nm, f"{nm}_err"]
+    if model.n_exp > 1:
+        for i in range(len(model.tau_names)):
+            p_header += [f"alpha{i + 1}", f"f{i + 1}"]
+        p_header += ["tau_mean_amp_ns", "tau_mean_int_ns"]
+    p_header += ["weighted", "r2", "chi2", "red_chi2", "n_points", "dof"]
+
+    row: list = [
+        source_path.name,
+        model.key,
+        int(model.n_exp),
+        "measured" if result["has_irf"] else "none",
+        float(win[0]) if win is not None else float("nan"),
+        float(win[1]) if win is not None else float("nan"),
+    ]
+    for nm in result["names"]:
+        row.append(float(result["values"][nm]))
+        # Fixed parameters have no fitted error.  NaN, not 0: it writes as a
+        # blank cell and reads back as "not estimated" rather than "estimated
+        # to be exactly zero".
+        row.append(float("nan") if result["fixed"].get(nm)
+                   else float(result["errors"][nm]))
+    if model.n_exp > 1:
+        for tn in model.tau_names:
+            row.append(float(der.get("alphas", {}).get(tn, float("nan"))))
+            row.append(float(der["fractions"].get(tn, float("nan"))))
+        row.append(float(der["tau_mean_amp"]))
+        row.append(float(der["tau_mean_int"]))
+    row += [
+        "yes" if result["weighted"] else "no",
+        float(result["r2"]),
+        float(result["chi2"]),
+        float(result["red_chi2"]),
+        int(result["n_points"]),
+        int(result["dof"]),
+    ]
+
+    # Distinct keys, not several lines all called "note": read_export parses
+    # "# key : value" into a dict, so repeated keys overwrite each other.
+    comments: list[str] = []
+    comments.append("Lifetime reconvolution fit - parameter table")
+    comments.append(f"source : {source_path.name}")
+    comments.append(f"model : {model.name} [{model.key}]")
+    comments.append(f"formula : {model.formula}")
+    comments.append(f"fit_type : {'reconvolution (measured IRF)' if result['has_irf'] else 'tail (no IRF)'}")
+    comments.append(f"exported : {datetime.now().isoformat(timespec='seconds')}")
+    comments.append(f"weighted : {'yes (Poisson sigma = sqrt(N))' if result['weighted'] else 'no'}")
+    fixed_names = [nm for nm in result["names"] if result["fixed"].get(nm)]
+    comments.append(f"fixed : {', '.join(fixed_names) if fixed_names else '(none)'}")
+    comments.append("units : tau and shift in ns, fit window in ns")
+    comments.append("note_fixed : blank *_err means the parameter was held fixed")
+    if model.n_exp > 1:
+        comments.append("note_alpha : alpha_i = a_i / sum(a) - amplitude "
+                        "fraction (fraction of molecules)")
+        comments.append("note_f : f_i = a_i*tau_i / sum(a*tau) - intensity "
+                        "fraction (fraction of photons)")
+        comments.append("note_components : alpha_i / f_i are indexed in the "
+                        "order " + ", ".join(model.tau_names))
+
+    with params_path.open("w", encoding="utf-8", newline="") as fh:
+        for line in comments:
+            fh.write(f"# {line}\n")
+        fh.write(",".join(p_header) + "\n")
+        fh.write(",".join(
+            fcs_export._csv_value(v) if isinstance(v, float) else str(v)
+            for v in row) + "\n")
+    print(f"[reconv fit] wrote {params_path}")
+
+    fcs_export.write_table_xlsx(
+        xlsx_path, comments, p_header, [row],
+        sheet_title="fit parameters", log_tag="reconv fit")
+
+    return report_path, curve_path, params_path
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -727,6 +874,27 @@ def _lifetime_setup_dialog(parent, model: LifetimeModel, data: LifetimeData):
         font=("Helvetica", 8), fg="grey", justify="left",
     ).pack(fill="x", padx=12, pady=(0, 2))
 
+    # Optional label folded into the fit folder and the output filenames, so a
+    # set of fits can be told apart in a file listing (and in Excel's window
+    # list) without opening them.  Same control and behaviour as the
+    # correlation and tail-fit dialogs.
+    name_row = tk.Frame(win)
+    name_row.pack(fill="x", padx=12, pady=(8, 0))
+    tk.Label(name_row, text="Save as:", anchor="w",
+             font=("Helvetica", 9)).pack(side="left")
+    name_var = tk.StringVar(value="")
+    tk.Entry(name_row, textvariable=name_var,
+             font=("Helvetica", 9)).pack(side="left", fill="x", expand=True,
+                                         padx=(4, 0))
+    tk.Label(
+        win,
+        text=("      optional label; added after the timestamp, in both the\n"
+              "      folder and the filenames, e.g.\n"
+              "      2026-07-23_14-25-30_«myLabel»/"
+              "20260723_142530_«myLabel»_params.csv"),
+        font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
+    ).pack(fill="x", padx=12)
+
     btns = tk.Frame(win)
     btns.pack(pady=10)
     
@@ -776,9 +944,13 @@ def _lifetime_setup_dialog(parent, model: LifetimeModel, data: LifetimeData):
             messagebox.showerror("Fit failed", str(e), parent=win)
             return
 
+        # Read the label BEFORE destroying the window: the StringVar outlives
+        # the widget, but reading it first keeps the dependency obvious.
+        fit_label = name_var.get()
         win.destroy()
 
-        report_path, _curve = export_lifetime_fit(result, data.filepath)
+        report_path, _curve, _params = export_lifetime_fit(
+            result, data.filepath, fit_label)
         fig, _axes = plot_lifetime_fit(result, data.filepath.name, show=False)
         try:
             fig.savefig(report_path.with_suffix(".png"), dpi=150)

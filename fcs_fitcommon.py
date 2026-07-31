@@ -44,6 +44,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 
 # ── Output directories ────────────────────────────────────────────────────────
@@ -70,21 +71,52 @@ def fits_dir(source_path: Path) -> Path:
     return out
 
 
-def new_fit_dir(source_path: Path) -> Path:
+def slug_name(text: Optional[str]) -> str:
+    """
+    Reduce a user-supplied label to a filesystem-safe token.
+
+    Letters, digits, '-' and '_' survive; everything else becomes '_', runs of
+    underscores collapse, and the result is trimmed to 60 characters so a long
+    label cannot push a path past the filesystem limit.  Returns "" for None or
+    for text that contains nothing usable, which every caller treats as
+    "no label given".
+    """
+    if not text:
+        return ""
+    out = []
+    for ch in str(text).strip():
+        out.append(ch if (ch.isalnum() or ch in "-_") else "_")
+    slug = "".join(out).strip("_")
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug[:60]
+
+
+def new_fit_dir(source_path: Path, name: Optional[str] = None) -> Path:
     """
     Create and return a fresh, uniquely-named subfolder inside the shared
     'fits' directory for ONE export.
 
-    The folder name is just the export timestamp; sample, model and parameter
-    detail lives inside the files.  A numeric suffix is appended if two exports
-    land in the same second.
+    The folder name is the export timestamp, followed by the user's label if
+    one was given::
+
+        fits/2026-07-31_14-25-30/                 (no label)
+        fits/2026-07-31_14-25-30_titration_5uM/   (label "titration 5uM")
+
+    Timestamp FIRST so that a plain alphabetical listing is also chronological,
+    which is what makes a fits/ folder with dozens of runs navigable.  The
+    label is what makes a particular run findable within it.
+
+    A numeric suffix is appended if two exports land in the same second.
     """
     fits = fits_dir(source_path)
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out = fits / stamp
+    slug = slug_name(name)
+    base = f"{stamp}_{slug}" if slug else stamp
+    out = fits / base
     n = 2
     while out.exists():                    # avoid same-second clashes
-        out = fits / f"{stamp}_{n}"
+        out = fits / f"{base}_{n}"
         n += 1
     out.mkdir(parents=True, exist_ok=True)
     return out
@@ -169,6 +201,29 @@ def _selftest() -> None:
         b = new_fit_dir(src)
         assert a != b and a.is_dir() and b.is_dir()
         assert a.parent == b.parent == root / "data" / "fits"
+
+        # slug_name
+        assert slug_name(None) == ""
+        assert slug_name("   ") == ""
+        assert slug_name("!!!") == ""
+        assert slug_name("titration 5uM") == "titration_5uM"
+        assert slug_name("a//b  c") == "a_b_c"
+        assert slug_name("keep-me_1") == "keep-me_1"
+        assert len(slug_name("x" * 200)) == 60
+
+        # new_fit_dir folds the label in after the timestamp
+        c = new_fit_dir(src, "titration 5uM")
+        assert c.name.endswith("_titration_5uM"), c.name
+        assert c.is_dir()
+        stamp_part = c.name[: -len("_titration_5uM")]
+        assert len(stamp_part) == len("2026-07-31_14-25-30"), stamp_part
+
+        # a label that slugs to nothing behaves exactly like no label:
+        # bare timestamp, plus only the numeric clash suffix.  (a is the bare
+        # timestamp folder made above, so e collides with it and gets a suffix.)
+        e = new_fit_dir(src, "***")
+        assert e.name.startswith(a.name), e.name
+        assert e.name[len(a.name):].lstrip("_").isdigit(), e.name
 
     print("fcs_fitcommon: all self-tests passed.")
 

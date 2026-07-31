@@ -1,0 +1,74 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -50,6 +50,7 @@
+ from fcs_fitcommon import (
+     fits_dir as _fits_dir,
+     new_fit_dir as _new_fit_dir,
++    slug_name as _slug_name,
+     fmt_bound as _fmt,
+     parse_bound as _parse_bound,
+ )
+@@ -932,23 +933,14 @@
+     path, so comparing two fits meant renaming one by hand first.  A
+     timestamp makes the names unique, and an optional label makes them
+     meaningful.
++
++    Order is timestamp THEN label, matching the fit folder built by
++    fcs_fitcommon.new_fit_dir, so a directory listing sorts chronologically
++    and a file sitting on its own still says when it was made.
+     """
+     stamp = (when or datetime.now()).strftime("%Y%m%d_%H%M%S")
+     slug = _slug_name(name_override)
+-    return f"{slug}_{stamp}" if slug else f"globalfit_{stamp}"
+-
+-
+-def _slug_name(text: Optional[str]) -> str:
+-    """Reduce a user-supplied label to a filesystem-safe token."""
+-    if not text:
+-        return ""
+-    out = []
+-    for ch in str(text).strip():
+-        out.append(ch if (ch.isalnum() or ch in "-_") else "_")
+-    slug = "".join(out).strip("_")
+-    while "__" in slug:
+-        slug = slug.replace("__", "_")
+-    return slug[:60]
++    return f"{stamp}_{slug}" if slug else f"globalfit_{stamp}"
+ 
+ 
+ def export_global_fit(result: dict, out_source: str | Path,
+@@ -962,14 +954,16 @@
+     the right place — the caller passes the first selected correlation CSV, so
+     no .fcs file is required.
+ 
+-    Filenames carry a timestamp, and optionally *name_override*, so that two
+-    fits can be open in Excel at once.  The four files of one fit share a stem
+-    and differ only in their suffix, which is what lets the reopener find a
+-    curves file's matching parameter table.
++    Both the containing folder and the filenames carry the timestamp and,
++    when given, *name_override* -- so a fit is identifiable from the folder
++    listing without opening it, and any file moved out of that folder still
++    carries the label with it.  The four files of one fit share a stem and
++    differ only in their suffix, which is what lets the reopener find a curves
++    file's matching parameter table.
+     """
+     out_source = Path(out_source)
+     model = result["model"]
+-    out_dir = _new_fit_dir(out_source)
++    out_dir = _new_fit_dir(out_source, name_override)
+     stem = _fit_file_stem(name_override)
+     report_path = out_dir / f"{stem}_report.txt"
+     curve_path  = out_dir / f"{stem}_curves.csv"
+@@ -1865,8 +1859,10 @@
+                                          padx=(4, 0))
+     tk.Label(
+         win,
+-        text=("      optional label; a timestamp is always appended, e.g.\n"
+-              "      «myLabel»_20260723_142530_params.csv"),
++        text=("      optional label; added after the timestamp, in both the\n"
++              "      folder and the filenames, e.g.\n"
++              "      2026-07-23_14-25-30_«myLabel»/"
++              "20260723_142530_«myLabel»_params.csv"),
+         font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
+     ).pack(fill="x", padx=12)
+ 

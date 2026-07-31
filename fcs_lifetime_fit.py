@@ -37,6 +37,7 @@ Dependencies
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -54,12 +55,86 @@ from fcs_reader import FCSData
 import fcs_lifetime
 import fcs_fisher
 
+import fcs_export
+
 from fcs_fitcommon import (
     fits_dir as _fits_dir,
     new_fit_dir as _new_fit_dir,
     fmt_bound as _fmt,
     parse_bound as _parse_bound,
+    slug_name as _slug_name,
 )
+
+# ── Multi-component decomposition ─────────────────────────────────────────────
+
+# Multi-exponential models name their parameters A1/tau1, A2/tau2, ...
+_COMPONENT_RE = re.compile(r"^(A|tau)(\d+)$")
+
+
+def component_fractions(values: Dict[str, float],
+                        names) -> Optional[dict]:
+    """
+    Normalised fractional contributions of each component of a multi-
+    exponential decay.
+
+    For a decay I(t) = SUM_i A_i exp(-t / tau_i) there are two different and
+    equally standard ways to say "how much" component i contributes, and they
+    are NOT interchangeable:
+
+    alpha_i = A_i / SUM_j A_j
+        Amplitude (pre-exponential) fraction.  Proportional to the NUMBER of
+        emitters in that state, because each contributes A_i to the decay at
+        t = 0.  This is the one to quote when asking what fraction of the
+        molecules are in a given conformation or binding state.
+
+    f_i = A_i tau_i / SUM_j A_j tau_j
+        Intensity (photon) fraction.  The fraction of the total emitted
+        photons that come from component i, since the integrated area of an
+        exponential is A_i tau_i.  This is what a steady-state intensity
+        measurement is sensitive to, and it is what a bulk fluorimeter would
+        report.
+
+    A dim, long-lived species and a bright, short-lived one can have very
+    different alpha and f, so both are reported and labelled rather than
+    picking one and calling it "the fraction".
+
+    Also returns both mean lifetimes:
+
+        tau_mean_amp = SUM A_i tau_i / SUM A_i          (amplitude-weighted)
+        tau_mean_int = SUM A_i tau_i^2 / SUM A_i tau_i  (intensity-weighted)
+
+    The amplitude-weighted mean is the one proportional to the average time a
+    molecule spends excited, and is what the existing ``tau_mean`` field has
+    always reported.
+
+    Returns None when the decomposition is not meaningful: fewer than two
+    components, a missing A/tau pair, or non-positive amplitudes or lifetimes
+    (which a fit can reach if the bounds permit it, and which would make the
+    fractions meaningless rather than merely imprecise).
+    """
+    idx = sorted({int(m.group(2)) for nm in names
+                  if (m := _COMPONENT_RE.match(nm))})
+    comps = [(i, float(values[f"A{i}"]), float(values[f"tau{i}"]))
+             for i in idx
+             if f"A{i}" in values and f"tau{i}" in values]
+    if len(comps) < 2:
+        return None
+    if any(a <= 0 or t <= 0 for _, a, t in comps):
+        return None
+
+    sum_a  = sum(a for _, a, _ in comps)
+    sum_at = sum(a * t for _, a, t in comps)
+    if sum_a <= 0 or sum_at <= 0:
+        return None
+
+    return {
+        "indices":      [i for i, _, _ in comps],
+        "alpha":        {i: a / sum_a          for i, a, _ in comps},
+        "f":            {i: a * t / sum_at     for i, a, t in comps},
+        "tau_mean_amp": sum_at / sum_a,
+        "tau_mean_int": sum(a * t * t for _, a, t in comps) / sum_at,
+    }
+
 
 # ── Data preparation ──────────────────────────────────────────────────────────
 
@@ -255,12 +330,12 @@ def fit_lifetime(
         chi2 = red_chi2 = float("nan")
 
     # Derived: amplitude-weighted mean lifetime for the two-exponential model.
-    tau_mean = float("nan")
-    if {"A1", "tau1", "A2", "tau2"} <= set(names):
-        a1, t1 = values["A1"], values["tau1"]
-        a2, t2 = values["A2"], values["tau2"]
-        denom = a1 + a2
-        tau_mean = (a1 * t1 + a2 * t2) / denom if denom > 0 else float("nan")
+    # Amplitude-weighted mean lifetime and the per-component fractions.  This
+    # used to test for exactly {A1, tau1, A2, tau2}, so a triple-exponential
+    # fit reported no <tau> at all; component_fractions handles any number of
+    # components and returns None when the decomposition is not meaningful.
+    fractions = component_fractions(values, names)
+    tau_mean  = fractions["tau_mean_amp"] if fractions else float("nan")
 
     return {
         "model": model, "names": names, "free": free,
@@ -276,6 +351,7 @@ def fit_lifetime(
         "channel": channel, "n_bins": n_bins,
         "fit_start_ns": float(fit_start_ns), "fit_end_ns": float(fit_end_ns),
         "drop_edges": drop_edges, "tau_mean": tau_mean,
+        "fractions": fractions,
     }
 
 
@@ -314,8 +390,20 @@ def plot_lifetime_fit(
         unit = next((p.unit for p in model.params if p.name == n), "")
         tag = "  (fixed)" if result["fixed"].get(n) else f" ± {err:.3g}"
         lines.append(f"{n} = {val:.4g}{tag} {unit}".rstrip())
+    # Normalised component fractions, one compact row per component:
+    #   α = amplitude fraction (fraction of MOLECULES)
+    #   f = intensity fraction (fraction of PHOTONS)
+    # Both on one line so a triple exponential adds three rows, not six.
+    fr = result.get("fractions")
+    if fr:
+        lines.append("")
+        lines.append("α = amplitude, f = intensity")
+        for i in fr["indices"]:
+            lines.append(f"  {i}: α = {fr['alpha'][i]:.3f}   f = {fr['f'][i]:.3f}")
     if np.isfinite(result.get("tau_mean", float("nan"))):
-        lines.append(f"⟨τ⟩ = {result['tau_mean']:.4g} ns")
+        lines.append(f"⟨τ⟩ = {result['tau_mean']:.4g} ns  (ampl.)")
+    if fr:
+        lines.append(f"⟨τ⟩ = {fr['tau_mean_int']:.4g} ns  (int.)")
     gof = (f"red. χ² = {result['red_chi2']:.3g}"
            if result["weighted"] else f"R² = {result['r2']:.4f}")
     lines.append(gof)
@@ -356,17 +444,44 @@ def plot_lifetime_fit(
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
-def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
+def _lifetime_file_stem(name_override: Optional[str] = None,
+                        when: Optional[datetime] = None) -> str:
     """
-    Write a human-readable .txt report plus a .csv of the fitted curve to the
-    'fits' folder.  Returns (report_path, curve_path).
+    Shared stem for one lifetime fit's output files.
+
+    Mirrors fcs_fit._fit_file_stem: timestamp, then the user's label.  The
+    files used to be named lifetime_fit_report.txt / lifetime_fit_curve.csv,
+    identical for every fit and distinguished only by their folder -- which
+    Excel cannot cope with, since it refuses to hold two workbooks of the same
+    filename open at once regardless of path.  That was harmless while lifetime
+    fits wrote no spreadsheet; it stops being harmless now that they do.
+    """
+    stamp = (when or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    slug = _slug_name(name_override)
+    return f"{stamp}_{slug}" if slug else f"lifetimefit_{stamp}"
+
+
+def export_lifetime_fit(result: dict, source_path: str | Path,
+                        name_override: Optional[str] = None,
+                        ) -> Tuple[Path, Path, Path]:
+    """
+    Write a lifetime fit's report (.txt), fitted curve (.csv) and parameter
+    table (.csv + .xlsx) to the 'fits' folder.
+
+    Returns (report_path, curve_path, params_path).
+
+    Both the folder and the filenames carry the timestamp and, when given,
+    *name_override*, exactly as the correlation global fit does.
     """
     source_path = Path(source_path)
     model = result["model"]
-    out_dir = _new_fit_dir(source_path)
+    out_dir = _new_fit_dir(source_path, name_override)
+    stem = _lifetime_file_stem(name_override)
     ch = result.get("channel")
-    report_path = out_dir / "lifetime_fit_report.txt"
-    curve_path  = out_dir / "lifetime_fit_curve.csv"
+    report_path = out_dir / f"{stem}_report.txt"
+    curve_path  = out_dir / f"{stem}_curve.csv"
+    params_path = out_dir / f"{stem}_params.csv"
+    xlsx_path   = out_dir / f"{stem}_params.xlsx"
 
     # ── Report ────────────────────────────────────────────────────────────────
     L: list[str] = []
@@ -401,10 +516,26 @@ def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Pa
         bnd = f"[{_fmt(lo)}, {_fmt(hi)}]"
         L.append(f"{n:<8}{val:>14.6g}{err_str}  {p_unit:<7} "
                  f"{bnd:>22}  {'yes' if is_fixed else 'no'}")
+    fr = result.get("fractions")
+    if fr:
+        L.append("")
+        L.append("Normalised component fractions")
+        L.append("-" * 60)
+        L.append("  α = A_i / ΣA        amplitude fraction  (fraction of molecules)")
+        L.append("  f = A_i τ_i / ΣAτ   intensity fraction  (fraction of photons)")
+        L.append("")
+        L.append(f"{'comp':<8}{'alpha':>12}{'f':>12}{'A':>14}{'tau (ns)':>14}")
+        for i in fr["indices"]:
+            L.append(f"{i:<8}{fr['alpha'][i]:>12.4f}{fr['f'][i]:>12.4f}"
+                     f"{result['values'][f'A{i}']:>14.6g}"
+                     f"{result['values'][f'tau{i}']:>14.6g}")
     if np.isfinite(result.get("tau_mean", float("nan"))):
         L.append("")
         L.append(f"derived    : amplitude-weighted mean lifetime "
                  f"⟨τ⟩ = {result['tau_mean']:.6g} ns")
+        if fr:
+            L.append(f"             intensity-weighted mean lifetime "
+                     f"⟨τ⟩ = {fr['tau_mean_int']:.6g} ns")
     L.append("")
     L.append("Goodness of fit")
     L.append("-" * 60)
@@ -445,7 +576,95 @@ def export_lifetime_fit(result: dict, source_path: str | Path) -> Tuple[Path, Pa
 
     print(f"[lifetime fit] wrote {report_path}")
     print(f"[lifetime fit] wrote {curve_path}")
-    return report_path, curve_path
+
+    # ── Wide parameter table (one row) for spreadsheets ──────────────────────
+    # Same shape as the global fit's *_params.csv: one row per fitted dataset,
+    # each parameter a value + error pair with the "_err" suffix used
+    # throughout the suite.  A lifetime fit is a single dataset, so there is
+    # one row -- which is exactly what makes these files worth concatenating
+    # across a series to plot a parameter against a variable.
+    p_header = ["dataset", "channel", "model", "n_bins",
+                "fit_start_ns", "fit_end_ns"]
+    for nm in result["names"]:
+        p_header += [nm, f"{nm}_err"]
+
+    fr = result.get("fractions")
+    if fr:
+        for i in fr["indices"]:
+            p_header += [f"alpha{i}", f"f{i}"]
+        p_header += ["tau_mean_amp_ns", "tau_mean_int_ns"]
+
+    p_header += ["weighted", "r2", "chi2", "red_chi2", "n_points", "dof"]
+
+    row: list = [
+        source_path.name,
+        (f"Ch{ch}" if ch is not None else ""),
+        model.key,
+        (int(result["n_bins"]) if result.get("n_bins") is not None else ""),
+        float(result["fit_start_ns"]),
+        float(result["fit_end_ns"]),
+    ]
+    for nm in result["names"]:
+        row.append(float(result["values"][nm]))
+        # A fixed parameter has no fitted error.  NaN, not 0: openpyxl renders
+        # it as an empty cell and read_export maps a blank back to NaN, so it
+        # round-trips as "not estimated" rather than "estimated to be zero".
+        row.append(float("nan") if result["fixed"].get(nm)
+                   else float(result["errors"][nm]))
+    if fr:
+        for i in fr["indices"]:
+            row.append(float(fr["alpha"][i]))
+            row.append(float(fr["f"][i]))
+        row.append(float(fr["tau_mean_amp"]))
+        row.append(float(fr["tau_mean_int"]))
+    row += [
+        "yes" if result["weighted"] else "no",
+        float(result["r2"]),
+        float(result["chi2"]) if result["weighted"] else float("nan"),
+        float(result["red_chi2"]) if result["weighted"] else float("nan"),
+        int(result["n_points"]),
+        int(result["dof"]),
+    ]
+
+    comments: list[str] = []
+    comments.append("Lifetime fit - parameter table")
+    comments.append(f"source : {source_path.name}")
+    comments.append(f"model : {model.name} [{model.key}]")
+    comments.append(f"formula : {model.formula}")
+    comments.append(f"exported : {datetime.now().isoformat(timespec='seconds')}")
+    comments.append(f"weighted : {'yes (Poisson sigma = sqrt(counts))' if result['weighted'] else 'no'}")
+    fixed_names = [nm for nm in result["names"] if result["fixed"].get(nm)]
+    comments.append(f"fixed : {', '.join(fixed_names) if fixed_names else '(none)'}")
+    comments.append("units : tau in ns, fit window in ns")
+    # Distinct keys, not four lines all called "note".  fcs_export.read_export
+    # parses "# key : value" into a dict, so repeated keys overwrite each other
+    # and only the last note would survive a round trip.
+    comments.append("note_fixed : blank *_err means the parameter was held fixed")
+    if fr:
+        comments.append("note_alpha : alpha_i = A_i / sum(A) - amplitude "
+                        "fraction (fraction of molecules)")
+        comments.append("note_f : f_i = A_i*tau_i / sum(A*tau) - intensity "
+                        "fraction (fraction of photons)")
+        comments.append("note_tau_mean : tau_mean_amp = sum(A*tau)/sum(A) ; "
+                        "tau_mean_int = sum(A*tau^2)/sum(A*tau)")
+
+    def _csv_cell(v) -> str:
+        if isinstance(v, float):
+            return "" if not np.isfinite(v) else f"{v:.10g}"
+        return str(v)
+
+    with params_path.open("w", encoding="utf-8", newline="") as fh:
+        for line in comments:
+            fh.write(f"# {line}\n")
+        fh.write(",".join(p_header) + "\n")
+        fh.write(",".join(_csv_cell(v) for v in row) + "\n")
+    print(f"[lifetime fit] wrote {params_path}")
+
+    fcs_export.write_table_xlsx(
+        xlsx_path, comments, p_header, [row],
+        sheet_title="fit parameters", log_tag="lifetime fit")
+
+    return report_path, curve_path, params_path
 
 # ── GUI: entry point and dialogs ──────────────────────────────────────────────
 
@@ -736,6 +955,27 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
         variable=weight_var, anchor="w",
     ).pack(fill="x", padx=12, pady=(6, 0))
 
+    # Optional label folded into the fit folder and the output filenames, so a
+    # set of fits can be told apart in a file listing (and in Excel's window
+    # list) without opening them.  Same control, wording and behaviour as the
+    # correlation fit dialog.
+    name_row = tk.Frame(win)
+    name_row.pack(fill="x", padx=12, pady=(8, 0))
+    tk.Label(name_row, text="Save as:", anchor="w",
+             font=("Helvetica", 9)).pack(side="left")
+    name_var = tk.StringVar(value="")
+    tk.Entry(name_row, textvariable=name_var,
+             font=("Helvetica", 9)).pack(side="left", fill="x", expand=True,
+                                         padx=(4, 0))
+    tk.Label(
+        win,
+        text=("      optional label; added after the timestamp, in both the\n"
+              "      folder and the filenames, e.g.\n"
+              "      2026-07-23_14-25-30_«myLabel»/"
+              "20260723_142530_«myLabel»_params.csv"),
+        font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
+    ).pack(fill="x", padx=12)
+
     btns = tk.Frame(win)
     btns.pack(pady=10)
 
@@ -770,9 +1010,13 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
             messagebox.showerror("Fit failed", str(e), parent=win)
             return
 
+        # Read the label BEFORE destroying the window: the StringVar outlives
+        # the widget, but reading it first keeps the dependency obvious.
+        fit_label = name_var.get()
         win.destroy()
 
-        report_path, _curve = export_lifetime_fit(result, fcs_data.filepath)
+        report_path, _curve, _params = export_lifetime_fit(
+            result, fcs_data.filepath, fit_label)
         fig, _axes = plot_lifetime_fit(result, fcs_data.filepath.name, show=False)
         try:
             fig.savefig(report_path.with_suffix(".png"), dpi=150)
@@ -785,7 +1029,12 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
             for n in result["names"]
         )
         if np.isfinite(result.get("tau_mean", float("nan"))):
-            summary += f"\n⟨τ⟩ = {result['tau_mean']:.4g} ns"
+            summary += f"\n⟨τ⟩ = {result['tau_mean']:.4g} ns (amplitude-weighted)"
+        _fr = result.get("fractions")
+        if _fr:
+            summary += "\n" + "   ".join(
+                f"α{i} = {_fr['alpha'][i]:.3f} / f{i} = {_fr['f'][i]:.3f}"
+                for i in _fr["indices"])
         gof = (f"red. χ² = {result['red_chi2']:.3g}"
                if result["weighted"] else f"R² = {result['r2']:.4f}")
         messagebox.showinfo(

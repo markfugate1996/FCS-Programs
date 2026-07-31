@@ -90,6 +90,28 @@ def _slug(text: str) -> str:
     return slug or "data"
 
 
+def _csv_value(v: float) -> str:
+    """
+    Render one numeric cell for the CSV body.
+
+    Non-finite values are written as an EMPTY cell rather than the text "nan"
+    or "inf".  Three reasons, in order of how much they bite:
+
+    * :func:`read_export` already maps a blank cell to ``np.nan``, so blank is
+      exactly what NaN reads back as.  Writing "nan" happened to survive the
+      round trip only because ``float("nan")`` parses -- blank is the format
+      the reader was actually written for.
+    * :func:`write_table_xlsx` has always blanked non-finite floats, because
+      Excel treats "nan" as text and then refuses to plot the column.  The two
+      writers disagreed; a value that vanished in the spreadsheet appeared as
+      a string in the CSV.
+    * NaN is how a column says "no data here" -- a channel the file never
+      recorded, a parameter held fixed, a bin with nothing in it.  A blank
+      reads as absence to a human and to pandas; "nan" reads as a value.
+    """
+    return "" if not np.isfinite(v) else f"{v:.10g}"
+
+
 # ── Core writer ───────────────────────────────────────────────────────────────
 
 def export_columns(
@@ -164,7 +186,7 @@ def export_columns(
                 fh.write(f"# {key} : {val}\n")
         fh.write(",".join(names) + "\n")
         for row in zip(*arrays):
-            fh.write(",".join(f"{v:.10g}" for v in row) + "\n")
+            fh.write(",".join(_csv_value(v) for v in row) + "\n")
 
     return out_path
 

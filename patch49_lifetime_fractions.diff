@@ -1,0 +1,178 @@
+--- a/fcs_lifetime_fit.py
++++ b/fcs_lifetime_fit.py
+@@ -37,6 +37,7 @@
+ 
+ from __future__ import annotations
+ 
++import re
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Dict, Optional, Tuple
+@@ -61,6 +62,77 @@
+     parse_bound as _parse_bound,
+ )
+ 
++# ── Multi-component decomposition ─────────────────────────────────────────────
++
++# Multi-exponential models name their parameters A1/tau1, A2/tau2, ...
++_COMPONENT_RE = re.compile(r"^(A|tau)(\d+)$")
++
++
++def component_fractions(values: Dict[str, float],
++                        names) -> Optional[dict]:
++    """
++    Normalised fractional contributions of each component of a multi-
++    exponential decay.
++
++    For a decay I(t) = SUM_i A_i exp(-t / tau_i) there are two different and
++    equally standard ways to say "how much" component i contributes, and they
++    are NOT interchangeable:
++
++    alpha_i = A_i / SUM_j A_j
++        Amplitude (pre-exponential) fraction.  Proportional to the NUMBER of
++        emitters in that state, because each contributes A_i to the decay at
++        t = 0.  This is the one to quote when asking what fraction of the
++        molecules are in a given conformation or binding state.
++
++    f_i = A_i tau_i / SUM_j A_j tau_j
++        Intensity (photon) fraction.  The fraction of the total emitted
++        photons that come from component i, since the integrated area of an
++        exponential is A_i tau_i.  This is what a steady-state intensity
++        measurement is sensitive to, and it is what a bulk fluorimeter would
++        report.
++
++    A dim, long-lived species and a bright, short-lived one can have very
++    different alpha and f, so both are reported and labelled rather than
++    picking one and calling it "the fraction".
++
++    Also returns both mean lifetimes:
++
++        tau_mean_amp = SUM A_i tau_i / SUM A_i          (amplitude-weighted)
++        tau_mean_int = SUM A_i tau_i^2 / SUM A_i tau_i  (intensity-weighted)
++
++    The amplitude-weighted mean is the one proportional to the average time a
++    molecule spends excited, and is what the existing ``tau_mean`` field has
++    always reported.
++
++    Returns None when the decomposition is not meaningful: fewer than two
++    components, a missing A/tau pair, or non-positive amplitudes or lifetimes
++    (which a fit can reach if the bounds permit it, and which would make the
++    fractions meaningless rather than merely imprecise).
++    """
++    idx = sorted({int(m.group(2)) for nm in names
++                  if (m := _COMPONENT_RE.match(nm))})
++    comps = [(i, float(values[f"A{i}"]), float(values[f"tau{i}"]))
++             for i in idx
++             if f"A{i}" in values and f"tau{i}" in values]
++    if len(comps) < 2:
++        return None
++    if any(a <= 0 or t <= 0 for _, a, t in comps):
++        return None
++
++    sum_a  = sum(a for _, a, _ in comps)
++    sum_at = sum(a * t for _, a, t in comps)
++    if sum_a <= 0 or sum_at <= 0:
++        return None
++
++    return {
++        "indices":      [i for i, _, _ in comps],
++        "alpha":        {i: a / sum_a          for i, a, _ in comps},
++        "f":            {i: a * t / sum_at     for i, a, t in comps},
++        "tau_mean_amp": sum_at / sum_a,
++        "tau_mean_int": sum(a * t * t for _, a, t in comps) / sum_at,
++    }
++
++
+ # ── Data preparation ──────────────────────────────────────────────────────────
+ 
+ def prepare_decay(
+@@ -255,12 +327,12 @@
+         chi2 = red_chi2 = float("nan")
+ 
+     # Derived: amplitude-weighted mean lifetime for the two-exponential model.
+-    tau_mean = float("nan")
+-    if {"A1", "tau1", "A2", "tau2"} <= set(names):
+-        a1, t1 = values["A1"], values["tau1"]
+-        a2, t2 = values["A2"], values["tau2"]
+-        denom = a1 + a2
+-        tau_mean = (a1 * t1 + a2 * t2) / denom if denom > 0 else float("nan")
++    # Amplitude-weighted mean lifetime and the per-component fractions.  This
++    # used to test for exactly {A1, tau1, A2, tau2}, so a triple-exponential
++    # fit reported no <tau> at all; component_fractions handles any number of
++    # components and returns None when the decomposition is not meaningful.
++    fractions = component_fractions(values, names)
++    tau_mean  = fractions["tau_mean_amp"] if fractions else float("nan")
+ 
+     return {
+         "model": model, "names": names, "free": free,
+@@ -276,6 +348,7 @@
+         "channel": channel, "n_bins": n_bins,
+         "fit_start_ns": float(fit_start_ns), "fit_end_ns": float(fit_end_ns),
+         "drop_edges": drop_edges, "tau_mean": tau_mean,
++        "fractions": fractions,
+     }
+ 
+ 
+@@ -314,8 +387,20 @@
+         unit = next((p.unit for p in model.params if p.name == n), "")
+         tag = "  (fixed)" if result["fixed"].get(n) else f" ± {err:.3g}"
+         lines.append(f"{n} = {val:.4g}{tag} {unit}".rstrip())
++    # Normalised component fractions, one compact row per component:
++    #   α = amplitude fraction (fraction of MOLECULES)
++    #   f = intensity fraction (fraction of PHOTONS)
++    # Both on one line so a triple exponential adds three rows, not six.
++    fr = result.get("fractions")
++    if fr:
++        lines.append("")
++        lines.append("α = amplitude, f = intensity")
++        for i in fr["indices"]:
++            lines.append(f"  {i}: α = {fr['alpha'][i]:.3f}   f = {fr['f'][i]:.3f}")
+     if np.isfinite(result.get("tau_mean", float("nan"))):
+-        lines.append(f"⟨τ⟩ = {result['tau_mean']:.4g} ns")
++        lines.append(f"⟨τ⟩ = {result['tau_mean']:.4g} ns  (ampl.)")
++    if fr:
++        lines.append(f"⟨τ⟩ = {fr['tau_mean_int']:.4g} ns  (int.)")
+     gof = (f"red. χ² = {result['red_chi2']:.3g}"
+            if result["weighted"] else f"R² = {result['r2']:.4f}")
+     lines.append(gof)
+@@ -401,10 +486,26 @@
+         bnd = f"[{_fmt(lo)}, {_fmt(hi)}]"
+         L.append(f"{n:<8}{val:>14.6g}{err_str}  {p_unit:<7} "
+                  f"{bnd:>22}  {'yes' if is_fixed else 'no'}")
++    fr = result.get("fractions")
++    if fr:
++        L.append("")
++        L.append("Normalised component fractions")
++        L.append("-" * 60)
++        L.append("  α = A_i / ΣA        amplitude fraction  (fraction of molecules)")
++        L.append("  f = A_i τ_i / ΣAτ   intensity fraction  (fraction of photons)")
++        L.append("")
++        L.append(f"{'comp':<8}{'alpha':>12}{'f':>12}{'A':>14}{'tau (ns)':>14}")
++        for i in fr["indices"]:
++            L.append(f"{i:<8}{fr['alpha'][i]:>12.4f}{fr['f'][i]:>12.4f}"
++                     f"{result['values'][f'A{i}']:>14.6g}"
++                     f"{result['values'][f'tau{i}']:>14.6g}")
+     if np.isfinite(result.get("tau_mean", float("nan"))):
+         L.append("")
+         L.append(f"derived    : amplitude-weighted mean lifetime "
+                  f"⟨τ⟩ = {result['tau_mean']:.6g} ns")
++        if fr:
++            L.append(f"             intensity-weighted mean lifetime "
++                     f"⟨τ⟩ = {fr['tau_mean_int']:.6g} ns")
+     L.append("")
+     L.append("Goodness of fit")
+     L.append("-" * 60)
+@@ -785,7 +886,12 @@
+             for n in result["names"]
+         )
+         if np.isfinite(result.get("tau_mean", float("nan"))):
+-            summary += f"\n⟨τ⟩ = {result['tau_mean']:.4g} ns"
++            summary += f"\n⟨τ⟩ = {result['tau_mean']:.4g} ns (amplitude-weighted)"
++        _fr = result.get("fractions")
++        if _fr:
++            summary += "\n" + "   ".join(
++                f"α{i} = {_fr['alpha'][i]:.3f} / f{i} = {_fr['f'][i]:.3f}"
++                for i in _fr["indices"])
+         gof = (f"red. χ² = {result['red_chi2']:.3g}"
+                if result["weighted"] else f"R² = {result['r2']:.4f}")
+         messagebox.showinfo(
