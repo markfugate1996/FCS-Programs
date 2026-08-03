@@ -23,8 +23,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from fcs_reader import load_dataset, FCSData
 import fcs_plot
 import fcs_lifetime
-import fcs_lifetime_fit
-import fcs_lifetime_recon
 import fcs_corr
 import fcs_pch
 import fcs_fit
@@ -928,67 +926,24 @@ def task_pch():
     fcs_pch.run_pch_dialog(d, export=export_var.get())
 
 def task_model():
-    """Open the matching modelling workflow for the active dataset.
+    """Open the modelling chooser: correlation, lifetime, or PCH.
 
-    Photon data (.fcs) → the correlation / lifetime / PCH chooser in fcs_fit.
-    Lifetime decays (.ifx) → a tail-fit vs IRF-reconvolution chooser, since
-    correlation and PCH need photon records an .ifx file does not carry.
-    No active file → the same chooser with only Correlation enabled.  Saved
-    correlation CSVs carry their own metadata, so modelling them needs no .fcs
+    Every active dataset goes to the same chooser, including .ifx decays and an
+    empty workspace.  The data type is the first question because it is the one
+    the user actually came to answer; anything narrower — which lifetime
+    method, which channel, which file — belongs to the workflow that needs it
+    and is asked there.
+
+    No active file is not a special case any more.  Each fitter reads its own
+    exported CSVs and falls back to a file browser, so modelling needs nothing
     in the workspace — which matters because the .fcs originals are far larger
-    than the exported curves and often are not the copy you have to hand.
-
+    than the exports and often are not the copy you have to hand.
     """
     d = _active_data()
-    if d is None:
-        fcs_fit.run_model_dialog(None, parent=root)
-        return
-    if getattr(d, "kind", None) == "lifetime_decay":
-        _lifetime_method_dialog(d)
-        return
     # Pass the workspace file order so global-fit datasets/rows follow it
     # instead of being listed alphabetically.
     order = [fd.filepath.name for fd in workspace.values()]
     fcs_fit.run_model_dialog(d, parent=root, workspace_order=order)
-
-
-def _lifetime_method_dialog(d):
-    """Choose tail fit (default) vs IRF reconvolution for an .ifx decay."""
-    dialog = tk.Toplevel(root)
-    dialog.title("Model lifetime decay")
-    dialog.resizable(False, False)
-    dialog.grab_set()
-
-    tk.Label(dialog, text="Model lifetime decay",
-             font=("Helvetica", 12, "bold"), pady=8).pack()
-    tk.Label(dialog, text=d.filepath.name,
-             font=("Helvetica", 9), fg="grey").pack()
-
-    has_irf = bool(getattr(d, "has_irf", False))
-    method_var = tk.StringVar(value="tail")
-
-    frame = tk.LabelFrame(dialog, text="Method", padx=12, pady=8)
-    frame.pack(fill="x", padx=14, pady=8)
-    tk.Radiobutton(frame, text="Tail fit  (sum of exponentials, no IRF)",
-                   variable=method_var, value="tail", anchor="w").pack(fill="x")
-    recon_label = ("IRF reconvolution" if has_irf
-                   else "IRF reconvolution  (no IRF in this file)")
-    tk.Radiobutton(frame, text=recon_label,
-                   variable=method_var, value="recon", anchor="w",
-                   state=("normal" if has_irf else "disabled")).pack(fill="x")
-
-    def _go():
-        method = method_var.get()
-        dialog.destroy()
-        if method == "recon":
-            fcs_lifetime_recon.run_reconv_fit_dialog(d, parent=root)
-        else:
-            fcs_lifetime_fit.run_lifetime_fit_dialog(d, parent=root)
-
-    btns = tk.Frame(dialog)
-    btns.pack(pady=10)
-    tk.Button(btns, text="Next →", width=12, command=_go, pady=4).pack(side="left", padx=6)
-    tk.Button(btns, text="Cancel", width=10, command=dialog.destroy, pady=4).pack(side="left", padx=6)
 
 
 def task_calibrate():

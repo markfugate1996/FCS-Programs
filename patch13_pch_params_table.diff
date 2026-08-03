@@ -1,0 +1,126 @@
+--- a/fcs_pch_fit.py
++++ b/fcs_pch_fit.py
+@@ -62,6 +62,7 @@
+     new_fit_dir as _new_fit_dir,
+     fmt_bound as _fmt,
+     parse_bound as _parse_bound,
++    write_params_table as _write_params_table,
+ )
+ 
+ # ── Data preparation ──────────────────────────────────────────────────────────
+@@ -620,15 +621,29 @@
+ 
+ # ── Export ────────────────────────────────────────────────────────────────────
+ 
+-def export_pch_fit(result: dict, source_path: str | Path) -> Tuple[Path, Path]:
+-    """Write a .txt report and a .csv of the fitted PCH to the 'fits' folder."""
++def export_pch_fit(result: dict, source_path: str | Path
++                   ) -> Tuple[Path, Path, Path]:
++    """
++    Write a fit's report (.txt), fitted curve (.csv) and parameter table
++    (.csv + .xlsx) to the 'fits' folder.
++
++    Returns (report_path, curve_path, params_path).
++
++    The parameter table is the artefact the other three fitters have always
++    written and this one did not: a machine-readable row of value/_err pairs
++    that can be collected across fits, plus the .xlsx mirror for reading.  The
++    .txt report is for a human reading ONE fit; a table is what you need when
++    comparing twenty, and re-typing numbers out of report files is how
++    transcription errors get into a figure.
++    """
+     source_path = Path(source_path)
+     model = result["model"]
+-    
++
+     out_dir = _new_fit_dir(source_path)
+     ch = result.get("channel")
+     report_path = out_dir / "pch_fit_report.txt"
+     curve_path  = out_dir / "pch_fit_curve.csv"
++    params_path = out_dir / "pch_fit_params.csv"
+ 
+ 
+ 
+@@ -724,7 +739,72 @@
+ 
+     print(f"[pch fit] wrote {report_path}")
+     print(f"[pch fit] wrote {curve_path}")
+-    return report_path, curve_path
++
++    # ── Parameter table (.csv + .xlsx) ────────────────────────────────────────
++    # Column order mirrors the lifetime and correlation tables: identifying
++    # columns, then every model parameter as a value/_err pair, then derived
++    # quantities, then goodness of fit.  A reader who knows one of these tables
++    # knows all of them.
++    p_header: list = ["source", "channel", "model", "bin_width_s",
++                      "sampled_bins_M"]
++    for nm in result["names"]:
++        p_header += [nm, f"{nm}_err"]
++    derived_keys = list(result["derived"].keys())
++    p_header += derived_keys
++    p_header += ["mean_k", "var_k", "Q", "weighted", "r2", "chi2", "red_chi2",
++                 "n_points", "dof"]
++
++    row: list = [
++        source_path.name,
++        (str(ch) if ch is not None else ""),
++        model.key,
++        float(result["bin_width_s"]) if result.get("bin_width_s") else float("nan"),
++        int(result["M"]),
++    ]
++    for nm in result["names"]:
++        row.append(float(result["values"][nm]))
++        # A fixed parameter has no fitted error.  NaN rather than 0, so the
++        # cell reads back as "not estimated" instead of "estimated to be
++        # exactly zero" -- params_cell renders it blank.
++        row.append(float("nan") if result["fixed"].get(nm)
++                   else float(result["errors"][nm]))
++    for kname in derived_keys:
++        row.append(float(result["derived"][kname]))
++    row += [
++        float(result["mean"]), float(result["var"]), float(result["Q"]),
++        "yes" if result["weighted"] else "no",
++        float(result["r2"]),
++        float(result["chi2"]) if result["weighted"] else float("nan"),
++        float(result["red_chi2"]) if result["weighted"] else float("nan"),
++        int(result["n_points"]), int(result["dof"]),
++    ]
++
++    comments: list = []
++    comments.append("PCH fit - parameter table")
++    comments.append(f"source : {source_path.name}")
++    if result.get("origin") and result["origin"] != source_path.name:
++        comments.append(f"measured_from : {result['origin']}")
++    comments.append(f"model : {model.name} [{model.key}]")
++    comments.append(f"formula : {model.formula}")
++    comments.append(f"exported : {datetime.now().isoformat(timespec='seconds')}")
++    comments.append("weighted : " + ("yes (Poisson sigma = sqrt(counts))"
++                                     if result["weighted"] else "no"))
++    fixed_names = [nm for nm in result["names"] if result["fixed"].get(nm)]
++    comments.append(f"fixed : {', '.join(fixed_names) if fixed_names else '(none)'}")
++    # Distinct keys: fcs_export.read_export parses "# key : value" into a dict,
++    # so repeated keys overwrite each other and only the last would survive.
++    comments.append("units_epsilon : epsilon is counts per molecule per BIN; "
++                    "eta = epsilon / bin_width_s is counts per second and is "
++                    "the bin-width-independent brightness")
++    comments.append("note_fixed : blank *_err means the parameter was held fixed")
++    comments.append("note_Q : Q = Var/<k> - 1, the excess of the counting "
++                    "variance over Poisson; Q = 0 means no brightness "
++                    "information is present")
++
++    _write_params_table(params_path, comments, p_header, [row],
++                        log_tag="pch fit")
++
++    return report_path, curve_path, params_path
+ 
+ # ── GUI: entry point and dialogs ──────────────────────────────────────────────
+ 
+@@ -1228,7 +1308,7 @@
+ 
+         win.destroy()
+         result["origin"] = getattr(source, "source_name", None)
+-        report_path, _curve = export_pch_fit(result, source.filepath)
++        report_path, _curve, _params = export_pch_fit(result, source.filepath)
+         fig, _axes = plot_pch_fit(result, source.filepath.name, show=False)
+         try:
+             fig.savefig(report_path.with_suffix(".png"), dpi=150)

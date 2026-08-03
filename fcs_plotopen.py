@@ -28,7 +28,7 @@ Adding an analysis
 Implement ``rebuild_plot(meta, columns, show=True, path=None) -> (fig, ax)``
 in the module that owns the analysis, then register it::
 
-    register_rebuilder("lifetime", "fcs_lifetime", "rebuild_plot")
+    register_rebuilder("intensity", "fcs_intensity", "rebuild_plot")
 
 The rebuilder receives exactly what :func:`fcs_export.read_export` returns,
 plus the source path, so it can find sibling files -- a global fit reads its
@@ -58,9 +58,11 @@ import fcs_export
 
 # analysis name, exactly as written into the CSV header -> (module, function)
 _REBUILDERS: dict = {
-    "correlation":        ("fcs_corr",  "rebuild_plot"),
-    "global fit curves":  ("fcs_fit",   "rebuild_plot"),
-    "calibration points": ("fcs_calib", "rebuild_plot"),
+    "correlation":        ("fcs_corr",     "rebuild_plot"),
+    "global fit curves":  ("fcs_fit",      "rebuild_plot"),
+    "calibration points": ("fcs_calib",    "rebuild_plot"),
+    "lifetime":           ("fcs_lifetime", "rebuild_plot"),
+    "pch":                ("fcs_pch",      "rebuild_plot"),
 }
 
 

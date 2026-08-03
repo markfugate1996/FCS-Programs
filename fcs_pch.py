@@ -18,14 +18,26 @@ are shown on the plot as annotations.
 
 Public API
 ----------
+    compute_pch_counts(times_s, bin_width_s)       -> (k, n_k, M, mean, var)
     compute_pch(times_s, bin_width_s)              -> (k, pk, mean, var)
     plot_pch(channels_data, bin_width_s, ...)      -> (fig, ax)
     run_pch_dialog(fcs_data)                       -> shows dialog + plot
+
+Exported CSVs
+-------------
+A PCH export carries the RAW per-count frequencies ``n_<label>`` as well as
+the normalised ``pk_<label>``, and records the number of sampled time bins M
+and the observed count rate for every series in its header.  Those are exactly
+the quantities :mod:`fcs_pch_fit` needs to weight a fit by the Poisson error of
+each histogram bin (sigma = sqrt(n_k)) and to report the predicted/observed
+count-rate ratio, so a saved histogram can be fitted with no .fcs file present
+and gives numerically identical results to fitting the photon records.
 """
 
 from __future__ import annotations
 
-from typing import Tuple, Dict
+from pathlib import Path
+from typing import Tuple, Dict, NamedTuple, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -57,15 +69,91 @@ _DEFAULT_BIN_WIDTH_LABEL = "100 µs"
 
 # ── Core computation ──────────────────────────────────────────────────────────
 
-def compute_pch(
+def acquisition_window(fcs_data) -> Tuple[float, float, str]:
+    """
+    The interval over which the detectors were actually observing.
+
+    Why this exists
+    ---------------
+    The PCH used to bin each channel from its OWN first photon to its OWN last
+    photon.  That quietly discarded the observed-but-empty time at the head and
+    tail of the acquisition -- time in which the detector was running and
+    recorded nothing, which is a real measurement of k = 0 and belongs in the
+    histogram.  Dropping it removes k = 0 bins only, so it biases p(0) DOWN and
+    every other p(k) up, and it gave Ch1 and Ch2 different M for one shared
+    acquisition.  Binning both channels over the true window fixes both.
+
+    How the window is chosen
+    ------------------------
+    ``duration_s`` on the dataset is the acquisition length, so when every
+    photon on both channels lies inside ``[0, duration_s]`` that is the window
+    and the third return value is ``"acquisition"``.  If the photon times do
+    not sit on that axis (an absolute clock, say) the fallback is the union of
+    both channels' spans, tagged ``"photon_span_union"``: still not the true
+    window, but at least one window shared by both channels rather than two.
+
+    The tag is returned rather than inferred later because it is written into
+    the export header -- a reader should be told which convention produced the
+    k = 0 bin count instead of having to guess.
+    """
+    starts, ends = [], []
+    for attr in ("ch1_times_s", "ch2_times_s"):
+        t = getattr(fcs_data, attr, None)
+        if t is not None and len(t):
+            starts.append(float(t[0]))
+            ends.append(float(t[-1]))
+    if not starts:
+        raise ValueError("No photons on either channel; cannot compute PCH.")
+    t_first, t_last = min(starts), max(ends)
+
+    dur = getattr(fcs_data, "duration_s", None)
+    try:
+        dur = float(dur)
+    except (TypeError, ValueError):
+        dur = None
+    if dur is not None and np.isfinite(dur) and dur > 0:
+        # Only trust [0, duration] if the photons really lie on that axis.
+        # Asserting it blindly would invent empty leading bins that were never
+        # observed -- the opposite error, and a worse one.
+        if t_first >= 0.0 and t_last <= dur:
+            return 0.0, dur, "acquisition"
+
+    return t_first, t_last, "photon_span_union"
+
+
+def compute_pch_counts(
     times_s: np.ndarray,
     bin_width_s: float,
-) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    t_start: Optional[float] = None,
+    t_end: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, int, float, float]:
     """
-    Compute the photon counting histogram from a photon arrival time array.
+    Compute the photon counting histogram as RAW per-count frequencies.
 
-    The arrival times are binned into non-overlapping windows of width
-    bin_width_s.  The histogram of counts-per-bin is the PCH.
+    The window ``[t_start, t_end]`` is divided into non-overlapping bins of
+    width bin_width_s and the histogram of counts-per-bin is the PCH.  Bins in
+    which nothing was detected are counted as k = 0, including any at the head
+    or tail of the acquisition: they are observations, not absent data.
+
+    This is the primitive; :func:`compute_pch` normalises its output.  The raw
+    frequencies and the sampled-bin count M are kept because they, not the
+    probabilities, are what a weighted fit needs: p(k) alone cannot say how
+    many bins went into each point, so it cannot supply a Poisson error bar.
+
+    It is deliberately identical in construction to
+    ``fcs_pch_fit.pch_counts`` -- same window, same M, same edges, same ddof --
+    so a fit run from an exported histogram and one run from the photon records
+    see exactly the same numbers.
+
+    The trailing PARTIAL bin
+    ------------------------
+    If the window is not an exact multiple of the bin width, the leftover slice
+    at the end is not binned, and photons inside it are not counted.  This is
+    the one omission that is deliberate: a short bin is not an observation of
+    the same quantity as a full one, and folding it in would add a point drawn
+    from a narrower window and bias p(k) toward low k.  It is at most one bin
+    wide -- under 0.001% of a typical acquisition -- and the amount discarded
+    is reported by the caller rather than left silent.
 
     Parameters
     ----------
@@ -73,65 +161,215 @@ def compute_pch(
         Sorted absolute photon arrival times in seconds.
     bin_width_s : float
         Bin width in seconds.
+    t_start, t_end : float, optional
+        The observation window.  Defaults to this channel's own first and last
+        photon, which is the old behaviour and is retained only for callers
+        with no dataset to ask; :func:`acquisition_window` supplies the honest
+        window and every caller in this suite uses it.
 
     Returns
     -------
     k       : np.ndarray (int)
         Photon count values (0, 1, 2, …, k_max).
-    pk      : np.ndarray (float)
-        Probability of each count value (normalised to sum = 1).
+    n_k     : np.ndarray (float)
+        Number of time bins holding exactly k photons  (sums to M).
+    M       : int
+        Number of sampled time bins.
     mean    : float
         Mean photons per bin  <k>.
     var     : float
         Variance of photons per bin  Var(k).
     """
-    if len(times_s) == 0:
+    times_s = np.asarray(times_s, dtype=np.float64)
+    if times_s.size == 0:
         raise ValueError("times_s is empty; cannot compute PCH.")
 
-    t_start = times_s[0]
-    t_end   = times_s[-1]
-    n_bins  = max(1, int((t_end - t_start) / bin_width_s))
-    edges   = t_start + np.arange(n_bins + 1) * bin_width_s
+    t_start = float(times_s[0]) if t_start is None else float(t_start)
+    t_end   = float(times_s[-1]) if t_end is None else float(t_end)
+    if t_end <= t_start:
+        raise ValueError(
+            f"PCH window is empty: t_start={t_start:.6g} s is not before "
+            f"t_end={t_end:.6g} s.")
+    # A photon outside the window means the window is wrong for these data.
+    # np.histogram would drop it without a word, so say so instead: silently
+    # binning 90% of a channel is exactly the kind of quiet trimming this
+    # window was introduced to stop.
+    if times_s[0] < t_start or times_s[-1] > t_end:
+        raise ValueError(
+            f"Photon times span [{times_s[0]:.6g}, {times_s[-1]:.6g}] s, "
+            f"outside the requested PCH window "
+            f"[{t_start:.6g}, {t_end:.6g}] s.")
+
+    n_bins = max(1, int((t_end - t_start) / bin_width_s))
+    edges  = t_start + np.arange(n_bins + 1) * bin_width_s
 
     counts, _ = np.histogram(times_s, bins=edges)
+    # np.histogram puts values equal to the last edge INTO the last bin, so a
+    # photon landing exactly on it is kept rather than lost.
 
     mean = float(counts.mean())
-    var  = float(counts.var(ddof=1))
+    var  = float(counts.var(ddof=1)) if len(counts) > 1 else float("nan")
 
     k_max = int(counts.max())
     k     = np.arange(0, k_max + 1, dtype=int)
-    pk    = np.bincount(counts, minlength=k_max + 1).astype(float)
-    pk   /= pk.sum()   # normalise to probability
+    n_k   = np.bincount(counts, minlength=k_max + 1).astype(float)
 
-    return k, pk, mean, var
+    return k, n_k, int(n_bins), mean, var
+
+
+def window_tail(bin_width_s: float, t_start: float, t_end: float
+                ) -> Tuple[float, int]:
+    """
+    Size of the unbinned trailing slice: ``(seconds, whole_bins_used)``.
+
+    Reported in the export header so the discarded remainder is on the record.
+    """
+    span = float(t_end) - float(t_start)
+    n_bins = max(1, int(span / bin_width_s))
+    return span - n_bins * bin_width_s, n_bins
+
+
+def compute_pch(
+    times_s: np.ndarray,
+    bin_width_s: float,
+    t_start: Optional[float] = None,
+    t_end: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """
+    Compute the normalised photon counting histogram p(k).
+
+    Thin wrapper over :func:`compute_pch_counts` kept for callers that only
+    want probabilities.  ``pk = n_k / M`` exactly, since the frequencies sum
+    to the number of sampled bins.
+
+    Returns
+    -------
+    k, pk, mean, var  -- see :func:`compute_pch_counts`.
+    """
+    k, n_k, M, mean, var = compute_pch_counts(
+        times_s, bin_width_s, t_start=t_start, t_end=t_end)
+    return k, n_k / n_k.sum(), mean, var
+
+
+# ── One plotted / exported series ─────────────────────────────────────────────
+
+class PCHSeries(NamedTuple):
+    """
+    One PCH curve: what is plotted, plus what a later fit will need.
+
+    ``channels_data`` maps a display label ('Ch1', 'Ch2', 'Ch1+Ch2') to one of
+    these.  It was a bare 5-tuple ``(k, pk, mean, var, colour)``; the extra
+    fields are the reason saved histograms became fittable, and a NamedTuple
+    keeps every existing positional use valid while letting the exporter reach
+    ``s.n_k`` and ``s.M`` by name.
+
+    M is carried per series even though every series of one file now shares the
+    same acquisition window and therefore the same M.  It is stored beside the
+    counts it belongs to so that ``sum(n_k) == M`` is checkable per series on
+    read, which is the check that catches a truncated or mis-padded column.
+    """
+    k:      np.ndarray      # count values 0..k_max
+    pk:     np.ndarray      # probabilities, sum = 1
+    mean:   float           # <k>
+    var:    float           # Var(k), ddof=1
+    colour: str             # plot colour
+    n_k:    np.ndarray = None   # raw frequencies, sum = M
+    M:      int = 0             # number of sampled time bins
+    cps:    Optional[float] = None   # observed count rate for this series (Hz)
+    window: Optional[Tuple[float, float]] = None   # (t_start, t_end) in s
+    window_source: str = ""     # 'acquisition' | 'photon_span_union'
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
 def _export_pch(
     fcs_data: FCSData,
-    channels_data: Dict[str, Tuple[np.ndarray, np.ndarray, float, float, str]],
+    channels_data: Dict[str, "PCHSeries"],
     bin_width_s: float,
 ) -> None:
     """
     Write the plotted PCH series for one file to a CSV.
 
-    Each series has its own contiguous k = 0..k_last; every series' p(k) is
-    padded onto a common k axis (0..max) with zeros so they share one table.
+    Columns
+    -------
+    ``k`` then, per series, ``pk_<label>`` (probability) and ``n_<label>``
+    (raw frequency).  The two are redundant -- ``pk = n_k / M`` -- and both are
+    written anyway: p(k) is the plotted quantity and the one a human reads,
+    n_k is the one a weighted fit needs.  Storing the raw counts is what makes
+    the export fittable rather than merely viewable.
+
+    Padding
+    -------
+    Each series has its own contiguous k = 0..k_last, and the table shares one
+    k axis running to the longest.  Cells past a series' own k_last are NaN,
+    not 0, matching ``fcs_lifetime._lifetime_export_columns``.  The distinction
+    is load-bearing here: inside a series' range a zero is a real measurement
+    ("no bin held exactly k photons"), while past its end nothing was sampled
+    at all.  Zero-padding would blur the two and quietly hand the fitter extra
+    data points whose Poisson weight sigma = sqrt(max(n,1)) = 1 is fictitious.
+    NaN also round-trips, since fcs_export writes it as a blank cell and
+    read_export maps a blank back to NaN.
+
+    Metadata
+    --------
+    Per series: the sampled-bin count M, the observed count rate, the photon
+    total, and the moments.  M and the count rate are not conveniences -- M
+    sets the Poisson weights and the reduced chi-squared scale, and the count
+    rate is what the fitter divides its predicted rate by to report
+    ``predicted_over_observed``.  Neither is recoverable from p(k) with
+    certainty, so both are recorded rather than inferred later.
     """
     if not channels_data:
         return
-    k_max  = max(int(np.asarray(k)[-1]) for (k, *_rest) in channels_data.values())
+    k_max  = max(int(np.asarray(s.k)[-1]) for s in channels_data.values())
     k_full = np.arange(0, k_max + 1)
-    cols: Dict[str, np.ndarray] = {"k": k_full}
-    meta: Dict[str, object] = {"bin_width_s": f"{bin_width_s:.6g}"}
-    for label, (k, pk, mean, var, _colour) in channels_data.items():
-        pk_full = np.zeros(k_max + 1, dtype=float)
-        pk_full[np.asarray(k, dtype=int)] = pk
+    cols: Dict[str, np.ndarray] = {"k": k_full.astype(float)}
+    meta: Dict[str, object] = {
+        "pch_schema":  "2",
+        "bin_width_s": f"{bin_width_s:.10g}",
+        "series":      "+".join(channels_data.keys()),
+    }
+    duration = getattr(fcs_data, "duration_s", None)
+    if duration is not None:
+        meta["duration_s"] = f"{float(duration):.10g}"
+
+    # The window every series was binned over, and what was left unbinned.
+    # A reader can then tell an honest k = 0 count from a trimmed one without
+    # re-deriving anything, and can see exactly how much time went unused.
+    _any = next(iter(channels_data.values()))
+    if _any.window is not None:
+        w0, w1 = _any.window
+        tail_s, n_used = window_tail(bin_width_s, w0, w1)
+        meta["window_start_s"]   = f"{w0:.10g}"
+        meta["window_end_s"]     = f"{w1:.10g}"
+        meta["window_source"]    = _any.window_source
+        meta["window_unbinned_tail_s"] = f"{tail_s:.6g}"
+        meta["note_window"] = (
+            "all series binned over one shared window; empty time inside it "
+            "is counted as k=0. Only the trailing partial bin is unbinned.")
+
+    for label, s in channels_data.items():
+        idx = np.asarray(s.k, dtype=int)
+
+        pk_full = np.full(k_max + 1, np.nan, dtype=float)
+        pk_full[idx] = s.pk
         cols[f"pk_{label}"] = pk_full
-        meta[f"{label}_mean"]          = f"{mean:.6g}"
-        meta[f"{label}_var"]           = f"{var:.6g}"
-        meta[f"{label}_var_over_mean"] = f"{var / mean:.6g}" if mean > 0 else "nan"
+
+        if s.n_k is not None:
+            n_full = np.full(k_max + 1, np.nan, dtype=float)
+            n_full[idx] = np.asarray(s.n_k, dtype=float)
+            cols[f"n_{label}"] = n_full
+            meta[f"{label}_photons"] = f"{int(round(float(np.sum(np.asarray(s.n_k) * idx))))}"
+
+        if s.M:
+            meta[f"{label}_sampled_bins_M"] = f"{int(s.M)}"
+        if s.cps is not None and np.isfinite(s.cps):
+            meta[f"{label}_observed_cps"] = f"{float(s.cps):.10g}"
+        meta[f"{label}_mean"]          = f"{s.mean:.10g}"
+        meta[f"{label}_var"]           = f"{s.var:.10g}"
+        meta[f"{label}_var_over_mean"] = (f"{s.var / s.mean:.10g}"
+                                          if s.mean > 0 else "nan")
+
     ch_tag = "_".join(channels_data.keys())
     bw_tag = f"{bin_width_s * 1e6:.0f}us"
     fcs_export.safe_export(
@@ -140,7 +378,7 @@ def _export_pch(
 
 
 def plot_pch(
-    channels_data: Dict[str, Tuple[np.ndarray, np.ndarray, float, float, str]],
+    channels_data: Dict[str, "PCHSeries"],
     bin_width_s: float,
     fcs_data: FCSData,
     show: bool = True,
@@ -153,7 +391,7 @@ def plot_pch(
     ----------
     channels_data : dict
         Keys are display labels (e.g. 'Ch1', 'Ch2', 'Ch1+Ch2').
-        Values are (k, pk, mean, var, colour) tuples from compute_pch.
+        Values are PCHSeries records from _build_channels_data.
     bin_width_s : float
         Bin width used (shown in title).
     fcs_data : FCSData
@@ -173,7 +411,8 @@ def plot_pch(
 
     annotation_lines: list[str] = []
 
-    for label, (k, pk, mean, var, colour) in channels_data.items():
+    for label, _s in channels_data.items():
+        k, pk, mean, var, colour = _s.k, _s.pk, _s.mean, _s.var, _s.colour
         # ── Bar chart of the PCH ──────────────────────────────────────────────
         ax.bar(k, pk, width=0.75, color=colour, alpha=0.55,
                label=label, zorder=2)
@@ -249,22 +488,36 @@ def _build_channels_data(
     fcs_data: FCSData,
     channel_choice: str,
     bin_width_s: float,
-) -> Dict[str, Tuple[np.ndarray, np.ndarray, float, float, str]]:
+) -> Dict[str, "PCHSeries"]:
     """
-    Compute the per-series ``{label: (k, pk, mean, var, colour)}`` dict for a
-    single file given a channel choice ('ch1', 'ch2', 'both', or 'combined').
+    Compute the per-series ``{label: PCHSeries}`` dict for a single file given
+    a channel choice ('ch1', 'ch2', 'both', or 'combined').
+
+    Every series is binned over the SAME window -- the acquisition, not each
+    channel's own first-to-last photon -- so Ch1 and Ch2 share one M, their
+    bins line up in time, and observed empty time is counted as k = 0 on both.
     """
-    channels_data: Dict[str, Tuple] = {}
+    t0, t1, wsrc = acquisition_window(fcs_data)
+
+    def _series(times, colour, cps) -> PCHSeries:
+        k, n_k, M, mean, var = compute_pch_counts(
+            times, bin_width_s, t_start=t0, t_end=t1)
+        return PCHSeries(k=k, pk=n_k / n_k.sum(), mean=mean, var=var,
+                         colour=colour, n_k=n_k, M=M, cps=cps,
+                         window=(t0, t1), window_source=wsrc)
+
+    r1 = getattr(fcs_data, "count_rate_ch1_hz", None)
+    r2 = getattr(fcs_data, "count_rate_ch2_hz", None)
+
+    channels_data: Dict[str, PCHSeries] = {}
     if channel_choice in ("ch1", "both"):
-        k, pk, mean, var = compute_pch(fcs_data.ch1_times_s, bin_width_s)
-        channels_data["Ch1"] = (k, pk, mean, var, _CH_COLOUR[1])
+        channels_data["Ch1"] = _series(fcs_data.ch1_times_s, _CH_COLOUR[1], r1)
     if channel_choice in ("ch2", "both"):
-        k, pk, mean, var = compute_pch(fcs_data.ch2_times_s, bin_width_s)
-        channels_data["Ch2"] = (k, pk, mean, var, _CH_COLOUR[2])
+        channels_data["Ch2"] = _series(fcs_data.ch2_times_s, _CH_COLOUR[2], r2)
     if channel_choice == "combined":
         t = np.sort(np.concatenate([fcs_data.ch1_times_s, fcs_data.ch2_times_s]))
-        k, pk, mean, var = compute_pch(t, bin_width_s)
-        channels_data["Ch1+Ch2"] = (k, pk, mean, var, _CH_COLOUR["both"])
+        both = (r1 + r2) if (r1 is not None and r2 is not None) else None
+        channels_data["Ch1+Ch2"] = _series(t, _CH_COLOUR["both"], both)
     return channels_data
 
 
@@ -328,9 +581,9 @@ def plot_pch_overlay(
     for d, colour in zip(datasets, colours):
         channels_data = _build_channels_data(d, channel_choice, bin_width_s)
         first = True
-        for label, (k, pk, mean, var, _c) in channels_data.items():
+        for label, _s in channels_data.items():
             ax.plot(
-                k, pk, color=colour, linewidth=1.2,
+                _s.k, _s.pk, color=colour, linewidth=1.2,
                 marker=_SERIES_MARKER.get(label, "o"), markersize=3.5,
                 alpha=0.9,
                 label=d.filepath.name if first else None,
@@ -360,6 +613,116 @@ def plot_pch_overlay(
     if show:
         fcs_plottools.show_figure(fig, ax)
     return fig, ax
+
+
+# ── Reopening an exported PCH ─────────────────────────────────────────────────
+
+def _label_colour(label: str) -> str:
+    """Plot colour for an exported series label ('Ch1', 'Ch2', 'Ch1+Ch2')."""
+    if "+" in label:
+        return _CH_COLOUR["both"]
+    if label.startswith("Ch") and label[2:].isdigit():
+        return _CH_COLOUR.get(int(label[2:]), _CH_COLOUR[1])
+    return _CH_COLOUR[1]
+
+
+class _RebuiltSource:
+    """
+    Stands in for the FCSData a rebuilt plot no longer has.
+
+    Named after the ORIGINAL measurement rather than the CSV, so a reopened
+    figure carries the same title as a freshly drawn one; the point of
+    reopening is to get the result back, not to be reminded which file it was
+    cached in.
+    """
+    def __init__(self, path, name):
+        self.filepath = Path(name) if name else Path(path)
+
+
+def rebuild_plot(meta, columns, show: bool = True, path=None):
+    """
+    Redraw an exported PCH as a live figure, for :mod:`fcs_plotopen`.
+
+    Takes what :func:`fcs_export.read_export` returns and calls the SAME
+    :func:`plot_pch` that drew the file in the first place, so a reopened
+    figure is identical to a fresh one and there is no second rendering path to
+    drift out of step.
+
+    Rebuilding uses ``pk``, not the counts: p(k) is what was plotted, and it is
+    present in every PCH export including ones written before the raw counts
+    were added.  A histogram that cannot be FITTED can still be LOOKED at, and
+    refusing to reopen it would be a needless loss -- the counts matter for
+    Poisson weighting, which a plot does not do.
+    """
+    if "k" not in columns:
+        raise ValueError(
+            "This file has no 'k' column, so it is not a PCH export.")
+    if "pk_fit" in columns or "counts_fit" in columns:
+        raise ValueError(
+            "This is a PCH fit curve, not a measured histogram.  Reopen the "
+            "histogram written by the PCH plotting task instead.")
+
+    k_all = np.asarray(columns["k"], dtype=np.float64)
+
+    labels = [c[3:] for c in columns if c.startswith("pk_")]
+    if not labels:
+        raise ValueError(
+            "This file has a 'k' column but no 'pk_<channel>' column, so "
+            "there is no histogram in it to draw.")
+
+    try:
+        bin_width_s = float(meta.get("bin_width_s"))
+    except (TypeError, ValueError):
+        raise ValueError(
+            "This PCH export does not record 'bin_width_s' in its header, so "
+            "the histogram cannot be labelled with the bin width it used.")
+
+    channels_data: Dict[str, PCHSeries] = {}
+    for label in labels:
+        pk = np.asarray(columns[f"pk_{label}"], dtype=np.float64)
+        good = np.isfinite(pk)
+        if not good.any():
+            continue
+        k_ser  = k_all[good].astype(int)
+        pk_ser = pk[good]
+
+        # Moments come from the header when it has them and are otherwise
+        # recomputed from p(k).  Both are needed: the Poisson reference curve
+        # and the Q annotation are drawn from <k> and Var(k).
+        def _hdr(key, fallback):
+            try:
+                v = float(meta[f"{label}_{key}"])
+                return v if np.isfinite(v) else fallback
+            except (KeyError, TypeError, ValueError):
+                return fallback
+        norm  = pk_ser.sum()
+        mean0 = float(np.sum(pk_ser * k_ser) / norm) if norm else float("nan")
+        var0  = (float(np.sum(pk_ser * (k_ser - mean0) ** 2) / norm)
+                 if norm else float("nan"))
+
+        n_col = columns.get(f"n_{label}")
+        n_k = M = None
+        if n_col is not None:
+            n_arr = np.asarray(n_col, dtype=np.float64)[good]
+            if np.isfinite(n_arr).all():
+                n_k = n_arr
+                M = int(round(float(n_arr.sum())))
+
+        channels_data[label] = PCHSeries(
+            k=k_ser, pk=pk_ser,
+            mean=_hdr("mean", mean0), var=_hdr("var", var0),
+            colour=_label_colour(label),
+            n_k=n_k, M=M or 0,
+            cps=_hdr("observed_cps", None),
+        )
+
+    if not channels_data:
+        raise ValueError("This PCH export contains no plottable series.")
+
+    src = _RebuiltSource(path, meta.get("source file") or meta.get("source"))
+    # export=False without exception: reopening is for looking at a result, and
+    # re-exporting would overwrite the very file just read.
+    return plot_pch(channels_data, bin_width_s, src, show=show, export=False)
 
 
 # ── Dialog ────────────────────────────────────────────────────────────────────
@@ -453,7 +816,7 @@ def run_pch_dialog(fcs_data: FCSData, export: bool = False):
 
         dialog.destroy()
 
-        # Build the dict of (k, pk, mean, var, colour) per series
+        # Build the dict of PCHSeries per series
         try:
             channels_data = _build_channels_data(
                 fcs_data, channel_choice, bin_width_s)
@@ -486,16 +849,8 @@ if __name__ == "__main__":
     bw      = float(sys.argv[2]) if len(sys.argv) > 2 else 100e-6
     choice  = sys.argv[3] if len(sys.argv) > 3 else "both"
 
-    channels_data: Dict[str, Tuple] = {}
-    if choice in ("ch1", "both"):
-        k, pk, mean, var = compute_pch(d.ch1_times_s, bw)
-        channels_data["Ch1"] = (k, pk, mean, var, _CH_COLOUR[1])
-    if choice in ("ch2", "both"):
-        k, pk, mean, var = compute_pch(d.ch2_times_s, bw)
-        channels_data["Ch2"] = (k, pk, mean, var, _CH_COLOUR[2])
-    if choice == "combined":
-        t = np.sort(np.concatenate([d.ch1_times_s, d.ch2_times_s]))
-        k, pk, mean, var = compute_pch(t, bw)
-        channels_data["Ch1+Ch2"] = (k, pk, mean, var, _CH_COLOUR["both"])
+    # Use the shared builder rather than a second hand-rolled copy of it, so
+    # the CLI cannot drift from the GUI path the way the old duplicate did.
+    channels_data = _build_channels_data(d, choice, bw)
 
     plot_pch(channels_data, bw, d)

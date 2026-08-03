@@ -366,9 +366,19 @@ class LoadedDecay:
         # Channel identity comes from the column names: a Ch2-only export has
         # only a ch2_counts column, so its single decay is Ch2 and must not be
         # relabelled Ch1 just because it is the only one present.
+        self._single  = "decay" in self.series
         self.channels = tuple(
             int(k[2:]) for k in ("Ch1", "Ch2") if k in self.series)
-        self._single = "decay" in self.series
+        if self._single:
+            # An unlabelled 'decay' column carries no channel identity to
+            # preserve, but fcs_lifetime indexes colours, labels and
+            # require_channels() by channel number, and an empty tuple would
+            # draw an empty gate picker.  Presenting it as channel 1 is the
+            # convention an .ifx decay already gets: LifetimeData exposes no
+            # channels attribute, so callers default it to Ch1.
+            # channel_summary still reports "decay", so nothing in the UI
+            # claims this curve came off detector 1.
+            self.channels = (1,)
 
     # ── Identity ─────────────────────────────────────────────────────────────
 
@@ -429,6 +439,79 @@ class LoadedDecay:
         return self.series[key]
 
     # ── The FCSData-shaped call ──────────────────────────────────────────────
+
+    @property
+    def has_irf(self) -> bool:
+        """
+        True when the export carries an IRF column.
+
+        fcs_lifetime_recon gates reconvolution on this attribute, so an export
+        that saved its IRF stays eligible for a reconvolution fit instead of
+        being silently demoted to tail fitting.
+        """
+        return self.irf is not None and len(np.asarray(self.irf)) > 0
+
+    def decay_curve(self, channel: Optional[int] = None):
+        """
+        Return ``(t_ns, decay, irf)`` at the stored resolution.
+
+        The third member of the trio fcs_lifetime_recon reads off a decay
+        object -- the other two being ``filepath`` and ``has_irf`` -- so a
+        loaded decay can be reconvolution-fitted with no change there beyond
+        admitting its ``kind``.
+
+        Choosing the channel
+        --------------------
+        An .ifx decay is one curve, so ``LifetimeData.decay_curve()`` takes no
+        argument and the reconvolution fitter never had a channel to pick.  A
+        two-channel export is different, and defaulting to the first channel
+        would hand back a Ch1 decay to a caller that never said which detector
+        it meant -- a fitted lifetime attributed to the wrong channel, with
+        nothing in the result to show for it.  So an ambiguous request raises
+        and the caller must choose.  A file holding one decay, labelled or not,
+        is unambiguous and needs no argument.
+        """
+        if channel is None:
+            if self._single or len(self.channels) == 1:
+                channel = None if self._single else self.channels[0]
+            else:
+                raise ValueError(
+                    f"{self.filepath.name} holds {self.channel_summary}; "
+                    f"decay_curve() needs a channel to say which decay to "
+                    f"return.  Pass channel=1 or channel=2."
+                )
+        counts = self.counts(channel)
+        irf = (np.asarray(self.irf, dtype=np.float64).copy()
+               if self.has_irf else None)
+        return self.t_ns.copy(), counts.copy(), irf
+
+    def valid_n_bins(self) -> list:
+        """
+        Bin counts this decay can actually be rebinned to.
+
+        Only exact integer divisors of the stored resolution qualify; see
+        :meth:`lifetime_histogram`.  The GUI offers this list rather than the
+        full ``fcs_lifetime._VALID_N_BINS`` so a resolution the file cannot
+        produce is never selectable, instead of being chosen and then rejected
+        with an error two screens later.
+        """
+        stored = self.n_bins
+        opts = [n for n in fcs_lifetime._VALID_N_BINS
+                if n <= stored and stored % n == 0]
+        if stored not in opts:
+            opts.append(stored)
+        return sorted(set(opts))
+
+    def gate_n_bins(self, preferred: int = 512) -> int:
+        """
+        Resolution for the interactive gate picker.
+
+        select_gate() asks for 512 bins by default, which a decay exported at
+        256 cannot supply.  This returns the closest valid choice at or below
+        *preferred*, so the picker opens rather than raising.
+        """
+        opts = [n for n in self.valid_n_bins() if n <= preferred]
+        return max(opts) if opts else min(self.valid_n_bins())
 
     def lifetime_histogram(self, channel: int = 1,
                            n_bins: int = None):
@@ -768,6 +851,11 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
     L.append("Lifetime fit report")
     L.append("=" * 60)
     L.append(f"source     : {source_path.name}")
+    if result.get("origin") and result["origin"] != source_path.name:
+        # Fitting a saved decay: name the file the photons were measured in,
+        # so the report identifies the measurement and not just the CSV that
+        # happened to be on disk.
+        L.append(f"measured from : {result['origin']}")
     L.append(f"model      : {model.name}  [{model.key}]")
     L.append(f"formula    : {model.formula}")
     L.append(f"fitted     : {datetime.now().isoformat(timespec='seconds')}")
@@ -940,18 +1028,319 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
 # level → persists across files for the session.
 _last_fit_window: dict = {"start": None, "end": None}
 
-def run_lifetime_fit_dialog(fcs_data: FCSData, parent=None):
+def run_lifetime_fit_dialog(fcs_data: Optional[FCSData] = None, parent=None):
     """
-    Full GUI flow for lifetime modelling: choose channel / resolution / window,
-    pick a model, set guesses and bounds, then fit, plot and export.
-    """
-    def _after_data(channel, n_bins, t_ns, counts, fit_start, fit_end):
-        def _after_model(model: FCSModel):
-            _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
-                                   t_ns, counts, fit_start, fit_end)
-        _select_lifetime_model_dialog(parent, _after_model)
+    Full GUI flow for lifetime modelling: choose a source, then channel /
+    resolution / window, pick a model, set guesses and bounds, then fit, plot
+    and export.
 
-    _lifetime_data_dialog(parent, fcs_data, _after_data)
+    Two sources are offered.  Photon records give the full choice of channel
+    and histogram resolution.  A saved decay CSV is already binned, so the
+    resolution choice narrows to the exact integer rebins the file can produce
+    -- see :meth:`LoadedDecay.valid_n_bins` -- while the channel choice, the
+    window entries and the interactive picker all behave exactly as they do for
+    photon data, because :class:`LoadedDecay` satisfies the same three
+    attributes fcs_lifetime uses.  With no photon data loaded the chooser is
+    bypassed straight to the CSV browser, since there is nothing else to fit.
+    """
+    def _run(source):
+        def _after_data(channel, n_bins, t_ns, counts, fit_start, fit_end):
+            def _after_model(model: FCSModel):
+                _lifetime_setup_dialog(parent, source, model, channel, n_bins,
+                                       t_ns, counts, fit_start, fit_end)
+            _select_lifetime_model_dialog(parent, _after_model)
+        _lifetime_data_dialog(parent, source, _after_data)
+
+    def _from_csv():
+        _lifetime_csv_dialog(parent, fcs_data, _run)
+
+    if fcs_data is None:
+        _from_csv()
+        return
+    _lifetime_source_dialog(parent, fcs_data,
+                            lambda: _run(fcs_data), _from_csv)
+
+
+def run_lifetime_method_dialog(data=None, parent=None):
+    """
+    Choose tail fit vs IRF reconvolution, then hand off to that fitter.
+
+    This screen used to live in fcs_main and fired straight off the workspace,
+    before the user had said they wanted a lifetime fit at all.  It belongs
+    after that choice, and it belongs here, in the module that owns lifetime
+    fitting -- fcs_main should route to a workflow, not implement one.
+
+    Both methods stay selectable whatever ``data`` is.  Each fitter has its own
+    source screen and can open a saved decay, so greying reconvolution out
+    because the file in the workspace has no IRF would hide the CSV browser
+    behind a file the user may not have meant to fit at all.  Reconvolution
+    without an IRF is a tail fit under another name, and fcs_lifetime_recon
+    asks before running one.
+    """
+    import tkinter as tk
+
+    win = tk.Toplevel(parent)
+    win.title("Model lifetime decay")
+    win.resizable(False, False)
+    win.grab_set()
+
+    tk.Label(win, text="Model lifetime decay",
+             font=("Helvetica", 12, "bold"), pady=8).pack()
+    if data is not None and getattr(data, "filepath", None) is not None:
+        tk.Label(win, text=data.filepath.name,
+                 font=("Helvetica", 9), fg="grey").pack()
+
+    method_var = tk.StringVar(value="tail")
+    frame = tk.LabelFrame(win, text="Method", padx=12, pady=8)
+    frame.pack(fill="x", padx=14, pady=8)
+    tk.Radiobutton(frame, text="Tail fit  (sum of exponentials, no IRF)",
+                   variable=method_var, value="tail", anchor="w").pack(fill="x")
+    tk.Radiobutton(frame, text="IRF reconvolution",
+                   variable=method_var, value="recon", anchor="w").pack(fill="x")
+
+    if data is not None and hasattr(data, "has_irf"):
+        note = ("this decay carries an IRF" if data.has_irf
+                else "this decay has no IRF — reconvolution would need a "
+                     "saved decay that kept one")
+    else:
+        note = "reconvolution needs a decay whose export kept its IRF column"
+    tk.Label(frame, text=note, font=("Helvetica", 8), fg="grey",
+             wraplength=300, justify="left").pack(fill="x", pady=(2, 0))
+
+    def _go():
+        method = method_var.get()
+        win.destroy()
+        if method == "recon":
+            # Imported here so the two lifetime fitters stay independent at
+            # module scope; either can be used without loading the other.
+            import fcs_lifetime_recon
+            fcs_lifetime_recon.run_reconv_fit_dialog(data, parent=parent)
+        else:
+            run_lifetime_fit_dialog(data, parent=parent)
+
+    btns = tk.Frame(win)
+    btns.pack(pady=10)
+    tk.Button(btns, text="Next →", width=12, command=_go,
+              pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(side="left", padx=6)
+    win.wait_window()
+
+
+def _lifetime_source_dialog(parent, fcs_data, on_photons, on_csv):
+    """Screen 0 — fit the active file's photon records, or a saved decay."""
+    import tkinter as tk
+
+    win = tk.Toplevel(parent)
+    win.title("Lifetime fit — source")
+    win.resizable(False, False)
+    win.grab_set()
+
+    tk.Label(win, text="Lifetime fit — choose the data",
+             font=("Helvetica", 12, "bold"), pady=8).pack()
+
+    body = tk.Frame(win, padx=16, pady=4)
+    body.pack(fill="x")
+
+    def _go(fn):
+        win.destroy()
+        fn()
+
+    tk.Button(body, text="Active file — photon records", width=32, pady=6,
+              command=lambda: _go(on_photons)).pack(pady=3)
+    tk.Label(body, text=f"{fcs_data.filepath.name}\n"
+                        f"any histogram resolution, binned now",
+             font=("Helvetica", 8), fg="grey", justify="center").pack()
+
+    tk.Button(body, text="Saved decay (CSV)…", width=32, pady=6,
+              command=lambda: _go(on_csv)).pack(pady=(10, 3))
+    tk.Label(body, text="resolution limited to exact rebins of the export",
+             font=("Helvetica", 8), fg="grey").pack()
+
+    tk.Button(win, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(pady=10)
+    win.wait_window()
+
+
+# Folder the decay CSV browser last worked in, remembered for the session.
+_last_decay_browse_dir: Optional[str] = None
+
+
+def _default_decay_dir(fcs_data=None) -> Optional[Path]:
+    """Folder the decay CSV browser should open on: 'analysis' beside the
+    active file, else the folder last browsed this session."""
+    if fcs_data is not None and getattr(fcs_data, "filepath", None) is not None:
+        start = Path(fcs_data.filepath).parent
+        analysis = start / "analysis"
+        return analysis if analysis.exists() else start
+    if _last_decay_browse_dir:
+        prev = Path(_last_decay_browse_dir)
+        if prev.exists():
+            return prev
+    return None
+
+
+def _lifetime_csv_dialog(parent, fcs_data, on_done):
+    """Screen 0b — pick a saved decay CSV and hand back a LoadedDecay."""
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+
+    global _last_decay_browse_dir
+
+    init_dir = _default_decay_dir(fcs_data)
+    paths = discover_lifetime_csvs(init_dir) if init_dir else []
+
+    win = tk.Toplevel(parent)
+    win.title("Lifetime fit — saved decay")
+    win.geometry("620x430")
+    win.minsize(520, 360)
+    win.grab_set()
+
+    tk.Label(win, text="Select a saved lifetime decay",
+             font=("Helvetica", 12, "bold"), pady=6).pack()
+    tk.Label(win, text="Decays exported by the 'Plot lifetime decay' task. "
+                       "Files that do not parse as a decay are not listed.",
+             font=("Helvetica", 9), fg="grey", wraplength=580,
+             justify="left").pack()
+
+    folder_var = tk.StringVar()
+
+    def _update_folder():
+        folder_var.set(f"Folder: {init_dir}" if init_dir
+                       else "Folder: none chosen yet")
+    _update_folder()
+    tk.Label(win, textvariable=folder_var, font=("Courier", 8), fg="grey",
+             wraplength=580, justify="left").pack()
+
+    lb_frame = tk.Frame(win)
+    lb_frame.pack(fill="both", expand=True, padx=12, pady=6)
+    scroll = tk.Scrollbar(lb_frame, orient="vertical")
+    listbox = tk.Listbox(lb_frame, yscrollcommand=scroll.set,
+                         activestyle="none", font=("Courier", 9),
+                         exportselection=False)
+    scroll.config(command=listbox.yview)
+    scroll.pack(side="right", fill="y")
+    listbox.pack(side="left", fill="both", expand=True)
+
+    info = tk.StringVar(value="")
+    tk.Label(win, textvariable=info, font=("Courier", 8), fg="grey",
+             wraplength=580, justify="left").pack(padx=12, anchor="w")
+
+    cache: dict = {}
+
+    def _current():
+        sel = listbox.curselection()
+        if not sel:
+            return None
+        p = paths[sel[0]]
+        if p not in cache:
+            try:
+                cache[p] = load_decay_object(p)
+            except Exception as e:
+                cache[p] = e
+        got = cache[p]
+        return None if isinstance(got, Exception) else got
+
+    def _refresh(*_):
+        d = _current()
+        if d is None:
+            info.set("")
+            return
+        info.set(f"{d.channel_summary}  ·  {d.n_bins} bins  ·  "
+                 f"period {d.laser_period_ns:.3g} ns  ·  "
+                 f"IRF {'yes' if d.has_irf else 'no'}  ·  "
+                 f"from {d.source_name}")
+
+    listbox.bind("<<ListboxSelect>>", _refresh)
+
+    def _populate(select=0):
+        listbox.delete(0, tk.END)
+        for p in paths:
+            listbox.insert(tk.END, p.name)
+        if paths:
+            listbox.selection_set(min(select, len(paths) - 1))
+        _refresh()
+
+    def _browse_folder():
+        nonlocal init_dir, paths
+        chosen = filedialog.askdirectory(
+            title="Choose a folder of decay exports",
+            initialdir=str(init_dir) if init_dir else "",
+            mustexist=True, parent=win)
+        if not chosen:
+            return
+        folder = Path(chosen)
+        found = discover_lifetime_csvs(folder)
+        if not found:
+            messagebox.showinfo(
+                "No decay exports",
+                f"Nothing in '{folder.name}' parsed as a lifetime decay.",
+                parent=win)
+            return
+        init_dir, paths = folder, found
+        _update_folder()
+        _populate()
+
+    def _add_files():
+        nonlocal init_dir, paths
+        new = filedialog.askopenfilenames(
+            title="Add decay export files",
+            initialdir=str(init_dir) if init_dir else "",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            parent=win)
+        if not new:
+            return
+        errors, added = [], 0
+        for n in new:
+            q = Path(n)
+            try:
+                load_lifetime_csv(q)
+            except Exception as e:
+                errors.append(f"{q.name}: {e}")
+                continue
+            if q not in paths:
+                paths.append(q)
+                added += 1
+        init_dir = Path(new[0]).parent
+        _update_folder()
+        _populate(select=len(paths) - 1 if added else 0)
+        if errors:
+            messagebox.showerror("Some files could not be read",
+                                 "\n\n".join(errors), parent=win)
+
+    bar = tk.Frame(win)
+    bar.pack(fill="x", padx=12)
+    tk.Button(bar, text="Add files…", command=_add_files, pady=3).pack(side="left")
+    tk.Button(bar, text="Browse folder…", command=_browse_folder,
+              pady=3).pack(side="left", padx=6)
+
+    btns = tk.Frame(win)
+    btns.pack(pady=8)
+
+    def _next():
+        d = _current()
+        if d is None:
+            sel = listbox.curselection()
+            if sel and isinstance(cache.get(paths[sel[0]]), Exception):
+                messagebox.showerror("Cannot read this file",
+                                     str(cache[paths[sel[0]]]), parent=win)
+            else:
+                messagebox.showinfo("Nothing selected",
+                                    "Select a decay export first.", parent=win)
+            return
+        if init_dir:
+            _last_decay_browse_dir = str(init_dir)
+        win.destroy()
+        on_done(d)
+
+    tk.Button(btns, text="Next →", width=12, command=_next,
+              pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(side="left", padx=6)
+
+    _populate()
+    win.wait_window()
 
 def _lifetime_data_dialog(parent, fcs_data, on_done):
     """Screen 1 — channel, histogram resolution, and fit window.
@@ -963,10 +1352,14 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
     import tkinter as tk
     from tkinter import messagebox
 
-    is_lt = getattr(fcs_data, "kind", None) == "lifetime_decay"
+    kind = getattr(fcs_data, "kind", None)
+    is_lt     = kind == "lifetime_decay"      # .ifx: one curve, fixed grid
+    is_loaded = kind == "loaded_decay"        # CSV: binned, but rebinnable
 
-    # .ifx is already binned → fit at native resolution (n_bins=None); .fcs uses
-    # the chosen histogram resolution.
+    # .ifx is already binned at a resolution it cannot change → fit natively
+    # (n_bins=None).  A loaded CSV is also already binned, but CAN be summed
+    # down to any exact divisor, so it keeps a resolution control restricted to
+    # those divisors.  Photon data uses the full choice.
     def _nbins():
         return None if is_lt else bin_var.get()
 
@@ -977,8 +1370,11 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
 
     tk.Label(win, text="Lifetime fit — select data",
              font=("Helvetica", 12, "bold"), pady=8).pack()
-    tk.Label(win, text=f"File: {fcs_data.filepath.name}",
-             font=("Helvetica", 9), fg="grey").pack()
+    _origin = getattr(fcs_data, "source_name", None)
+    _hdr = f"File: {fcs_data.filepath.name}"
+    if _origin and _origin != fcs_data.filepath.name:
+        _hdr += f"   (measured from {_origin})"
+    tk.Label(win, text=_hdr, font=("Helvetica", 9), fg="grey").pack()
 
     body = tk.Frame(win, padx=14, pady=8)
     body.pack(fill="x")
@@ -992,6 +1388,11 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
     tk.Label(body, text="Channel:", anchor="w").grid(row=0, column=0, sticky="w", pady=3)
     if is_lt:
         tk.Label(body, text="decay (.ifx)", anchor="w").grid(row=0, column=1, sticky="w")
+    elif is_loaded and getattr(fcs_data, "_single", False):
+        # An unlabelled single-curve export: there is nothing to choose, and
+        # offering Ch1/Ch2 would imply a detector identity the file never had.
+        tk.Label(body, text="decay (single curve)", anchor="w").grid(
+            row=0, column=1, sticky="w")
     else:
         ch_frame = tk.Frame(body)
         ch_frame.grid(row=0, column=1, sticky="w")
@@ -1006,11 +1407,26 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
                      text=f"({getattr(fcs_data, 'channel_summary', 'one channel')})",
                      font=("Helvetica", 8), fg="grey").pack(side="left", padx=(6, 0))
 
-    # Bins — only meaningful for photon data; an .ifx decay is already binned.
-    bin_var = tk.IntVar(value=4096)
+    # Bins — an .ifx decay is fixed; a loaded CSV can only be summed down to an
+    # exact divisor of what was exported, so only those are offered.  Listing
+    # the full set would let the user pick a resolution the file cannot produce
+    # and meet an error on the next screen instead of a greyed-out option here.
+    if is_loaded:
+        bin_choices = fcs_data.valid_n_bins()
+        bin_default = fcs_data.n_bins            # native, i.e. no rebinning
+    else:
+        bin_choices = list(fcs_lifetime._VALID_N_BINS)
+        bin_default = 4096
+    bin_var = tk.IntVar(value=bin_default)
     if not is_lt:
         tk.Label(body, text="Histogram bins:", anchor="w").grid(row=1, column=0, sticky="w", pady=3)
-        tk.OptionMenu(body, bin_var, *fcs_lifetime._VALID_N_BINS).grid(row=1, column=1, sticky="w")
+        tk.OptionMenu(body, bin_var, *bin_choices).grid(row=1, column=1, sticky="w")
+        if is_loaded:
+            tk.Label(body,
+                     text=f"(exported at {fcs_data.n_bins}; "
+                          f"exact rebins only)",
+                     font=("Helvetica", 8), fg="grey").grid(
+                         row=1, column=2, sticky="w", padx=(6, 0))
 
     # Window entries
     tk.Label(body, text="Fit start (ns):", anchor="w").grid(row=2, column=0, sticky="w", pady=3)
@@ -1045,8 +1461,11 @@ def _lifetime_data_dialog(parent, fcs_data, on_done):
             return None
 
     def _pick_on_hist():
+        # select_gate defaults to 512 bins, which a decay exported at 256
+        # cannot supply; ask the source what it can render.
+        gate_bins = (fcs_data.gate_n_bins(512) if is_loaded else 512)
         gate = fcs_lifetime.select_gate(
-            fcs_data, channels=(ch_var.get(),),
+            fcs_data, n_bins=gate_bins, channels=(ch_var.get(),),
             initial_gate=_current_window(),
             title="Set lifetime fit window",
             gate_label="Fit window",
@@ -1170,7 +1589,11 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
     win.grab_set()
 
     tk.Label(win, text=model.name, font=("Helvetica", 12, "bold"), pady=6).pack()
-    tk.Label(win, text=f"{fcs_data.filepath.name}  ·  Ch{channel}  ·  "
+    _origin = getattr(fcs_data, "source_name", None)
+    _name = fcs_data.filepath.name
+    if _origin and _origin != _name:
+        _name = f"{_name}  (from {_origin})"
+    tk.Label(win, text=f"{_name}  ·  Ch{channel}  ·  "
                        f"window {fit_start:.2f}–{fit_end:.2f} ns",
              font=("Helvetica", 9), fg="grey").pack()
     tk.Label(win, text=model.formula, font=("Courier", 9), fg="#444").pack(pady=(0, 6))
@@ -1281,6 +1704,8 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
         # the widget, but reading it first keeps the dependency obvious.
         fit_label = name_var.get()
         win.destroy()
+
+        result["origin"] = getattr(fcs_data, "source_name", None)
 
         report_path, _curve, _params = export_lifetime_fit(
             result, fcs_data.filepath, fit_label)

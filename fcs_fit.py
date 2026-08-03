@@ -1225,11 +1225,14 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None):
     PCH dispatch to run_lifetime_fit_dialog / run_pch_fit_dialog in the
     fcs_lifetime_fit and fcs_pch_fit modules respectively.
 
-    ``fcs_data`` may be None.  Correlation modelling reads saved CSVs and needs
-    no photon records, so it stays available; Lifetime and PCH do need them and
-    are disabled in that case.  When ``fcs_data`` is given it only supplies a
-    starting folder for the file browser — the curves themselves are whatever
-    the user picks.
+    ``fcs_data`` may be None, and all three remain available when it is.  Every
+    fitter now reads its own exported CSVs -- correlation curves, PCH
+    histograms, lifetime decays -- so none of them needs photon records in the
+    workspace, and each falls back to its own file browser when there are none.
+    That matters because the .fcs originals are far larger than the exports and
+    are often not the copy in hand.  When ``fcs_data`` is given it supplies a
+    starting folder for the browser and, where it holds the right kind of data,
+    the option of fitting it directly.
 
     ``workspace_order`` is an optional list of source .fcs file names in
     workspace order; when given, discovered correlation datasets are listed
@@ -1243,7 +1246,10 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None):
     win.resizable(False, False)
     win.grab_set()
 
-    have_photons = fcs_data is not None
+    # Photon records specifically, not just "something is loaded": an .ifx
+    # decay or a loaded histogram has a filepath but no arrival times, and
+    # offering PCH the chance to bin them would fail on the next screen.
+    photon_data = (fcs_data if hasattr(fcs_data, "ch1_times_s") else None)
 
     tk.Label(win, text="Model data",
              font=("Helvetica", 12, "bold"), pady=8).pack()
@@ -1260,24 +1266,25 @@ def run_model_dialog(fcs_data=None, parent=None, workspace_order=None):
 
     def _lifetime():
         win.destroy()
-        fcs_lifetime_fit.run_lifetime_fit_dialog(fcs_data, parent=parent)
+        # The tail-vs-reconvolution choice comes AFTER this one: asking how to
+        # fit a lifetime before the user has said they want a lifetime fit puts
+        # the questions in the wrong order.
+        fcs_lifetime_fit.run_lifetime_method_dialog(fcs_data, parent=parent)
 
     def _pch():
         win.destroy()
-        fcs_pch_fit.run_pch_fit_dialog(fcs_data, parent=parent)
+        fcs_pch_fit.run_pch_fit_dialog(photon_data, parent=parent)
 
     tk.Button(btns, text="Correlation", width=26, pady=6,
               command=_correlation).pack(pady=4)
     tk.Button(btns, text="Lifetime", width=26, pady=6,
-              command=_lifetime,
-              state=("normal" if have_photons else "disabled")).pack(pady=4)
+              command=_lifetime).pack(pady=4)
     tk.Button(btns, text="PCH", width=26, pady=6,
-              command=_pch,
-              state=("normal" if have_photons else "disabled")).pack(pady=4)
+              command=_pch).pack(pady=4)
 
-    if not have_photons:
-        tk.Label(win, text="Lifetime and PCH need the photon records in an\n"
-                           ".fcs file — add one to the workspace to use them.",
+    if photon_data is None:
+        tk.Label(win, text="No photon records loaded — each fitter will ask\n"
+                           "for a saved CSV from the analysis folder.",
                  font=("Helvetica", 9), fg="grey", justify="center").pack()
 
     tk.Button(win, text="Cancel", width=10, command=win.destroy,

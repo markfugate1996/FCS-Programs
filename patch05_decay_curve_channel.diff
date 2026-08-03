@@ -1,0 +1,41 @@
+--- a/fcs_lifetime_fit.py
++++ b/fcs_lifetime_fit.py
+@@ -451,7 +451,7 @@
+         """
+         return self.irf is not None and len(np.asarray(self.irf)) > 0
+ 
+-    def decay_curve(self):
++    def decay_curve(self, channel: Optional[int] = None):
+         """
+         Return ``(t_ns, decay, irf)`` at the stored resolution.
+ 
+@@ -459,8 +459,28 @@
+         object -- the other two being ``filepath`` and ``has_irf`` -- so a
+         loaded decay can be reconvolution-fitted with no change there beyond
+         admitting its ``kind``.
++
++        Choosing the channel
++        --------------------
++        An .ifx decay is one curve, so ``LifetimeData.decay_curve()`` takes no
++        argument and the reconvolution fitter never had a channel to pick.  A
++        two-channel export is different, and defaulting to the first channel
++        would hand back a Ch1 decay to a caller that never said which detector
++        it meant -- a fitted lifetime attributed to the wrong channel, with
++        nothing in the result to show for it.  So an ambiguous request raises
++        and the caller must choose.  A file holding one decay, labelled or not,
++        is unambiguous and needs no argument.
+         """
+-        counts = self.counts(None if self._single else self.channels[0])
++        if channel is None:
++            if self._single or len(self.channels) == 1:
++                channel = None if self._single else self.channels[0]
++            else:
++                raise ValueError(
++                    f"{self.filepath.name} holds {self.channel_summary}; "
++                    f"decay_curve() needs a channel to say which decay to "
++                    f"return.  Pass channel=1 or channel=2."
++                )
++        counts = self.counts(channel)
+         irf = (np.asarray(self.irf, dtype=np.float64).copy()
+                if self.has_irf else None)
+         return self.t_ns.copy(), counts.copy(), irf

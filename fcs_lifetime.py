@@ -216,6 +216,51 @@ def _default_gate(d: FCSData, n_bins: int = 256) -> Tuple[float, float]:
     return gate_min_ns, gate_max_ns
 
 
+# ── Reopening an exported decay ───────────────────────────────────────────────
+
+def rebuild_plot(meta, columns, show: bool = True, path=None):
+    """
+    Redraw an exported lifetime decay as a live figure, for fcs_plotopen.
+
+    Calls the SAME :func:`plot_lifetime` that drew the file originally, via the
+    LoadedDecay adapter, so a reopened figure is identical to a fresh one.
+
+    The CSV is re-read rather than rebuilt from *columns*: fcs_lifetime_fit
+    already owns the parsing of these files -- which column names mean which
+    channel, where the IRF lives, how a single unlabelled decay is handled --
+    and a second parser here would be one more thing to keep in step for no
+    gain.  fcs_lifetime_fit is imported inside the function because it imports
+    this module; at module scope that would be a cycle.
+    """
+    if path is None:
+        raise ValueError(
+            "Reopening a lifetime decay needs the file itself, not just its "
+            "parsed contents.")
+    import fcs_lifetime_fit
+
+    d = fcs_lifetime_fit.load_decay_object(path)
+
+    # plot_lifetime rejects a resolution outside _VALID_N_BINS.  An export made
+    # by this suite is always one of them, but a hand-edited or externally
+    # produced file need not be, and refusing to DRAW a decay over a bin count
+    # would be a poor trade -- fall back to the coarsest exact rebin that is
+    # valid, and say so rather than silently changing the resolution.
+    n_bins = d.n_bins
+    if n_bins not in _VALID_N_BINS:
+        valid = [n for n in d.valid_n_bins() if n in _VALID_N_BINS]
+        if not valid:
+            raise ValueError(
+                f"{Path(path).name} holds {d.n_bins} bins, which is not one of "
+                f"{_VALID_N_BINS} and cannot be reduced to one of them by an "
+                f"exact rebin, so it cannot be redrawn.")
+        n_bins = max(valid)
+        print(f"[lifetime] {Path(path).name} holds {d.n_bins} bins; "
+              f"redrawing at {n_bins}.")
+
+    return plot_lifetime(d, n_bins=n_bins, channels=d.channels,
+                         show=show, export=False)
+
+
 # ── Main plotting function ────────────────────────────────────────────────────
 
 def plot_lifetime(

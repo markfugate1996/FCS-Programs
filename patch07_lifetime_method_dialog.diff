@@ -1,0 +1,75 @@
+--- a/fcs_lifetime_fit.py
++++ b/fcs_lifetime_fit.py
+@@ -1061,6 +1061,72 @@
+                             lambda: _run(fcs_data), _from_csv)
+ 
+ 
++def run_lifetime_method_dialog(data=None, parent=None):
++    """
++    Choose tail fit vs IRF reconvolution, then hand off to that fitter.
++
++    This screen used to live in fcs_main and fired straight off the workspace,
++    before the user had said they wanted a lifetime fit at all.  It belongs
++    after that choice, and it belongs here, in the module that owns lifetime
++    fitting -- fcs_main should route to a workflow, not implement one.
++
++    Both methods stay selectable whatever ``data`` is.  Each fitter has its own
++    source screen and can open a saved decay, so greying reconvolution out
++    because the file in the workspace has no IRF would hide the CSV browser
++    behind a file the user may not have meant to fit at all.  Reconvolution
++    without an IRF is a tail fit under another name, and fcs_lifetime_recon
++    asks before running one.
++    """
++    import tkinter as tk
++
++    win = tk.Toplevel(parent)
++    win.title("Model lifetime decay")
++    win.resizable(False, False)
++    win.grab_set()
++
++    tk.Label(win, text="Model lifetime decay",
++             font=("Helvetica", 12, "bold"), pady=8).pack()
++    if data is not None and getattr(data, "filepath", None) is not None:
++        tk.Label(win, text=data.filepath.name,
++                 font=("Helvetica", 9), fg="grey").pack()
++
++    method_var = tk.StringVar(value="tail")
++    frame = tk.LabelFrame(win, text="Method", padx=12, pady=8)
++    frame.pack(fill="x", padx=14, pady=8)
++    tk.Radiobutton(frame, text="Tail fit  (sum of exponentials, no IRF)",
++                   variable=method_var, value="tail", anchor="w").pack(fill="x")
++    tk.Radiobutton(frame, text="IRF reconvolution",
++                   variable=method_var, value="recon", anchor="w").pack(fill="x")
++
++    if data is not None and hasattr(data, "has_irf"):
++        note = ("this decay carries an IRF" if data.has_irf
++                else "this decay has no IRF — reconvolution would need a "
++                     "saved decay that kept one")
++    else:
++        note = "reconvolution needs a decay whose export kept its IRF column"
++    tk.Label(frame, text=note, font=("Helvetica", 8), fg="grey",
++             wraplength=300, justify="left").pack(fill="x", pady=(2, 0))
++
++    def _go():
++        method = method_var.get()
++        win.destroy()
++        if method == "recon":
++            # Imported here so the two lifetime fitters stay independent at
++            # module scope; either can be used without loading the other.
++            import fcs_lifetime_recon
++            fcs_lifetime_recon.run_reconv_fit_dialog(data, parent=parent)
++        else:
++            run_lifetime_fit_dialog(data, parent=parent)
++
++    btns = tk.Frame(win)
++    btns.pack(pady=10)
++    tk.Button(btns, text="Next →", width=12, command=_go,
++              pady=4).pack(side="left", padx=6)
++    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
++              pady=4).pack(side="left", padx=6)
++    win.wait_window()
++
++
+ def _lifetime_source_dialog(parent, fcs_data, on_photons, on_csv):
+     """Screen 0 — fit the active file's photon records, or a saved decay."""
+     import tkinter as tk

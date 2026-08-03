@@ -1,0 +1,127 @@
+--- a/fcs_pch.py
++++ b/fcs_pch.py
+@@ -36,6 +36,7 @@
+ 
+ from __future__ import annotations
+ 
++from pathlib import Path
+ from typing import Tuple, Dict, NamedTuple, Optional
+ 
+ import numpy as np
+@@ -614,6 +615,116 @@
+     return fig, ax
+ 
+ 
++# ── Reopening an exported PCH ─────────────────────────────────────────────────
++
++def _label_colour(label: str) -> str:
++    """Plot colour for an exported series label ('Ch1', 'Ch2', 'Ch1+Ch2')."""
++    if "+" in label:
++        return _CH_COLOUR["both"]
++    if label.startswith("Ch") and label[2:].isdigit():
++        return _CH_COLOUR.get(int(label[2:]), _CH_COLOUR[1])
++    return _CH_COLOUR[1]
++
++
++class _RebuiltSource:
++    """
++    Stands in for the FCSData a rebuilt plot no longer has.
++
++    Named after the ORIGINAL measurement rather than the CSV, so a reopened
++    figure carries the same title as a freshly drawn one; the point of
++    reopening is to get the result back, not to be reminded which file it was
++    cached in.
++    """
++    def __init__(self, path, name):
++        self.filepath = Path(name) if name else Path(path)
++
++
++def rebuild_plot(meta, columns, show: bool = True, path=None):
++    """
++    Redraw an exported PCH as a live figure, for :mod:`fcs_plotopen`.
++
++    Takes what :func:`fcs_export.read_export` returns and calls the SAME
++    :func:`plot_pch` that drew the file in the first place, so a reopened
++    figure is identical to a fresh one and there is no second rendering path to
++    drift out of step.
++
++    Rebuilding uses ``pk``, not the counts: p(k) is what was plotted, and it is
++    present in every PCH export including ones written before the raw counts
++    were added.  A histogram that cannot be FITTED can still be LOOKED at, and
++    refusing to reopen it would be a needless loss -- the counts matter for
++    Poisson weighting, which a plot does not do.
++    """
++    if "k" not in columns:
++        raise ValueError(
++            "This file has no 'k' column, so it is not a PCH export.")
++    if "pk_fit" in columns or "counts_fit" in columns:
++        raise ValueError(
++            "This is a PCH fit curve, not a measured histogram.  Reopen the "
++            "histogram written by the PCH plotting task instead.")
++
++    k_all = np.asarray(columns["k"], dtype=np.float64)
++
++    labels = [c[3:] for c in columns if c.startswith("pk_")]
++    if not labels:
++        raise ValueError(
++            "This file has a 'k' column but no 'pk_<channel>' column, so "
++            "there is no histogram in it to draw.")
++
++    try:
++        bin_width_s = float(meta.get("bin_width_s"))
++    except (TypeError, ValueError):
++        raise ValueError(
++            "This PCH export does not record 'bin_width_s' in its header, so "
++            "the histogram cannot be labelled with the bin width it used.")
++
++    channels_data: Dict[str, PCHSeries] = {}
++    for label in labels:
++        pk = np.asarray(columns[f"pk_{label}"], dtype=np.float64)
++        good = np.isfinite(pk)
++        if not good.any():
++            continue
++        k_ser  = k_all[good].astype(int)
++        pk_ser = pk[good]
++
++        # Moments come from the header when it has them and are otherwise
++        # recomputed from p(k).  Both are needed: the Poisson reference curve
++        # and the Q annotation are drawn from <k> and Var(k).
++        def _hdr(key, fallback):
++            try:
++                v = float(meta[f"{label}_{key}"])
++                return v if np.isfinite(v) else fallback
++            except (KeyError, TypeError, ValueError):
++                return fallback
++        norm  = pk_ser.sum()
++        mean0 = float(np.sum(pk_ser * k_ser) / norm) if norm else float("nan")
++        var0  = (float(np.sum(pk_ser * (k_ser - mean0) ** 2) / norm)
++                 if norm else float("nan"))
++
++        n_col = columns.get(f"n_{label}")
++        n_k = M = None
++        if n_col is not None:
++            n_arr = np.asarray(n_col, dtype=np.float64)[good]
++            if np.isfinite(n_arr).all():
++                n_k = n_arr
++                M = int(round(float(n_arr.sum())))
++
++        channels_data[label] = PCHSeries(
++            k=k_ser, pk=pk_ser,
++            mean=_hdr("mean", mean0), var=_hdr("var", var0),
++            colour=_label_colour(label),
++            n_k=n_k, M=M or 0,
++            cps=_hdr("observed_cps", None),
++        )
++
++    if not channels_data:
++        raise ValueError("This PCH export contains no plottable series.")
++
++    src = _RebuiltSource(path, meta.get("source file") or meta.get("source"))
++    # export=False without exception: reopening is for looking at a result, and
++    # re-exporting would overwrite the very file just read.
++    return plot_pch(channels_data, bin_width_s, src, show=show, export=False)
++
++
+ # ── Dialog ────────────────────────────────────────────────────────────────────
+ 
+ _defaults: dict = {

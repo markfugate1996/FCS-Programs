@@ -1,0 +1,95 @@
+--- a/fcs_pch_fit.py
++++ b/fcs_pch_fit.py
+@@ -16,13 +16,18 @@
+     4. Fit, plot data + fit + residuals, write a report and curve CSV
+        to a 'fits' folder beside the source .fcs file.
+ 
+-Like the lifetime fitter, the PCH fitter works from the FCSData object (not from
+-a saved CSV): it bins the photon stream itself, which keeps the raw per-count
++The PCH fitter bins the photon stream itself, which keeps the raw per-count
+ frequencies and the number of sampled bins M.  M is needed to weight the fit by
+ the Poisson error of each histogram bin (σ = √counts), which is what makes the
+ reduced χ² meaningful — the same statistics family as the correlation and
+ lifetime fitters.
+ 
++Binning runs over the acquisition window from fcs_pch.acquisition_window, not
++over each channel's own first-to-last photon.  Time in which the detector was
++running and saw nothing is a measurement of k = 0 and is binned as such; the
++older photon-span window silently dropped those bins, which biased p(0) low and
++gave the two channels different M for one shared acquisition.
++
+ The numerical core (pch_counts, auto_guess_pch, fit_pch) has no GUI dependency.
+ The PCH model kernel itself lives in fcs_models (PCH_MODELS).
+ 
+@@ -63,6 +68,8 @@
+ def pch_counts(
+     times_s: np.ndarray,
+     bin_width_s: float,
++    t_start: Optional[float] = None,
++    t_end: Optional[float] = None,
+ ) -> Tuple[np.ndarray, np.ndarray, int, float, float]:
+     """
+     Build the photon counting histogram as RAW per-count frequencies.
+@@ -71,6 +78,14 @@
+     number of time bins containing exactly k photons) and the number of sampled
+     bins M, which the fit needs for Poisson weighting.
+ 
++    This is now a thin alias for :func:`fcs_pch.compute_pch_counts`.  The two
++    were separate copies of the same arithmetic, which is precisely the
++    arrangement that lets a fit and the export of the same data drift apart;
++    one definition cannot.  Pass ``t_start`` / ``t_end`` -- normally from
++    :func:`fcs_pch.acquisition_window` -- so that observed empty time at the
++    head and tail of the acquisition is binned honestly as k = 0 instead of
++    being trimmed off with the window.
++
+     Returns
+     -------
+     k    : np.ndarray (int)    count values 0..k_max
+@@ -79,22 +94,8 @@
+     mean : float               mean photons per bin  <k>
+     var  : float               variance of photons per bin  Var(k)
+     """
+-    times_s = np.asarray(times_s, dtype=np.float64)
+-    if times_s.size == 0:
+-        raise ValueError("times_s is empty; cannot compute PCH.")
+-
+-    t_start, t_end = times_s[0], times_s[-1]
+-    M = max(1, int((t_end - t_start) / bin_width_s))
+-    edges = t_start + np.arange(M + 1) * bin_width_s
+-    counts, _ = np.histogram(times_s, bins=edges)
+-
+-    mean = float(counts.mean())
+-    var  = float(counts.var(ddof=1)) if len(counts) > 1 else float("nan")
+-
+-    k_max = int(counts.max())
+-    k   = np.arange(0, k_max + 1, dtype=int)
+-    n_k = np.bincount(counts, minlength=k_max + 1).astype(float)
+-    return k, n_k, int(M), mean, var
++    return fcs_pch.compute_pch_counts(
++        times_s, bin_width_s, t_start=t_start, t_end=t_end)
+ 
+ 
+ def channel_times(fcs_data: FCSData, channel: str) -> np.ndarray:
+@@ -535,7 +536,10 @@
+         bw = fcs_pch._BIN_WIDTH_OPTIONS[bw_var.get()]
+         try:
+             t = channel_times(fcs_data, channel)
+-            k, n_k, M, mean, var = pch_counts(t, bw)
++            # Bin over the acquisition window, not this channel's first-to-last
++            # photon, so leading/trailing empty time counts as k = 0.
++            t0, t1, _wsrc = fcs_pch.acquisition_window(fcs_data)
++            k, n_k, M, mean, var = pch_counts(t, bw, t_start=t0, t_end=t1)
+         except Exception as e:
+             messagebox.showerror("PCH error", str(e), parent=win)
+             return
+@@ -726,7 +730,9 @@
+     model = fcs_models.get_pch_model(key)
+ 
+     d = read_fcs(path)
+-    k, n_k, M, mean, var = pch_counts(channel_times(d, ch), bw)
++    _t0, _t1, _wsrc = fcs_pch.acquisition_window(d)
++    k, n_k, M, mean, var = pch_counts(channel_times(d, ch), bw,
++                                      t_start=_t0, t_end=_t1)
+     guesses = auto_guess_pch(model, mean, var)
+     lowers = {p.name: p.lower for p in model.params}
+     uppers = {p.name: p.upper for p in model.params}

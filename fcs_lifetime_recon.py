@@ -561,6 +561,11 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
              f"free params : {len(result['free'])}   dof : {result['dof']}")
     L.append(f"weighting  : {'Poisson σ=√N' if result['weighted'] else 'none (unweighted)'}")
     L.append(f"IRF        : {'measured (reconvolution)' if result['has_irf'] else 'none (tail fit)'}")
+    if result.get("channel") is not None:
+        L.append(f"channel    : Ch{result['channel']}")
+    if result.get("origin") and result["origin"] != source_path.name:
+        # Fitting a saved decay: name the file the photons were measured in.
+        L.append(f"measured from : {result['origin']}")
     win = result.get("fit_window_ns")
     if win is not None:
         L.append(f"fit window : {win[0]:.3f} – {win[1]:.3f} ns "
@@ -705,28 +710,152 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
-def run_reconv_fit_dialog(data: LifetimeData, parent=None):
+def _is_decay_like(data) -> bool:
     """
-    Full GUI flow for IRF-reconvolution lifetime modelling: choose a model, set
-    up the fit, then fit, plot and export.  ``data`` must be a
-    :class:`fcs_ifx.LifetimeData`.
+    True when *data* can supply a decay curve for reconvolution.
+
+    Tested by capability rather than by ``kind``.  The gate here used to
+    compare against ``fcs_ifx.LIFETIME_KIND``, which admitted .ifx decays and
+    nothing else -- so a decay exported to CSV and read back was refused even
+    though it answers every call this module makes.  The surface really needed
+    is three attributes wide (``decay_curve``, ``has_irf``, ``filepath``), so
+    that is what is checked; a new decay source works here the day it satisfies
+    them, without another kind string being added to a list.
+    """
+    return (callable(getattr(data, "decay_curve", None))
+            and getattr(data, "filepath", None) is not None)
+
+
+def run_reconv_fit_dialog(data=None, parent=None):
+    """
+    Full GUI flow for IRF-reconvolution lifetime modelling: choose the decay,
+    then a model, then set up the fit, fit, plot and export.
+
+    ``data`` may be an :class:`fcs_ifx.LifetimeData`, a
+    ``fcs_lifetime_fit.LoadedDecay`` read back from an exported CSV, or None.
+    Anything that is not decay-shaped -- photon records, most obviously --
+    falls through to the saved-decay browser rather than being turned away,
+    since a .fcs in hand is no reason to refuse the decay CSV beside it.
     """
     import tkinter as tk
     from tkinter import messagebox
 
-    if getattr(data, "kind", None) != getattr(__import__("fcs_ifx"), "LIFETIME_KIND", "lifetime_decay"):
-        messagebox.showinfo(
-            "Lifetime fitting",
-            "Lifetime fitting works on time-domain decay files (.ifx).\n"
-            "The active file is not a lifetime decay dataset.",
-            parent=parent,
-        )
+    def _run(d, channel=None):
+        if not getattr(d, "has_irf", False):
+            # Reconvolution without an IRF is a tail fit wearing the wrong
+            # name.  The module can run it (has_irf=False is handled), but say
+            # so rather than let a report claim a reconvolution that had no
+            # instrument response behind it.
+            if not messagebox.askyesno(
+                    "No IRF in this decay",
+                    f"{d.filepath.name} carries no IRF, so this would be a "
+                    f"tail fit rather than a reconvolution.\n\n"
+                    f"Continue anyway?",
+                    parent=parent):
+                return
+        def _after_model(model: LifetimeModel):
+            _lifetime_setup_dialog(parent, model, d, channel=channel)
+        _select_lifetime_model_dialog(parent, _after_model)
+
+    def _from_csv():
+        # Imported here, not at module scope: fcs_lifetime_fit is a sibling
+        # fitter and a top-level import would couple the two modules' import
+        # order for the sake of one dialog.
+        import fcs_lifetime_fit
+        fcs_lifetime_fit._lifetime_csv_dialog(
+            parent, data if _is_decay_like(data) else None,
+            lambda d: _pick_channel(parent, d, _run))
+
+    if data is None or not _is_decay_like(data):
+        _from_csv()
         return
 
-    def _after_model(model: LifetimeModel):
-        _lifetime_setup_dialog(parent, model, data)
+    _reconv_source_dialog(parent, data,
+                          lambda: _pick_channel(parent, data, _run), _from_csv)
 
-    _select_lifetime_model_dialog(parent, _after_model)
+
+def _reconv_source_dialog(parent, data, on_active, on_csv):
+    """Screen 0 — reconvolve the active decay, or one saved to CSV."""
+    import tkinter as tk
+
+    win = tk.Toplevel(parent)
+    win.title("Reconvolution fit — source")
+    win.resizable(False, False)
+    win.grab_set()
+
+    tk.Label(win, text="Reconvolution fit — choose the decay",
+             font=("Helvetica", 12, "bold"), pady=8).pack()
+
+    body = tk.Frame(win, padx=16, pady=4)
+    body.pack(fill="x")
+
+    def _go(fn):
+        win.destroy()
+        fn()
+
+    tk.Button(body, text="Active decay", width=32, pady=6,
+              command=lambda: _go(on_active)).pack(pady=3)
+    tk.Label(body, text=f"{data.filepath.name}\n"
+                        f"IRF: {'present' if getattr(data, 'has_irf', False) else 'none'}",
+             font=("Helvetica", 8), fg="grey", justify="center").pack()
+
+    tk.Button(body, text="Saved decay (CSV)…", width=32, pady=6,
+              command=lambda: _go(on_csv)).pack(pady=(10, 3))
+    tk.Label(body, text="an export keeps its IRF column when one was saved",
+             font=("Helvetica", 8), fg="grey").pack()
+
+    tk.Button(win, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(pady=10)
+    win.wait_window()
+
+
+def _pick_channel(parent, data, on_done):
+    """
+    Screen 0c — which decay, when the source holds more than one.
+
+    An .ifx decay is a single curve and this screen never appears.  A
+    two-channel export genuinely has two decays with different lifetimes, and
+    ``LoadedDecay.decay_curve`` refuses to guess between them, so the choice is
+    made here and carried into the fit and its report.
+    """
+    import tkinter as tk
+
+    channels = tuple(getattr(data, "channels", ()) or ())
+    if len(channels) < 2:
+        on_done(data, channels[0] if channels else None)
+        return
+
+    win = tk.Toplevel(parent)
+    win.title("Reconvolution fit — channel")
+    win.resizable(False, False)
+    win.grab_set()
+
+    tk.Label(win, text="Which decay?", font=("Helvetica", 12, "bold"),
+             pady=8).pack()
+    tk.Label(win, text=f"{data.filepath.name} holds "
+                       f"{getattr(data, 'channel_summary', 'two decays')}",
+             font=("Helvetica", 9), fg="grey").pack()
+
+    ch_var = tk.IntVar(value=channels[0])
+    body = tk.Frame(win, padx=16, pady=8)
+    body.pack(fill="x")
+    for c in channels:
+        tk.Radiobutton(body, text=f"Ch{c}", variable=ch_var, value=c,
+                       anchor="w").pack(fill="x")
+
+    btns = tk.Frame(win)
+    btns.pack(pady=8)
+
+    def _next():
+        c = ch_var.get()
+        win.destroy()
+        on_done(data, c)
+
+    tk.Button(btns, text="Next →", width=12, command=_next,
+              pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(side="left", padx=6)
+    win.wait_window()
 
 
 def _select_lifetime_model_dialog(parent, on_choose):
@@ -780,12 +909,25 @@ def _select_lifetime_model_dialog(parent, on_choose):
     win.wait_window()
 
 
-def _lifetime_setup_dialog(parent, model: LifetimeModel, data: LifetimeData):
+def _decay_curve_of(data, channel=None):
+    """
+    ``data.decay_curve()``, passing *channel* only when there is one to pass.
+
+    ``LifetimeData.decay_curve()`` takes no arguments, so the channel cannot be
+    forwarded unconditionally; a loaded two-channel export needs it and will
+    raise without it.
+    """
+    if channel is None:
+        return data.decay_curve()
+    return data.decay_curve(channel)
+
+
+def _lifetime_setup_dialog(parent, model: LifetimeModel, data, channel=None):
     """Screen 2 — initial guesses, bounds and fixed flags, then fit."""
     import tkinter as tk
     from tkinter import messagebox
 
-    t_ns, decay, irf = data.decay_curve()
+    t_ns, decay, irf = _decay_curve_of(data, channel)
     peak_idx = int(np.argmax(decay))
     guesses0 = auto_guess_lifetime(model, t_ns, decay, peak_idx)
 
@@ -796,7 +938,13 @@ def _lifetime_setup_dialog(parent, model: LifetimeModel, data: LifetimeData):
 
     tk.Label(win, text=model.name, font=("Helvetica", 12, "bold"),
              pady=6).pack()
-    tk.Label(win, text=f"Data: {data.filepath.name}", font=("Helvetica", 9),
+    _origin = getattr(data, "source_name", None)
+    _name = data.filepath.name
+    if _origin and _origin != _name:
+        _name = f"{_name}  (from {_origin})"
+    if channel is not None:
+        _name = f"{_name}  ·  Ch{channel}"
+    tk.Label(win, text=f"Data: {_name}", font=("Helvetica", 9),
              fg="grey").pack()
     tk.Label(win, text=model.formula, font=("Courier", 9), fg="#444").pack(pady=(0, 4))
     irf_note = ("IRF: measured (iterative reconvolution)" if data.has_irf
@@ -939,6 +1087,9 @@ def _lifetime_setup_dialog(parent, model: LifetimeModel, data: LifetimeData):
         fit_label = name_var.get()
         win.destroy()
 
+        result["origin"]  = getattr(data, "source_name", None)
+        result["channel"] = channel
+
         report_path, _curve, _params = export_lifetime_fit(
             result, data.filepath, fit_label)
         fig, _axes = plot_lifetime_fit(result, data.filepath.name, show=False)
@@ -992,7 +1143,13 @@ if __name__ == "__main__":
     start_ns = float(sys.argv[3]) if len(sys.argv) > 3 else None
     end_ns = float(sys.argv[4]) if len(sys.argv) > 4 else None
 
-    t_ns, decay, irf = d.decay_curve()
+    _chs = tuple(getattr(d, "channels", ()) or ())
+    _cli_ch = _chs[0] if len(_chs) > 1 else None
+    if _cli_ch is not None:
+        print(f"[recon] {d.filepath.name} holds {len(_chs)} decays; "
+              f"fitting Ch{_cli_ch}.  Pass a single-channel export to choose "
+              f"another.")
+    t_ns, decay, irf = _decay_curve_of(d, _cli_ch)
     peak_idx = int(np.argmax(decay))
     guesses = auto_guess_lifetime(model, t_ns, decay, peak_idx)
     lowers = {p.name: p.lower for p in model.params}
@@ -1002,6 +1159,8 @@ if __name__ == "__main__":
     result = fit_lifetime(model, t_ns, decay, irf, guesses, lowers, uppers,
                           fixed, weighted=True, has_irf=d.has_irf,
                           fit_start_ns=start_ns, fit_end_ns=end_ns)
+    result["origin"]  = getattr(d, "source_name", None)
+    result["channel"] = _cli_ch
     export_lifetime_fit(result, d.filepath)
     print("\nFitted lifetimes:")
     for i, tn in enumerate(model.tau_names):
