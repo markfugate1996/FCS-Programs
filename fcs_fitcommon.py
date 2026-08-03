@@ -17,9 +17,17 @@ already lives inside a ``fits/`` folder, so the other three would nest
 Scope and dependencies
 ----------------------
 Deliberately depends on nothing but the standard library (``pathlib``,
-``datetime``, ``math``).  No numpy, no matplotlib, no tkinter, and no ``fcs_*``
-imports — so every fit module can import it with no risk of an import cycle and
-no cost at start-up.
+``datetime``, ``math``) AT IMPORT TIME.  No numpy, no matplotlib, no tkinter,
+and no ``fcs_*`` imports — so every fit module can import it with no risk of an
+import cycle and no cost at start-up.
+
+:func:`write_params_table` makes one narrow exception: it imports
+``fcs_export.write_table_xlsx`` INSIDE the function body, not at module scope.
+That keeps both properties the rule exists to protect — nothing is imported
+until a fit is actually exported, and the import graph at module load is
+unchanged — while letting all four fitters share one spreadsheet writer instead
+of each wrapping their own.  If ``fcs_export`` is unavailable for any reason the
+CSV is still written and only the ``.xlsx`` is skipped.
 
 Note on ``math.inf`` vs ``np.inf``: they are the same float value
 (``math.inf == np.inf`` and ``np.isinf(math.inf)`` is True), so callers that
@@ -154,6 +162,115 @@ def parse_bound(text: str, default: float) -> float:
     return float(t)
 
 
+# ── Parameter tables ──────────────────────────────────────────────────────────
+
+def params_cell(v) -> str:
+    """
+    Render one value as a CSV cell for a parameter table.
+
+    * Non-finite numbers (NaN, +/-inf) become an EMPTY cell.  NaN in these
+      tables means "not estimated" -- a parameter held fixed, a background
+      correction the source CSV did not carry, a count rate that was never
+      recorded.  A blank reads as absence to a human, to pandas, and to
+      :func:`fcs_export.read_export`, which maps it straight back to NaN.  The
+      literal text "nan" reads as a value, and Excel treats it as text and then
+      refuses to plot the column.
+    * Finite numbers use 10 significant figures, matching fcs_export.
+    * Anything else is passed through as text.
+    * Cells containing a comma, quote or newline are quoted per RFC 4180, so a
+      dataset name with a comma in it no longer silently shifts every later
+      column in the row by one.
+
+    Note that ``bool`` is a subclass of ``int`` and would render as 1/0; the
+    fitters pass "yes"/"no" strings instead, which is what the readers expect.
+    """
+    if isinstance(v, str):
+        cell = v
+    else:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            cell = str(v)
+        else:
+            cell = "" if not math.isfinite(f) else f"{f:.10g}"
+    if any(c in cell for c in (',', '"', '\n', '\r')):
+        return '"' + cell.replace('"', '""') + '"'
+    return cell
+
+
+def write_params_table(
+    csv_path: Path,
+    comments: list,
+    header: list,
+    rows: list,
+    *,
+    log_tag: str = "fit",
+    sheet_title: str = "fit parameters",
+) -> tuple:
+    """
+    Write a fit's parameter table as a CSV plus a matching ``.xlsx`` mirror.
+
+    Every fitter in the suite ends by writing the same artefact: a commented
+    header block, one column-title row, then one row per fitted dataset with
+    each parameter as a value + ``_err`` pair.  Four modules each had their own
+    copy of that loop, and they had already drifted -- three wrote a blank cell
+    for a non-finite value while fcs_fit wrote the text "nan", so the same
+    missing quantity looked different depending on which fitter produced it.
+    One definition removes that whole class of bug, exactly as this module did
+    for ``fits_dir`` and ``new_fit_dir``.
+
+    The ``.xlsx`` path is derived from *csv_path* rather than passed in: the
+    two files are the same table in two formats and must not be allowed to
+    drift apart in name any more than in content.
+
+    Parameters
+    ----------
+    csv_path : Path
+        Destination ``.csv``.  The spreadsheet is written alongside it with the
+        same stem and a ``.xlsx`` suffix.
+    comments : list of str
+        Header block.  Written as ``# line`` in the CSV and as grey italics
+        above the table in the spreadsheet.  Use DISTINCT keys for
+        ``key : value`` lines -- fcs_export.read_export parses them into a dict,
+        so four lines all called "note" collapse to one.
+    header : list of str
+        Column titles.
+    rows : list of sequences
+        Table body, one sequence per dataset.  Values are rendered by
+        :func:`params_cell`.
+    log_tag : str
+        Prefix for the console messages, e.g. "globalfit" or "reconv fit".
+    sheet_title : str
+        Worksheet name.
+
+    Returns
+    -------
+    (csv_path, xlsx_path or None)
+        The spreadsheet is None when openpyxl is missing or the write failed;
+        that never costs you the CSV, which is written first.
+    """
+    csv_path = Path(csv_path)
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        for line in comments:
+            fh.write(f"# {line}\n")
+        fh.write(",".join(str(h) for h in header) + "\n")
+        for row in rows:
+            fh.write(",".join(params_cell(v) for v in row) + "\n")
+    print(f"[{log_tag}] wrote {csv_path}")
+
+    xlsx_path = csv_path.with_suffix(".xlsx")
+    try:
+        from fcs_export import write_table_xlsx
+    except Exception as exc:   # noqa: BLE001 - the CSV must survive anything
+        print(f"[{log_tag}] could not load the spreadsheet writer ({exc}); "
+              f".csv is unaffected.")
+        return csv_path, None
+
+    written = write_table_xlsx(xlsx_path, comments, header, rows,
+                               sheet_title=sheet_title, log_tag=log_tag)
+    return csv_path, written
+
+
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
 def _selftest() -> None:
@@ -224,6 +341,29 @@ def _selftest() -> None:
         e = new_fit_dir(src, "***")
         assert e.name.startswith(a.name), e.name
         assert e.name[len(a.name):].lstrip("_").isdigit(), e.name
+
+        # write_params_table: blanks, quoting, and the .xlsx sibling
+        pt = root / "data" / "fits" / "t_params.csv"
+        csvp, _xl = write_params_table(
+            pt,
+            ["Test table", "note_a : first", "note_b : second"],
+            ["dataset", "tau", "tau_err", "n"],
+            [["plain", 1.5, float("nan"), 12],
+             ["has,comma", float("inf"), 2.0, 3]],
+            log_tag="selftest")
+        body = [l for l in csvp.read_text(encoding="utf-8").splitlines()
+                if not l.startswith("#")]
+        assert body[0] == "dataset,tau,tau_err,n", body[0]
+        assert body[1] == "plain,1.5,,12", body[1]          # NaN -> blank
+        assert body[2] == '"has,comma",,2,3', body[2]       # quoted; inf -> blank
+
+    # params_cell
+    assert params_cell(float("nan")) == ""
+    assert params_cell(float("inf")) == ""
+    assert params_cell(1.23456789012345) == "1.23456789"
+    assert params_cell(12) == "12"
+    assert params_cell("Ch1") == "Ch1"
+    assert params_cell('say "hi"') == '"say ""hi"""'
 
     print("fcs_fitcommon: all self-tests passed.")
 

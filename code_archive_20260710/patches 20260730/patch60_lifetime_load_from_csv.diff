@@ -1,0 +1,181 @@
+--- a/fcs_lifetime_fit.py
++++ b/fcs_lifetime_fit.py
+@@ -55,6 +55,8 @@
+ import fcs_lifetime
+ import fcs_fisher
+ 
++import fcs_export
++
+ from fcs_fitcommon import (
+     fits_dir as _fits_dir,
+     new_fit_dir as _new_fit_dir,
+@@ -184,16 +186,22 @@
+     return t_win, c_win, t_rel
+ 
+ 
+-def default_window(d: FCSData, channel: int, n_bins: int) -> Tuple[float, float]:
++def default_window_arrays(t_ns: np.ndarray,
++                          counts: np.ndarray) -> Tuple[float, float]:
+     """
+-    Default fit window: from the decay peak to the last usable bin.
++    Default fit window for an already-built decay: peak to last usable bin.
+ 
+-    The peak is found on the edge-excluded histogram, so the bin-0 spike never
+-    wins.  The window end is the last bin's time (the final-bin artifact is
+-    dropped separately by prepare_decay).
++    Takes arrays rather than an FCSData so the same rule applies whether the
++    histogram came from photon records or was read back from an exported CSV.
++    :func:`default_window` is the FCSData-shaped wrapper around this.
++
++    The peak is found on the edge-excluded histogram, so the bin-0 spike (the
++    TCSPC catch-all for untimed photons) never wins.  The window end is the
++    last usable bin's time; the final-bin artifact is dropped separately by
++    prepare_decay.
+     """
+-    t_ns, counts = d.lifetime_histogram(channel=channel, n_bins=n_bins)
+-    core = counts.astype(np.float64).copy()
++    t_ns = np.asarray(t_ns, dtype=np.float64)
++    core = np.asarray(counts, dtype=np.float64).copy()
+     if len(core) >= 2:
+         core[0] = 0.0
+         core[-1] = 0.0
+@@ -204,6 +212,139 @@
+     return peak_ns, end_ns
+ 
+ 
++def default_window(d: FCSData, channel: int, n_bins: int) -> Tuple[float, float]:
++    """Default fit window for a channel of a photon dataset."""
++    t_ns, counts = d.lifetime_histogram(channel=channel, n_bins=n_bins)
++    return default_window_arrays(t_ns, counts)
++
++
++# ── Reading an exported lifetime histogram ────────────────────────────────────
++
++def load_lifetime_csv(path) -> Tuple[np.ndarray, Dict[str, np.ndarray],
++                                     Optional[np.ndarray],
++                                     Dict[str, np.ndarray], Dict[str, str]]:
++    """
++    Read a lifetime decay exported by the "Plot lifetime decay" task.
++
++    This is the lifetime counterpart of fcs_fit.load_correlation_csv, and it
++    exists for the same reason: once a decay has been exported you should be
++    able to fit it without carrying the .fcs photon records around.  A 1024-bin
++    histogram is a few tens of kB; the TTTR file it came from is often hundreds
++    of MB.
++
++    Two export shapes are accepted, because the plotting task writes both:
++
++    * from photon data (.fcs) --  ``time_ns``, ``ch1_counts``, ``ch2_counts``
++      A channel that was never recorded is present but blank, so a column of
++      all-NaN means "no data", not "zero counts", and is skipped.
++    * from an ISS decay (.ifx) -- ``time_ns``, ``intensity``, and ``irf`` when
++      the file carried a measured instrument response.
++
++    Precision
++    ---------
++    Counts round-trip EXACTLY -- they are integers well inside 10 significant
++    figures.  The time axis does not: fcs_export writes 10 sig figs, so a bin
++    time comes back agreeing to about 1 part in 1e10 rather than bit-for-bit.
++    At a 48 ps bin width that is a discrepancy of order 0.1 fs, ten orders of
++    magnitude below the bin itself and far below the Poisson noise on any bin,
++    and a fit run from the CSV reproduces one run from the photon records to
++    better than 1e-9 ns.  Worth knowing before comparing two fits at full
++    printed precision and wondering why the last digits differ.
++
++    Returns
++    -------
++    t_ns : np.ndarray
++        Bin times in ns.
++    series : dict of label -> counts
++        ``{"Ch1": ..., "Ch2": ...}`` for a photon export (only the channels
++        that hold data), or ``{"decay": ...}`` for an .ifx export.
++    irf : np.ndarray or None
++        Instrument response, when the export carried one.
++    columns : dict
++        Every column found, by name.
++    meta : dict
++        Header ``# key : value`` fields, e.g. 'source file', 'n_bins',
++        'laser_period_ns', 'channels_recorded'.
++
++    Raises
++    ------
++    ValueError
++        If the file is not a lifetime decay export, with a message that says
++        what was found instead.
++    """
++    path = Path(path)
++    meta, columns = fcs_export.read_export(path)
++
++    if "time_ns" not in columns:
++        # A fit CURVE export uses t_ns and carries a 'fit' column.  Naming it
++        # specifically beats "no time_ns column", because fitting the output of
++        # a previous fit is a plausible mistake to make from a file browser.
++        if "t_ns" in columns and "fit" in columns:
++            raise ValueError(
++                f"{path.name} looks like a lifetime FIT curve, not a decay "
++                f"histogram.  Fit the exported histogram from 'Plot lifetime "
++                f"decay' instead."
++            )
++        raise ValueError(
++            f"{path.name} has no 'time_ns' column - is this a lifetime decay "
++            f"export?"
++        )
++
++    t_ns = np.asarray(columns["time_ns"], dtype=np.float64)
++    if len(t_ns) < 2:
++        raise ValueError(f"{path.name} has fewer than 2 time bins.")
++
++    def _has_data(arr) -> bool:
++        """A column that exists but is entirely blank carries no data."""
++        a = np.asarray(arr, dtype=np.float64)
++        return bool(a.size) and not bool(np.all(np.isnan(a)))
++
++    series: Dict[str, np.ndarray] = {}
++    for ch in (1, 2):
++        col = columns.get(f"ch{ch}_counts")
++        if col is not None and _has_data(col):
++            series[f"Ch{ch}"] = np.asarray(col, dtype=np.float64)
++    if not series and "intensity" in columns and _has_data(columns["intensity"]):
++        series["decay"] = np.asarray(columns["intensity"], dtype=np.float64)
++
++    if not series:
++        raise ValueError(
++            f"{path.name} has a time axis but no usable counts column "
++            f"(expected ch1_counts / ch2_counts, or intensity).  If this came "
++            f"from a single-channel file, the channel it did record should "
++            f"still hold data."
++        )
++
++    irf = columns.get("irf")
++    if irf is not None and _has_data(irf):
++        irf = np.asarray(irf, dtype=np.float64)
++    else:
++        irf = None
++
++    return t_ns, series, irf, columns, meta
++
++
++def discover_lifetime_csvs(folder) -> list:
++    """
++    Return the CSVs in *folder* that parse as lifetime decay exports.
++
++    Matches on content rather than filename, exactly as
++    fcs_fit._discover_correlation_csvs does, so a file the user renamed is
++    still found and a correlation export sitting in the same analysis folder
++    is still skipped.
++    """
++    folder = Path(folder)
++    found = []
++    if folder.exists():
++        for p in sorted(folder.glob("*.csv")):
++            try:
++                load_lifetime_csv(p)
++                found.append(p)
++            except Exception:
++                continue
++    return found
++
++
+ # ── Initial-guess heuristics ──────────────────────────────────────────────────
+ 
+ def auto_guess_lifetime(

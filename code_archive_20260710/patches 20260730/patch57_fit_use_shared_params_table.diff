@@ -1,0 +1,64 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -51,6 +51,7 @@
+     fits_dir as _fits_dir,
+     new_fit_dir as _new_fit_dir,
+     slug_name as _slug_name,
++    write_params_table as _write_params_table,
+     fmt_bound as _fmt,
+     parse_bound as _parse_bound,
+ )
+@@ -359,20 +360,6 @@
+ 
+ # ── Export ────────────────────────────────────────────────────────────────────
+ 
+-def _write_params_xlsx(path: Path, comments: list, header: list,
+-                        rows: list) -> Optional[Path]:
+-    """
+-    Mirror the parameter table as a real .xlsx for viewing in Excel.
+-
+-    Delegates to fcs_export.write_table_xlsx so the fit and the calibration
+-    produce identically formatted spreadsheets from one implementation; the
+-    .csv remains the machine-readable copy.
+-    """
+-    return fcs_export.write_table_xlsx(
+-        path, comments, header, rows,
+-        sheet_title="fit parameters", log_tag="globalfit")
+-
+-
+ # ── Global / linked fitting ───────────────────────────────────────────────────
+ 
+ def combined_guess(model: FCSModel, datasets: list) -> Dict[str, float]:
+@@ -1129,7 +1116,6 @@
+     # ── Wide parameter table (one row per dataset) for spreadsheets ───────────
+     # Calibrate Volume reads the .csv; the .xlsx is the convenient view.
+     params_path = out_dir / f"{stem}_params.csv"
+-    xlsx_path   = out_dir / f"{stem}_params.xlsx"
+     linked_names = [n for n in result["names"] if result["linked"].get(n)]
+     fixed_names  = [n for n in result["names"] if result["fixed"].get(n)]
+ 
+@@ -1220,18 +1206,12 @@
+         comments.append("note : cps_* are mean count rates (Hz) from the correlation "
+                         "headers; cps_fit = that channel (auto) or the Ch1/Ch2 average (cross)")
+ 
+-    def _csv_cell(v) -> str:
+-        return f"{v:.10g}" if isinstance(v, float) else str(v)
+-
+-    with params_path.open("w", encoding="utf-8", newline="") as fh:
+-        for line in comments:
+-            fh.write(f"# {line}\n")
+-        fh.write(",".join(p_header) + "\n")
+-        for row in data_rows:
+-            fh.write(",".join(_csv_cell(v) for v in row) + "\n")
+-    print(f"[globalfit] wrote {params_path}")
+-
+-    _write_params_xlsx(xlsx_path, comments, p_header, data_rows)
++    # One writer for the .csv and its .xlsx mirror, shared with the lifetime
++    # and reconvolution fitters.  Note this changes how a non-finite cell is
++    # rendered here: it used to be the text "nan" and is now an empty cell,
++    # which is what the other fitters and fcs_export have always written.
++    _write_params_table(params_path, comments, p_header, data_rows,
++                        log_tag="globalfit")
+ 
+     return report_path, curve_path, params_path
+ 

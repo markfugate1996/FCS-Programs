@@ -1,0 +1,19 @@
+--- a/fcs_lifetime.py
++++ b/fcs_lifetime.py
+@@ -133,10 +133,14 @@
+ 
+ def _lifetime_export_meta(d, n_bins: int, channels: tuple[int, ...]) -> dict:
+     """Metadata block shared by the single-file and overlay export paths."""
++    # 10 significant figures, matching the CSV body, rather than 4 decimals.
++    # These are the numbers a reader reconstructs the time axis from, so
++    # rounding them costs real precision: at 4 dp the period came back 1.8e-5 ns
++    # off, which is small but needless.
+     return {
+         "n_bins":            n_bins,
+-        "bin_width_ps":      f"{d.laser_period_ns / n_bins * 1000:.4f}",
+-        "laser_period_ns":   f"{d.laser_period_ns:.4f}",
++        "bin_width_ps":      f"{d.laser_period_ns / n_bins * 1000:.10g}",
++        "laser_period_ns":   f"{d.laser_period_ns:.10g}",
+         # What was drawn ...
+         "channels":          "+".join(f"Ch{c}" for c in channels),
+         # ... versus what the file has.  A blank ch2_counts means "not

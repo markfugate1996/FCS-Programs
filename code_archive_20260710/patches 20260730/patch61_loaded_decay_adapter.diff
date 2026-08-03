@@ -1,0 +1,150 @@
+--- a/fcs_lifetime_fit.py
++++ b/fcs_lifetime_fit.py
+@@ -324,6 +324,147 @@
+     return t_ns, series, irf, columns, meta
+ 
+ 
++class LoadedDecay:
++    """
++    A decay read back from an exported CSV, shaped like the piece of FCSData
++    that the lifetime plotting and gating code actually uses.
++
++    Why an adapter rather than array-shaped copies of those functions: the
++    surface they touch is three attributes wide -- ``filepath``,
++    ``laser_period_ns`` and ``lifetime_histogram()``.  Satisfying those means
++    :func:`fcs_lifetime.plot_lifetime`, :func:`fcs_lifetime.select_gate` and
++    :func:`fcs_lifetime._draw_histogram` all work on a CSV-sourced decay with
++    no changes at all, so the interactive window picker behaves identically
++    whether the histogram came from photon records or from disk.
++    ``fcs_lifetime._load`` already passes any non-path object straight through,
++    and the module already duck-types .ifx decays via ``kind``, so this fits
++    the existing convention rather than bending it.
++
++    Rebinning
++    ---------
++    The CSV is already binned.  When a caller asks for FEWER bins by an exact
++    integer factor the stored counts are summed in blocks, which reproduces the
++    histogram the photon path would have built at that resolution bit-for-bit
++    -- summing adjacent bins of a histogram is the same operation as histogram-
++    ing into wider bins.  Any other request (more bins than were exported, or a
++    non-integer factor) cannot be honoured: the information is not in the file.
++    Rather than silently returning a different resolution than was asked for,
++    which would make a fit report a bin count it did not use, that raises.
++    """
++
++    kind = "loaded_decay"
++
++    def __init__(self, path, t_ns, series, irf=None, meta=None):
++        self.filepath = Path(path)
++        self.t_ns     = np.asarray(t_ns, dtype=np.float64)
++        self.series   = {k: np.asarray(v, dtype=np.float64)
++                         for k, v in series.items()}
++        self.irf      = irf
++        self.meta     = dict(meta or {})
++        self.params   = dict(self.meta)
++
++        # Channel identity comes from the column names: a Ch2-only export has
++        # only a ch2_counts column, so its single decay is Ch2 and must not be
++        # relabelled Ch1 just because it is the only one present.
++        self.channels = tuple(
++            int(k[2:]) for k in ("Ch1", "Ch2") if k in self.series)
++        self._single = "decay" in self.series
++
++    # ── Identity ─────────────────────────────────────────────────────────────
++
++    @property
++    def source_name(self) -> str:
++        """Name of the .fcs/.ifx the decay was originally measured from."""
++        return (self.meta.get("source file")
++                or self.meta.get("source")
++                or self.filepath.name)
++
++    @property
++    def n_bins(self) -> int:
++        return len(self.t_ns)
++
++    @property
++    def laser_period_ns(self) -> float:
++        """
++        Laser period in ns.
++
++        Taken from the export header when present.  Otherwise estimated as one
++        bin past the last bin's left edge, which is the period the exporter
++        divided into these bins in the first place.
++        """
++        try:
++            return float(self.meta["laser_period_ns"])
++        except (KeyError, TypeError, ValueError):
++            if len(self.t_ns) >= 2:
++                width = float(self.t_ns[1] - self.t_ns[0])
++                return float(self.t_ns[-1]) + width
++            return float("nan")
++
++    @property
++    def channel_summary(self) -> str:
++        if self._single:
++            return "decay"
++        if len(self.channels) == 1:
++            return f"Ch{self.channels[0]} only"
++        return " + ".join(f"Ch{c}" for c in self.channels)
++
++    @property
++    def has_ch1(self) -> bool:
++        return 1 in self.channels
++
++    @property
++    def has_ch2(self) -> bool:
++        return 2 in self.channels
++
++    def counts(self, channel=None) -> np.ndarray:
++        """Stored counts for *channel* at the exported resolution."""
++        if self._single:
++            return self.series["decay"]
++        key = f"Ch{channel if channel is not None else self.channels[0]}"
++        if key not in self.series:
++            raise ValueError(
++                f"{self.filepath.name} holds {self.channel_summary}; "
++                f"there is no {key} decay in this export."
++            )
++        return self.series[key]
++
++    # ── The FCSData-shaped call ──────────────────────────────────────────────
++
++    def lifetime_histogram(self, channel: int = 1,
++                           n_bins: int = None):
++        """
++        Return ``(bin_times_ns, counts)``, rebinning if asked for fewer bins.
++
++        Signature matches FCSData.lifetime_histogram so the plotting and gating
++        code cannot tell the difference.
++        """
++        counts = self.counts(None if self._single else channel)
++        stored = len(counts)
++        if n_bins is None or int(n_bins) == stored:
++            return self.t_ns.copy(), counts.copy()
++
++        n_bins = int(n_bins)
++        if n_bins > stored or stored % n_bins:
++            raise ValueError(
++                f"{self.filepath.name} was exported with {stored} bins; "
++                f"{n_bins} bins cannot be derived from it.  Only an exact "
++                f"integer rebin to fewer bins is possible "
++                f"({', '.join(str(stored // f) for f in (1, 2, 4, 8, 16) if stored % f == 0)}"
++                f", ...).  Re-export the decay at {n_bins} bins to fit at that "
++                f"resolution."
++            )
++        factor = stored // n_bins
++        binned = counts.reshape(n_bins, factor).sum(axis=1)
++        times  = self.t_ns[::factor][:n_bins]
++        return times.copy(), binned
++
++
++def load_decay_object(path) -> LoadedDecay:
++    """Read an exported lifetime decay and wrap it as a :class:`LoadedDecay`."""
++    t_ns, series, irf, _cols, meta = load_lifetime_csv(path)
++    return LoadedDecay(path, t_ns, series, irf, meta)
++
++
+ def discover_lifetime_csvs(folder) -> list:
+     """
+     Return the CSVs in *folder* that parse as lifetime decay exports.

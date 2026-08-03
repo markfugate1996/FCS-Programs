@@ -1,0 +1,50 @@
+--- a/fcs_lifetime_fit.py
++++ b/fcs_lifetime_fit.py
+@@ -55,14 +55,13 @@
+ import fcs_lifetime
+ import fcs_fisher
+ 
+-import fcs_export
+-
+ from fcs_fitcommon import (
+     fits_dir as _fits_dir,
+     new_fit_dir as _new_fit_dir,
+     fmt_bound as _fmt,
+     parse_bound as _parse_bound,
+     slug_name as _slug_name,
++    write_params_table as _write_params_table,
+ )
+ 
+ # ── Multi-component decomposition ─────────────────────────────────────────────
+@@ -481,7 +480,6 @@
+     report_path = out_dir / f"{stem}_report.txt"
+     curve_path  = out_dir / f"{stem}_curve.csv"
+     params_path = out_dir / f"{stem}_params.csv"
+-    xlsx_path   = out_dir / f"{stem}_params.xlsx"
+ 
+     # ── Report ────────────────────────────────────────────────────────────────
+     L: list[str] = []
+@@ -648,21 +646,8 @@
+         comments.append("note_tau_mean : tau_mean_amp = sum(A*tau)/sum(A) ; "
+                         "tau_mean_int = sum(A*tau^2)/sum(A*tau)")
+ 
+-    def _csv_cell(v) -> str:
+-        if isinstance(v, float):
+-            return "" if not np.isfinite(v) else f"{v:.10g}"
+-        return str(v)
+-
+-    with params_path.open("w", encoding="utf-8", newline="") as fh:
+-        for line in comments:
+-            fh.write(f"# {line}\n")
+-        fh.write(",".join(p_header) + "\n")
+-        fh.write(",".join(_csv_cell(v) for v in row) + "\n")
+-    print(f"[lifetime fit] wrote {params_path}")
+-
+-    fcs_export.write_table_xlsx(
+-        xlsx_path, comments, p_header, [row],
+-        sheet_title="fit parameters", log_tag="lifetime fit")
++    _write_params_table(params_path, comments, p_header, [row],
++                        log_tag="lifetime fit")
+ 
+     return report_path, curve_path, params_path
+ 

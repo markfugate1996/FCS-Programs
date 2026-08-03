@@ -60,6 +60,7 @@ from fcs_fitcommon import (
     fmt_bound as _fmt,
     parse_bound as _parse_bound,
     slug_name as _slug_name,
+    write_params_table as _write_params_table,
 )
 
 # ── IRF preparation ───────────────────────────────────────────────────────────
@@ -546,7 +547,6 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
     report_path = out_dir / f"{stem}_report.txt"
     curve_path  = out_dir / f"{stem}_curve.csv"
     params_path = out_dir / f"{stem}_params.csv"
-    xlsx_path   = out_dir / f"{stem}_params.xlsx"
 
 
     der = result["derived"]
@@ -622,7 +622,7 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
         fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
         fh.write(",".join(names) + "\n")
         for row in zip(*(cols[n] for n in names)):
-            fh.write(",".join(fcs_export._csv_value(v) for v in row) + "\n")
+            fh.write(",".join(fcs_export.csv_value(v) for v in row) + "\n")
 
     print(f"[reconv fit] wrote {report_path}")
     print(f"[reconv fit] wrote {curve_path}")
@@ -697,18 +697,8 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
         comments.append("note_components : alpha_i / f_i are indexed in the "
                         "order " + ", ".join(model.tau_names))
 
-    with params_path.open("w", encoding="utf-8", newline="") as fh:
-        for line in comments:
-            fh.write(f"# {line}\n")
-        fh.write(",".join(p_header) + "\n")
-        fh.write(",".join(
-            fcs_export._csv_value(v) if isinstance(v, float) else str(v)
-            for v in row) + "\n")
-    print(f"[reconv fit] wrote {params_path}")
-
-    fcs_export.write_table_xlsx(
-        xlsx_path, comments, p_header, [row],
-        sheet_title="fit parameters", log_tag="reconv fit")
+    _write_params_table(params_path, comments, p_header, [row],
+                        log_tag="reconv fit")
 
     return report_path, curve_path, params_path
 

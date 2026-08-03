@@ -90,9 +90,13 @@ def _slug(text: str) -> str:
     return slug or "data"
 
 
-def _csv_value(v: float) -> str:
+def csv_value(v: float) -> str:
     """
-    Render one numeric cell for the CSV body.
+    Render one numeric cell for a CSV body.
+
+    Public because the fit modules write their own curve CSVs directly and must
+    render cells the same way this module does; a private name shared across
+    modules is how two writers drift apart.
 
     Non-finite values are written as an EMPTY cell rather than the text "nan"
     or "inf".  Three reasons, in order of how much they bite:
@@ -186,7 +190,7 @@ def export_columns(
                 fh.write(f"# {key} : {val}\n")
         fh.write(",".join(names) + "\n")
         for row in zip(*arrays):
-            fh.write(",".join(_csv_value(v) for v in row) + "\n")
+            fh.write(",".join(csv_value(v) for v in row) + "\n")
 
     return out_path
 

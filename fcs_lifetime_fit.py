@@ -63,6 +63,7 @@ from fcs_fitcommon import (
     fmt_bound as _fmt,
     parse_bound as _parse_bound,
     slug_name as _slug_name,
+    write_params_table as _write_params_table,
 )
 
 # ── Multi-component decomposition ─────────────────────────────────────────────
@@ -185,16 +186,22 @@ def prepare_decay(
     return t_win, c_win, t_rel
 
 
-def default_window(d: FCSData, channel: int, n_bins: int) -> Tuple[float, float]:
+def default_window_arrays(t_ns: np.ndarray,
+                          counts: np.ndarray) -> Tuple[float, float]:
     """
-    Default fit window: from the decay peak to the last usable bin.
+    Default fit window for an already-built decay: peak to last usable bin.
 
-    The peak is found on the edge-excluded histogram, so the bin-0 spike never
-    wins.  The window end is the last bin's time (the final-bin artifact is
-    dropped separately by prepare_decay).
+    Takes arrays rather than an FCSData so the same rule applies whether the
+    histogram came from photon records or was read back from an exported CSV.
+    :func:`default_window` is the FCSData-shaped wrapper around this.
+
+    The peak is found on the edge-excluded histogram, so the bin-0 spike (the
+    TCSPC catch-all for untimed photons) never wins.  The window end is the
+    last usable bin's time; the final-bin artifact is dropped separately by
+    prepare_decay.
     """
-    t_ns, counts = d.lifetime_histogram(channel=channel, n_bins=n_bins)
-    core = counts.astype(np.float64).copy()
+    t_ns = np.asarray(t_ns, dtype=np.float64)
+    core = np.asarray(counts, dtype=np.float64).copy()
     if len(core) >= 2:
         core[0] = 0.0
         core[-1] = 0.0
@@ -203,6 +210,280 @@ def default_window(d: FCSData, channel: int, n_bins: int) -> Tuple[float, float]
     if end_ns <= peak_ns:
         end_ns = float(t_ns[-1])
     return peak_ns, end_ns
+
+
+def default_window(d: FCSData, channel: int, n_bins: int) -> Tuple[float, float]:
+    """Default fit window for a channel of a photon dataset."""
+    t_ns, counts = d.lifetime_histogram(channel=channel, n_bins=n_bins)
+    return default_window_arrays(t_ns, counts)
+
+
+# ── Reading an exported lifetime histogram ────────────────────────────────────
+
+def load_lifetime_csv(path) -> Tuple[np.ndarray, Dict[str, np.ndarray],
+                                     Optional[np.ndarray],
+                                     Dict[str, np.ndarray], Dict[str, str]]:
+    """
+    Read a lifetime decay exported by the "Plot lifetime decay" task.
+
+    This is the lifetime counterpart of fcs_fit.load_correlation_csv, and it
+    exists for the same reason: once a decay has been exported you should be
+    able to fit it without carrying the .fcs photon records around.  A 1024-bin
+    histogram is a few tens of kB; the TTTR file it came from is often hundreds
+    of MB.
+
+    Two export shapes are accepted, because the plotting task writes both:
+
+    * from photon data (.fcs) --  ``time_ns``, ``ch1_counts``, ``ch2_counts``
+      A channel that was never recorded is present but blank, so a column of
+      all-NaN means "no data", not "zero counts", and is skipped.
+    * from an ISS decay (.ifx) -- ``time_ns``, ``intensity``, and ``irf`` when
+      the file carried a measured instrument response.
+
+    Precision
+    ---------
+    Counts round-trip EXACTLY -- they are integers well inside 10 significant
+    figures.  The time axis does not: fcs_export writes 10 sig figs, so a bin
+    time comes back agreeing to about 1 part in 1e10 rather than bit-for-bit.
+    At a 48 ps bin width that is a discrepancy of order 0.1 fs, ten orders of
+    magnitude below the bin itself and far below the Poisson noise on any bin,
+    and a fit run from the CSV reproduces one run from the photon records to
+    better than 1e-9 ns.  Worth knowing before comparing two fits at full
+    printed precision and wondering why the last digits differ.
+
+    Returns
+    -------
+    t_ns : np.ndarray
+        Bin times in ns.
+    series : dict of label -> counts
+        ``{"Ch1": ..., "Ch2": ...}`` for a photon export (only the channels
+        that hold data), or ``{"decay": ...}`` for an .ifx export.
+    irf : np.ndarray or None
+        Instrument response, when the export carried one.
+    columns : dict
+        Every column found, by name.
+    meta : dict
+        Header ``# key : value`` fields, e.g. 'source file', 'n_bins',
+        'laser_period_ns', 'channels_recorded'.
+
+    Raises
+    ------
+    ValueError
+        If the file is not a lifetime decay export, with a message that says
+        what was found instead.
+    """
+    path = Path(path)
+    meta, columns = fcs_export.read_export(path)
+
+    if "time_ns" not in columns:
+        # A fit CURVE export uses t_ns and carries a 'fit' column.  Naming it
+        # specifically beats "no time_ns column", because fitting the output of
+        # a previous fit is a plausible mistake to make from a file browser.
+        if "t_ns" in columns and "fit" in columns:
+            raise ValueError(
+                f"{path.name} looks like a lifetime FIT curve, not a decay "
+                f"histogram.  Fit the exported histogram from 'Plot lifetime "
+                f"decay' instead."
+            )
+        raise ValueError(
+            f"{path.name} has no 'time_ns' column - is this a lifetime decay "
+            f"export?"
+        )
+
+    t_ns = np.asarray(columns["time_ns"], dtype=np.float64)
+    if len(t_ns) < 2:
+        raise ValueError(f"{path.name} has fewer than 2 time bins.")
+
+    def _has_data(arr) -> bool:
+        """A column that exists but is entirely blank carries no data."""
+        a = np.asarray(arr, dtype=np.float64)
+        return bool(a.size) and not bool(np.all(np.isnan(a)))
+
+    series: Dict[str, np.ndarray] = {}
+    for ch in (1, 2):
+        col = columns.get(f"ch{ch}_counts")
+        if col is not None and _has_data(col):
+            series[f"Ch{ch}"] = np.asarray(col, dtype=np.float64)
+    if not series and "intensity" in columns and _has_data(columns["intensity"]):
+        series["decay"] = np.asarray(columns["intensity"], dtype=np.float64)
+
+    if not series:
+        raise ValueError(
+            f"{path.name} has a time axis but no usable counts column "
+            f"(expected ch1_counts / ch2_counts, or intensity).  If this came "
+            f"from a single-channel file, the channel it did record should "
+            f"still hold data."
+        )
+
+    irf = columns.get("irf")
+    if irf is not None and _has_data(irf):
+        irf = np.asarray(irf, dtype=np.float64)
+    else:
+        irf = None
+
+    return t_ns, series, irf, columns, meta
+
+
+class LoadedDecay:
+    """
+    A decay read back from an exported CSV, shaped like the piece of FCSData
+    that the lifetime plotting and gating code actually uses.
+
+    Why an adapter rather than array-shaped copies of those functions: the
+    surface they touch is three attributes wide -- ``filepath``,
+    ``laser_period_ns`` and ``lifetime_histogram()``.  Satisfying those means
+    :func:`fcs_lifetime.plot_lifetime`, :func:`fcs_lifetime.select_gate` and
+    :func:`fcs_lifetime._draw_histogram` all work on a CSV-sourced decay with
+    no changes at all, so the interactive window picker behaves identically
+    whether the histogram came from photon records or from disk.
+    ``fcs_lifetime._load`` already passes any non-path object straight through,
+    and the module already duck-types .ifx decays via ``kind``, so this fits
+    the existing convention rather than bending it.
+
+    Rebinning
+    ---------
+    The CSV is already binned.  When a caller asks for FEWER bins by an exact
+    integer factor the stored counts are summed in blocks, which reproduces the
+    histogram the photon path would have built at that resolution bit-for-bit
+    -- summing adjacent bins of a histogram is the same operation as histogram-
+    ing into wider bins.  Any other request (more bins than were exported, or a
+    non-integer factor) cannot be honoured: the information is not in the file.
+    Rather than silently returning a different resolution than was asked for,
+    which would make a fit report a bin count it did not use, that raises.
+    """
+
+    kind = "loaded_decay"
+
+    def __init__(self, path, t_ns, series, irf=None, meta=None):
+        self.filepath = Path(path)
+        self.t_ns     = np.asarray(t_ns, dtype=np.float64)
+        self.series   = {k: np.asarray(v, dtype=np.float64)
+                         for k, v in series.items()}
+        self.irf      = irf
+        self.meta     = dict(meta or {})
+        self.params   = dict(self.meta)
+
+        # Channel identity comes from the column names: a Ch2-only export has
+        # only a ch2_counts column, so its single decay is Ch2 and must not be
+        # relabelled Ch1 just because it is the only one present.
+        self.channels = tuple(
+            int(k[2:]) for k in ("Ch1", "Ch2") if k in self.series)
+        self._single = "decay" in self.series
+
+    # ── Identity ─────────────────────────────────────────────────────────────
+
+    @property
+    def source_name(self) -> str:
+        """Name of the .fcs/.ifx the decay was originally measured from."""
+        return (self.meta.get("source file")
+                or self.meta.get("source")
+                or self.filepath.name)
+
+    @property
+    def n_bins(self) -> int:
+        return len(self.t_ns)
+
+    @property
+    def laser_period_ns(self) -> float:
+        """
+        Laser period in ns.
+
+        Taken from the export header when present.  Otherwise estimated as one
+        bin past the last bin's left edge, which is the period the exporter
+        divided into these bins in the first place.
+        """
+        try:
+            return float(self.meta["laser_period_ns"])
+        except (KeyError, TypeError, ValueError):
+            if len(self.t_ns) >= 2:
+                width = float(self.t_ns[1] - self.t_ns[0])
+                return float(self.t_ns[-1]) + width
+            return float("nan")
+
+    @property
+    def channel_summary(self) -> str:
+        if self._single:
+            return "decay"
+        if len(self.channels) == 1:
+            return f"Ch{self.channels[0]} only"
+        return " + ".join(f"Ch{c}" for c in self.channels)
+
+    @property
+    def has_ch1(self) -> bool:
+        return 1 in self.channels
+
+    @property
+    def has_ch2(self) -> bool:
+        return 2 in self.channels
+
+    def counts(self, channel=None) -> np.ndarray:
+        """Stored counts for *channel* at the exported resolution."""
+        if self._single:
+            return self.series["decay"]
+        key = f"Ch{channel if channel is not None else self.channels[0]}"
+        if key not in self.series:
+            raise ValueError(
+                f"{self.filepath.name} holds {self.channel_summary}; "
+                f"there is no {key} decay in this export."
+            )
+        return self.series[key]
+
+    # ── The FCSData-shaped call ──────────────────────────────────────────────
+
+    def lifetime_histogram(self, channel: int = 1,
+                           n_bins: int = None):
+        """
+        Return ``(bin_times_ns, counts)``, rebinning if asked for fewer bins.
+
+        Signature matches FCSData.lifetime_histogram so the plotting and gating
+        code cannot tell the difference.
+        """
+        counts = self.counts(None if self._single else channel)
+        stored = len(counts)
+        if n_bins is None or int(n_bins) == stored:
+            return self.t_ns.copy(), counts.copy()
+
+        n_bins = int(n_bins)
+        if n_bins > stored or stored % n_bins:
+            raise ValueError(
+                f"{self.filepath.name} was exported with {stored} bins; "
+                f"{n_bins} bins cannot be derived from it.  Only an exact "
+                f"integer rebin to fewer bins is possible "
+                f"({', '.join(str(stored // f) for f in (1, 2, 4, 8, 16) if stored % f == 0)}"
+                f", ...).  Re-export the decay at {n_bins} bins to fit at that "
+                f"resolution."
+            )
+        factor = stored // n_bins
+        binned = counts.reshape(n_bins, factor).sum(axis=1)
+        times  = self.t_ns[::factor][:n_bins]
+        return times.copy(), binned
+
+
+def load_decay_object(path) -> LoadedDecay:
+    """Read an exported lifetime decay and wrap it as a :class:`LoadedDecay`."""
+    t_ns, series, irf, _cols, meta = load_lifetime_csv(path)
+    return LoadedDecay(path, t_ns, series, irf, meta)
+
+
+def discover_lifetime_csvs(folder) -> list:
+    """
+    Return the CSVs in *folder* that parse as lifetime decay exports.
+
+    Matches on content rather than filename, exactly as
+    fcs_fit._discover_correlation_csvs does, so a file the user renamed is
+    still found and a correlation export sitting in the same analysis folder
+    is still skipped.
+    """
+    folder = Path(folder)
+    found = []
+    if folder.exists():
+        for p in sorted(folder.glob("*.csv")):
+            try:
+                load_lifetime_csv(p)
+                found.append(p)
+            except Exception:
+                continue
+    return found
 
 
 # ── Initial-guess heuristics ──────────────────────────────────────────────────
@@ -481,7 +762,6 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
     report_path = out_dir / f"{stem}_report.txt"
     curve_path  = out_dir / f"{stem}_curve.csv"
     params_path = out_dir / f"{stem}_params.csv"
-    xlsx_path   = out_dir / f"{stem}_params.xlsx"
 
     # ── Report ────────────────────────────────────────────────────────────────
     L: list[str] = []
@@ -648,21 +928,8 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
         comments.append("note_tau_mean : tau_mean_amp = sum(A*tau)/sum(A) ; "
                         "tau_mean_int = sum(A*tau^2)/sum(A*tau)")
 
-    def _csv_cell(v) -> str:
-        if isinstance(v, float):
-            return "" if not np.isfinite(v) else f"{v:.10g}"
-        return str(v)
-
-    with params_path.open("w", encoding="utf-8", newline="") as fh:
-        for line in comments:
-            fh.write(f"# {line}\n")
-        fh.write(",".join(p_header) + "\n")
-        fh.write(",".join(_csv_cell(v) for v in row) + "\n")
-    print(f"[lifetime fit] wrote {params_path}")
-
-    fcs_export.write_table_xlsx(
-        xlsx_path, comments, p_header, [row],
-        sheet_title="fit parameters", log_tag="lifetime fit")
+    _write_params_table(params_path, comments, p_header, [row],
+                        log_tag="lifetime fit")
 
     return report_path, curve_path, params_path
 
