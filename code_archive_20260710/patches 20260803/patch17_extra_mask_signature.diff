@@ -1,0 +1,41 @@
+--- a/fcs_globalfit.py
++++ b/fcs_globalfit.py
+@@ -96,7 +96,7 @@
+ def prepare_datasets(
+     datasets: Sequence[dict],
+     weighted: bool = False,
+-    extra_mask: Optional[Callable[[dict, np.ndarray, np.ndarray], np.ndarray]] = None,
++    extra_mask: Optional[Callable[..., np.ndarray]] = None,
+     min_points: int = 2,
+ ) -> List[dict]:
+     """
+@@ -107,10 +107,16 @@
+     weight and a negative one is meaningless.
+ 
+     *extra_mask* is the hook for censoring that only one analysis knows about:
+-    it receives ``(ds, x, y)`` and returns a boolean array of points to KEEP.
+-    Correlation uses it to drop pair-starved lag channels, whose G values are
+-    censored rather than measured.  Nothing here needs to know that; it just
+-    needs somewhere for the caller to say so.
++    it receives ``(ds, x, y, mask)`` and returns a boolean array of points to
++    KEEP.  Correlation uses it to drop pair-starved lag channels, whose G
++    values are censored rather than measured.  Nothing here needs to know that;
++    it just needs somewhere for the caller to say so.
++
++    *mask* is the keep-array built so far, and it is passed because a censoring
++    rule usually needs to COUNT what it removes for the report -- and should
++    count only points that survived the finite and sigma masks, or a lag that
++    was already excluded for having no sigma gets reported a second time as
++    pair-starved.
+ 
+     Returns a new list of dicts carrying the masked arrays plus every other key
+     of the original, so per-dataset context (M, irf, meta) survives untouched.
+@@ -131,7 +137,7 @@
+             m &= np.isfinite(s) & (s > 0)
+ 
+         if extra_mask is not None:
+-            m &= np.asarray(extra_mask(ds, x, y), dtype=bool)
++            m &= np.asarray(extra_mask(ds, x, y, m), dtype=bool)
+ 
+         if int(np.count_nonzero(m)) < min_points:
+             raise ValueError(

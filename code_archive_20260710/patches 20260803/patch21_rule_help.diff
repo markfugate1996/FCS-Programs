@@ -1,0 +1,101 @@
+--- a/fcs_globalfit.py
++++ b/fcs_globalfit.py
+@@ -100,7 +100,7 @@
+ 
+ __all__ = ["prepare_datasets", "fit_linked", "combined_guess_from",
+            "parse_dataset_rule", "normalise_plan", "describe_plan",
+-           "RuleError", "FREE", "LINK", "FIX"]
++           "RuleError", "RULE_HELP", "rule_help_for", "FREE", "LINK", "FIX"]
+ 
+ 
+ # ── Per-parameter dataset plans ───────────────────────────────────────────────
+@@ -120,6 +120,68 @@
+ FIX  = "fix"
+ 
+ 
++# The syntax reference, kept HERE rather than in the dialog that shows it:
++# it describes what parse_dataset_rule accepts, so it belongs beside the parser
++# and changes when the parser changes.  A help text living in the GUI is a help
++# text that quietly goes stale.
++RULE_HELP = """\
++Per-dataset rules
++=================
++A rule says what one parameter does across the selected datasets.  Without a
++rule, a parameter is either linked (one shared value), fixed (held), or free
++(an independent value per dataset) for ALL of them.  A rule lets you mix those.
++
++Dataset numbers are the ones shown in the dataset list, starting at 1.
++
++Clauses, separated by semicolons
++--------------------------------
++  L(1,3,4)      LINK datasets 1, 3 and 4: they share one fitted value
++  L(1-10)       link a range (inclusive, so 1-10 is ten datasets)
++  L(*)          link every dataset (the same as ticking Link)
++  F(2=1e-6)     FIX dataset 2 at 1e-6; it is held, not fitted
++  F(2,5=0)      fix datasets 2 and 5 at 0
++  F(2)          fix dataset 2 at the Guess value in this row
++  U(7)          dataset 7 stays independent (the default; for emphasis)
++
++Anything you do not mention stays independent.
++
++Examples
++--------
++  L(1,3,4); F(2=1e-6)
++        1, 3 and 4 share a value; 2 is held at 1e-6; the rest float freely.
++
++  L(1-10); L(11-20)
++        Two SEPARATE shared values -- one for the first ten datasets, one for
++        the second ten.  Two L clauses are two groups, not one big one.
++
++  F(1-3=0.5)
++        Hold the first three at 0.5; everything else is fitted independently.
++
++Rules
++-----
++  * Each dataset may appear in at most one clause per parameter.
++  * L(...) needs two or more datasets; linking one is the same as leaving it
++    free.
++  * A rule replaces the Link and Fix boxes for that parameter.
++
++What linking means
++------------------
++Linking says the datasets SHARE a quantity, so the fit determines one value
++from all of them at once.  That makes the shared value better determined, and
++frees the parameters it was trading against.  It is an assumption, not a
++measurement: two datasets forced to share a value look, in the results, exactly
++like two datasets that happened to agree, which is why the report records every
++rule alongside the numbers.
++
++Rate-like quantities (diffusion times, lifetimes, brightness per second) are
++the usual things to link.  Scale-like ones (amplitudes, occupations, background
++offsets, and PCH epsilon, which is counts per molecule per BIN) depend on the
++acquisition settings, so linking them across datasets acquired with different
++bin widths, windows or durations links two quantities that are not the same
++quantity.
++"""
++
++
+ class RuleError(ValueError):
+     """
+     A dataset rule that could not be parsed or does not make sense.
+@@ -648,3 +710,20 @@
+         "success": bool(sol.success), "message": str(sol.message),
+         "cov": cov, "free_labels": free_labels,
+     }
++
++
++def rule_help_for(names: Optional[Sequence[str]] = None) -> str:
++    """
++    :data:`RULE_HELP` with the current dataset list appended.
++
++    Numbers in a rule mean nothing without knowing which file each one is, and
++    a help window that shows the syntax but not the numbering leaves the reader
++    to go and find it.  Called with no names it returns the plain reference.
++    """
++    if not names:
++        return RULE_HELP
++    lines = [RULE_HELP, "", f"Your {len(names)} dataset"
++             f"{'s' if len(names) != 1 else ''}", "-" * 24]
++    width = len(str(len(names)))
++    lines += [f"  {i:>{width}}  {nm}" for i, nm in enumerate(names, start=1)]
++    return "\n".join(lines)

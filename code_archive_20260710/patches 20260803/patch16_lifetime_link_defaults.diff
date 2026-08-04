@@ -1,0 +1,33 @@
+--- a/fcs_lifetime_models.py
++++ b/fcs_lifetime_models.py
+@@ -124,13 +124,28 @@
+         tau_names.append(tn)
+         params.append(Param(an, 1.0e4, 0.0, np.inf, "cnt",
+                              f"amplitude of component {i}"))
++        # Lifetimes are linked by default in a global fit and amplitudes are
++        # not: tau is a property of the fluorophore and its environment, while
++        # a_i counts photons and therefore scales with concentration,
++        # acquisition time and bin width.  Linking amplitudes across datasets
++        # binned or windowed differently links quantities that are not the
++        # same quantity -- a_i is the decay's extrapolated height at the START
++        # of the fit window, so it also moves if the window does.
+         params.append(Param(tn, default_taus[i - 1], 1e-3, 1e3, "ns",
+-                             f"lifetime of component {i}"))
++                             f"lifetime of component {i}", link_default=True))
+ 
++    # bg is left unlinked: it is a count, so it scales with acquisition time
++    # and bin width exactly as the amplitudes do, and is not comparable across
++    # datasets acquired differently.
+     params.append(Param("bg", 0.0, 0.0, np.inf, "cnt",
+                          "constant background / dark counts"))
++    # shift IS linked by default, on the same reasoning that links kappa in the
++    # correlation models: it describes the instrument (the timing offset
++    # between the IRF and the decay), not the sample, so one setup should give
++    # one value.  It has no effect on a tail fit, where the IRF is not used.
+     params.append(Param("shift", 0.0, -2.0, 2.0, "ns",
+-                        "IRF colour shift (decay vs IRF timing)", fixed=False))
++                        "IRF colour shift (decay vs IRF timing)", fixed=False,
++                        link_default=True))
+ 
+     return LifetimeModel(
+         key=key, name=name, description=description, formula=formula,

@@ -1,0 +1,239 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -38,6 +38,7 @@
+ from scipy.optimize import least_squares
+ 
+ import fcs_models
++import fcs_globalfit
+ from fcs_models import FCSModel
+ import fcs_export
+ from fcs_reader import read_fcs, FCSData
+@@ -410,34 +411,62 @@
+ 
+     Returns a result dict with global goodness-of-fit plus a per-dataset
+     breakdown (values, 1σ errors, fit curve, residuals, R²).
++
++    Implementation
++    --------------
++    The linked-parameter arithmetic — the free-parameter vector, the index map
++    from (parameter, dataset) into it, the concatenated residual and the
++    covariance — now lives in :mod:`fcs_globalfit`, which the PCH and lifetime
++    fitters use as well.  This function is what remains once that is taken out:
++    the correlation-specific parts, which are the pair-starved censoring, the
++    tau > 0 domain, and the key names the rest of this module reads.
++
++    The extraction is exact rather than approximate.  ``fit_linked`` was
++    written against this function's behaviour and is checked against it —
++    values, errors, R², dof, chi², and free-parameter labels compared with
++    ``==`` — so migrating changes no number that this module has ever
++    reported.
+     """
+     names = model.param_names()
+ 
+-    # ── Mask each dataset to finite, positive-lag points ─────────────────────
+-    prepped = []
++    # ── Mask each dataset to finite, positive-lag, non-censored points ───────
++    # Counted here rather than inside the shared masker because "pair-starved"
++    # is a fact about photon correlation, not about fitting.  The running mask
++    # is used so a lag already dropped for want of a sigma is not ALSO counted
++    # as pair-starved, which would overstate the censoring in the report.
+     starved_counts: Dict[str, int] = {}
+-    for ds in datasets:
+-        t = np.asarray(ds["tau"], dtype=np.float64)
+-        y = np.asarray(ds["G"],   dtype=np.float64)
+-        m = np.isfinite(t) & np.isfinite(y) & (t > 0)
+-        s = None
+-        if weighted and ds.get("sigma") is not None:
+-            s = np.asarray(ds["sigma"], dtype=np.float64)
+-            m &= np.isfinite(s) & (s > 0)
+ 
++    def _keep(ds, tau, G, mask):
++        keep = tau > 0
+         n_starved = 0
+         if drop_pair_starved:
+-            starved = m & (y <= pair_starved_cutoff)
++            starved = mask & keep & (G <= pair_starved_cutoff)
+             n_starved = int(np.count_nonzero(starved))
+-            m &= ~starved
++            keep = keep & ~starved
+         starved_counts[ds["name"]] = n_starved
++        return keep
++
++    core_datasets = [
++        {"name": ds["name"], "x": ds["tau"], "y": ds["G"],
++         "sigma": ds.get("sigma"), "meta": ds.get("meta", {})}
++        for ds in datasets
++    ]
+ 
+-        t, y = t[m], y[m]
+-        s = s[m] if s is not None else None
+-        if len(t) < 2:
++    # min_points=0 so the shared masker never raises: the "too few points"
++    # message belongs here, where it can say WHY.  A dataset left short by
++    # censoring is reporting a count rate too low for the lag range -- a fact
++    # about the measurement -- and a generic message would send the user
++    # looking at their fit settings instead.
++    prepped = fcs_globalfit.prepare_datasets(
++        core_datasets, weighted=weighted, extra_mask=_keep, min_points=0)
++
++    for pp in prepped:
++        n_starved = starved_counts.get(pp["name"], 0)
++        pp["n_pair_starved"] = n_starved
++        if len(pp["x"]) < 2:
+             if n_starved:
+                 raise ValueError(
+-                    f"Dataset '{ds['name']}' has too few usable points to fit: "
++                    f"Dataset '{pp['name']}' has too few usable points to fit: "
+                     f"{n_starved} lag channel"
+                     f"{'s' if n_starved != 1 else ''} were discarded as "
+                     f"pair-starved (G <= {pair_starved_cutoff:g}, meaning no "
+@@ -447,121 +476,39 @@
+                     f"chosen lag range, not that the fit settings are wrong."
+                 )
+             raise ValueError(
+-                f"Dataset '{ds['name']}' has too few finite points to fit.")
+-        prepped.append({"name": ds["name"], "tau": t, "G": y, "sigma": s,
+-                        "meta": ds.get("meta", {}),
+-                        "n_pair_starved": n_starved})
+-
+-    D = len(prepped)
+-    if D == 0:
+-        raise ValueError("No datasets selected.")
+-    use_weights = weighted and all(p["sigma"] is not None for p in prepped)
+-
+-    # ── Lay out the free-parameter vector ────────────────────────────────────
+-    free_spec: list = []          # (param_name, dataset_index | None)
+-    for p in names:
+-        if fixed.get(p, False):
+-            continue
+-        if linked.get(p, False):
+-            free_spec.append((p, None))
+-        else:
+-            free_spec.extend((p, di) for di in range(D))
+-    if not free_spec:
+-        raise ValueError("At least one parameter must be free (not fixed).")
+-    idx = {spec: i for i, spec in enumerate(free_spec)}
+-    fixed_value = {p: guesses[p] for p in names if fixed.get(p, False)}
+-
+-    def value_of(theta, p, di):
+-        if fixed.get(p, False):
+-            return fixed_value[p]
+-        if linked.get(p, False):
+-            return theta[idx[(p, None)]]
+-        return theta[idx[(p, di)]]
+-
+-    def residuals(theta):
+-        chunks = []
+-        for di, pp in enumerate(prepped):
+-            vals = {p: value_of(theta, p, di) for p in names}
+-            mvals = model.func(pp["tau"], **vals)
+-            r = pp["G"] - mvals
+-            if use_weights:
+-                r = r / pp["sigma"]
+-            chunks.append(r)
+-        return np.concatenate(chunks)
+-
+-    theta0, lb, ub = [], [], []
+-    for (p, _di) in free_spec:
+-        theta0.append(guesses[p]); lb.append(lowers[p]); ub.append(uppers[p])
+-    theta0 = [min(max(v, lo), hi) for v, lo, hi in zip(theta0, lb, ub)]
+-
+-    sol = least_squares(residuals, theta0, bounds=(lb, ub), max_nfev=maxfev)
+-
+-    # ── Covariance / parameter errors ────────────────────────────────────────
+-    n_obs = int(sum(len(pp["tau"]) for pp in prepped))
+-    n_par = len(free_spec)
+-    dof = n_obs - n_par
+-    cov = None
+-    try:
+-        JtJ = sol.jac.T @ sol.jac
+-        cov = np.linalg.pinv(JtJ)
+-        if not use_weights and dof > 0:
+-            cov = cov * (2.0 * sol.cost / dof)   # scale by residual variance
+-        perr_free = np.sqrt(np.clip(np.diag(cov), 0.0, np.inf))
+-    except Exception:
+-        perr_free = np.full(n_par, np.nan)
+-
+-    def err_of(p, di):
+-        if fixed.get(p, False):
+-            return 0.0
+-        if linked.get(p, False):
+-            return float(perr_free[idx[(p, None)]])
+-        return float(perr_free[idx[(p, di)]])
++                f"Dataset '{pp['name']}' has too few finite points to fit.")
+ 
+-    # ── Per-dataset breakdown ────────────────────────────────────────────────
+-    theta = sol.x
++    out = fcs_globalfit.fit_linked(
++        names, prepped,
++        lambda ds, tau, values: model.func(tau, **values),
++        linked, guesses, lowers, uppers, fixed,
++        weighted=weighted, maxfev=maxfev,
++    )
++
++    # ── Restore this module's key names ──────────────────────────────────────
++    # The shared core speaks x/y/yfit because it fits curves, not correlations.
++    # Everything downstream here — plot_global_fit, export_global_fit,
++    # rebuild_plot, the noise/Fisher block — reads tau/G/Gfit, and renaming
++    # them for the sake of the refactor would be churn with no benefit.
+     per_dataset = []
+-    for di, pp in enumerate(prepped):
+-        vals = {p: value_of(theta, p, di) for p in names}
+-        errs = {p: err_of(p, di) for p in names}
+-        mvals = model.func(pp["tau"], **vals)
+-        resid = pp["G"] - mvals
+-        ss_res = float(np.sum(resid ** 2))
+-        ss_tot = float(np.sum((pp["G"] - pp["G"].mean()) ** 2))
+-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
++    for entry in out["datasets"]:
+         per_dataset.append({
+-            "name": pp["name"], "tau": pp["tau"], "G": pp["G"],
+-            "Gfit": mvals, "resid": resid, "sigma": pp["sigma"],
+-            "values": vals, "errors": errs, "r2": r2,
+-            "ss_res": ss_res, "n_points": len(pp["tau"]),
+-            "n_pair_starved": pp.get("n_pair_starved", 0),
+-            "meta": pp.get("meta", {}),
++            "name": entry["name"],
++            "tau": entry["x"], "G": entry["y"], "Gfit": entry["yfit"],
++            "resid": entry["resid"], "sigma": entry["sigma"],
++            "values": entry["values"], "errors": entry["errors"],
++            "r2": entry["r2"], "ss_res": entry["ss_res"],
++            "n_points": entry["n_points"],
++            "n_pair_starved": entry.get("n_pair_starved", 0),
++            "meta": entry.get("meta", {}),
+         })
+ 
+-    full_res = residuals(theta)
+-    ss_res_tot = float(np.sum(full_res ** 2))
+-    if use_weights and dof > 0:
+-        chi2, red_chi2 = ss_res_tot, ss_res_tot / dof
+-    else:
+-        chi2 = red_chi2 = float("nan")
+-
+-    #this builds labels for the free param vector
+-    free_labels = [
+-        p if di is None else f"{p}[{prepped[di]['name']}]"
+-        for (p, di) in free_spec
+-    ]
+-
+-    return {
+-        "model": model, "names": names, "datasets": per_dataset,
+-        "linked": dict(linked), "fixed": dict(fixed),
+-        "lowers": dict(lowers), "uppers": dict(uppers), "guesses": dict(guesses),
+-        "weighted": use_weights, "n_datasets": D,
+-        "drop_pair_starved": bool(drop_pair_starved),
+-        "pair_starved_cutoff": float(pair_starved_cutoff),
+-        "dof": dof, "n_free": n_par, "n_obs": n_obs,
+-        "chi2": chi2, "red_chi2": red_chi2, "ss_res": ss_res_tot,
+-        "success": bool(sol.success), "message": str(sol.message),
+-        "cov": cov, "free_labels": free_labels,
+-    }
++    result = dict(out)
++    result["datasets"] = per_dataset
++    result["model"] = model
++    result["drop_pair_starved"] = bool(drop_pair_starved)
++    result["pair_starved_cutoff"] = float(pair_starved_cutoff)
++    return result
+ 
+ 
+ def plot_global_fit(result: dict, show: bool = True):

@@ -1,0 +1,354 @@
+--- /dev/null
++++ b/fcs_fitdialogs.py
+@@ -0,0 +1,351 @@
++"""
++fcs_fitdialogs.py
++=================
++The dialog pieces every multi-dataset fit needs, shared by all three analyses.
++
++    fcs_fit.py            correlation global fit
++    fcs_pch_fit.py        PCH global fit
++    fcs_lifetime_fit.py   lifetime global fit
++
++What is here
++------------
++    dataset_legend(...)   numbered list of the selected datasets
++    ParamTable(...)       the Parameter / Link / Guess / Lower / Upper / Fix /
++                          Rule grid, with live rule checking
++    show_rule_help(...)   the rule syntax reference, in a window
++
++Why shared
++----------
++The three fitters ask the same question -- for each model parameter, what is
++the starting guess, what are its bounds, and is it shared, held or free? -- and
++differ only in what a parameter means.  Three copies of that grid would drift
++the way ``_fits_dir`` and the parameter tables did before fcs_fitcommon and
++fcs_globalfit collected them, and this grid is the one place a mistake is
++expensive: it decides what the fit is allowed to do.
++
++Dependencies
++------------
++tkinter is imported inside functions, not at module scope, so a headless
++script can import this module for its constants without needing a display.
++"""
++
++from __future__ import annotations
++
++from typing import Dict, List, Optional, Sequence
++
++import numpy as np
++
++import fcs_globalfit
++from fcs_fitcommon import fmt_bound as _fmt, parse_bound as _parse_bound
++
++
++__all__ = ["dataset_legend", "ParamTable", "show_rule_help"]
++
++
++# ── Dataset legend ────────────────────────────────────────────────────────────
++
++def dataset_legend(parent, names: Sequence[str], height: int = 5):
++    """
++    A numbered, read-only list of the selected datasets.
++
++    Rules address datasets by number, so the numbering has to be on screen
++    while the rule is being typed.  Requiring the user to remember that d7 is
++    the third replicate of the 5 uM point is how the wrong dataset gets fixed
++    at the wrong value.
++
++    Returns the frame, already packed by the caller's convention (it is not
++    packed here, so the caller decides where it goes).
++    """
++    import tkinter as tk
++
++    frame = tk.LabelFrame(parent, text=f"Datasets ({len(names)})",
++                          padx=6, pady=4)
++    inner = tk.Frame(frame)
++    inner.pack(fill="both", expand=True)
++
++    rows = min(max(len(names), 1), height)
++    text = tk.Text(inner, height=rows, width=52, font=("Courier", 8),
++                   wrap="none", relief="flat", background=frame["background"])
++    scroll = tk.Scrollbar(inner, orient="vertical", command=text.yview)
++    text.configure(yscrollcommand=scroll.set)
++    if len(names) > rows:
++        scroll.pack(side="right", fill="y")
++    text.pack(side="left", fill="both", expand=True)
++
++    width = len(str(max(len(names), 1)))
++    for i, nm in enumerate(names, start=1):
++        text.insert("end", f"{i:>{width}}  {nm}\n")
++    text.configure(state="disabled")
++    return frame
++
++
++# ── Rule help ─────────────────────────────────────────────────────────────────
++
++def show_rule_help(parent, names: Optional[Sequence[str]] = None):
++    """
++    Show the rule syntax reference in a scrollable, selectable window.
++
++    The text comes from :data:`fcs_globalfit.RULE_HELP`, so it cannot describe
++    a syntax the parser does not accept.  Selectable rather than a message box
++    because the most useful thing to do with an example is copy it.
++    """
++    import tkinter as tk
++
++    win = tk.Toplevel(parent)
++    win.title("Per-dataset rules — syntax")
++    win.geometry("640x560")
++
++    body = tk.Frame(win)
++    body.pack(fill="both", expand=True, padx=8, pady=8)
++    scroll = tk.Scrollbar(body, orient="vertical")
++    text = tk.Text(body, wrap="word", font=("Courier", 9),
++                   yscrollcommand=scroll.set)
++    scroll.config(command=text.yview)
++    scroll.pack(side="right", fill="y")
++    text.pack(side="left", fill="both", expand=True)
++    text.insert("1.0", fcs_globalfit.rule_help_for(names))
++    text.configure(state="disabled")
++
++    tk.Button(win, text="Close", width=10, command=win.destroy,
++              pady=4).pack(pady=(0, 8))
++    return win
++
++
++# ── Parameter table ───────────────────────────────────────────────────────────
++
++class ParamTable:
++    """
++    The per-parameter grid: Link, Guess, Lower, Upper, Fix, and a rule.
++
++    Build it into *parent*, then call :meth:`read` when the user commits.  The
++    caller supplies the model and the dataset names; everything else -- widget
++    state, live rule checking, validation -- is handled here.
++
++    The Rule column
++    ---------------
++    Ticking Rule for a parameter disables that row's Link and Fix boxes.  Both
++    describe the same thing, and with both live there is no defined answer to
++    "the box says linked and the rule says F(2=0), which wins?".  This is not a
++    judgement about what should be linked -- any rule the parser accepts is
++    allowed -- only about not having two controls for one setting.
++
++    Rules are checked as they are typed and the result shown in plain words
++    underneath, because a rule is a small program and the failure mode of a
++    small program is doing something other than what was meant.  Seeing
++    "linked {d1, d3, d4}; fixed d2 = 1e-06; free d5, d6" is what catches the
++    off-by-one before the fit runs, not after.
++    """
++
++    def __init__(self, parent, model, dataset_names: Sequence[str],
++                 guesses0: Optional[Dict[str, float]] = None,
++                 allow_rules: bool = True):
++        import tkinter as tk
++
++        self.model = model
++        self.names = [p.name for p in model.params]
++        self.dataset_names = list(dataset_names)
++        self.D = len(self.dataset_names)
++        self.multi = self.D > 1
++        guesses0 = guesses0 or {}
++
++        self.link_vars: Dict[str, tk.BooleanVar] = {}
++        self.guess_vars: Dict[str, tk.StringVar] = {}
++        self.lower_vars: Dict[str, tk.StringVar] = {}
++        self.upper_vars: Dict[str, tk.StringVar] = {}
++        self.fixed_vars: Dict[str, tk.BooleanVar] = {}
++        self.rule_on: Dict[str, tk.BooleanVar] = {}
++        self.rule_text: Dict[str, tk.StringVar] = {}
++        self._link_widgets: Dict[str, object] = {}
++        self._fix_widgets: Dict[str, object] = {}
++        self._rule_widgets: Dict[str, object] = {}
++
++        self.frame = tk.Frame(parent)
++        table = tk.Frame(self.frame, padx=12, pady=4)
++        table.pack(fill="x")
++
++        headers = ["Parameter", "Link", "Guess", "Lower", "Upper", "Fix"]
++        if allow_rules and self.multi:
++            headers += ["Rule?", "Rule"]
++        for c, h in enumerate(headers):
++            tk.Label(table, text=h, font=("Helvetica", 10, "bold")).grid(
++                row=0, column=c, padx=4, pady=(0, 4))
++
++        for r, p in enumerate(model.params, start=1):
++            label = p.name + (f" ({p.unit})" if p.unit else "")
++            tk.Label(table, text=label, anchor="w", width=12).grid(
++                row=r, column=0, sticky="w", padx=4, pady=2)
++
++            lkv = tk.BooleanVar(value=p.link_default if self.multi else False)
++            gv  = tk.StringVar(value=f"{guesses0.get(p.name, p.default):.6g}")
++            lv  = tk.StringVar(value=_fmt(p.lower))
++            uv  = tk.StringVar(value=_fmt(p.upper))
++            fv  = tk.BooleanVar(value=p.fixed)
++
++            lkw = tk.Checkbutton(table, variable=lkv,
++                                 state="normal" if self.multi else "disabled")
++            lkw.grid(row=r, column=1, padx=4)
++            tk.Entry(table, textvariable=gv, width=12).grid(row=r, column=2, padx=4)
++            tk.Entry(table, textvariable=lv, width=10).grid(row=r, column=3, padx=4)
++            tk.Entry(table, textvariable=uv, width=10).grid(row=r, column=4, padx=4)
++            fw = tk.Checkbutton(table, variable=fv)
++            fw.grid(row=r, column=5, padx=4)
++
++            self.link_vars[p.name]  = lkv
++            self.guess_vars[p.name] = gv
++            self.lower_vars[p.name] = lv
++            self.upper_vars[p.name] = uv
++            self.fixed_vars[p.name] = fv
++            self._link_widgets[p.name] = lkw
++            self._fix_widgets[p.name]  = fw
++
++            if allow_rules and self.multi:
++                rv = tk.BooleanVar(value=False)
++                rt = tk.StringVar(value="")
++                rw = tk.Entry(table, textvariable=rt, width=26,
++                              state="disabled")
++                tk.Checkbutton(
++                    table, variable=rv,
++                    command=lambda n=p.name: self._toggle_rule(n),
++                ).grid(row=r, column=6, padx=4)
++                rw.grid(row=r, column=7, padx=4)
++                rt.trace_add("write", lambda *_a: self._refresh_status())
++                self.rule_on[p.name] = rv
++                self.rule_text[p.name] = rt
++                self._rule_widgets[p.name] = rw
++
++        if allow_rules and self.multi:
++            bar = tk.Frame(self.frame)
++            bar.pack(fill="x", padx=12, pady=(4, 0))
++            tk.Button(bar, text="Rule syntax…", pady=2,
++                      command=lambda: show_rule_help(
++                          self.frame, self.dataset_names)).pack(side="left")
++            tk.Label(bar, text="  e.g.  L(1,3,4); F(2=1e-6)    or    "
++                              "L(1-10); L(11-20)",
++                     font=("Courier", 8), fg="grey").pack(side="left")
++
++            self.status = tk.StringVar(value="")
++            self._status_label = tk.Label(
++                self.frame, textvariable=self.status, font=("Courier", 8),
++                fg="grey", anchor="w", justify="left", wraplength=620)
++            self._status_label.pack(fill="x", padx=12, pady=(2, 0))
++        else:
++            self.status = None
++            self._status_label = None
++
++    # ── internals ────────────────────────────────────────────────────────────
++
++    def _toggle_rule(self, name: str):
++        """Enable the rule entry and stand the Link/Fix boxes down."""
++        on = self.rule_on[name].get()
++        self._rule_widgets[name].configure(state="normal" if on else "disabled")
++        for widgets in (self._link_widgets, self._fix_widgets):
++            widgets[name].configure(state="disabled" if on else "normal")
++        if not on:
++            # Leaving the text in place would make an unticked rule look active.
++            self.rule_text[name].set("")
++        self._refresh_status()
++
++    def _parse_rules(self):
++        """``(plans, errors)`` for every parameter whose rule box is ticked."""
++        plans: Dict[str, tuple] = {}
++        errors: Dict[str, str] = {}
++        for name in self.names:
++            if name not in self.rule_on or not self.rule_on[name].get():
++                continue
++            text = self.rule_text[name].get().strip()
++            if not text:
++                errors[name] = "rule is empty"
++                continue
++            try:
++                default = float(self.guess_vars[name].get())
++            except (TypeError, ValueError):
++                default = 0.0
++            try:
++                plan, _summary = fcs_globalfit.parse_dataset_rule(
++                    text, self.D, default_value=default)
++            except fcs_globalfit.RuleError as exc:
++                errors[name] = str(exc).replace("\n", " ")
++            else:
++                plans[name] = plan
++        return plans, errors
++
++    def _refresh_status(self):
++        if self.status is None:
++            return
++        plans, errors = self._parse_rules()
++        lines: List[str] = []
++        for name in self.names:
++            if name in errors:
++                lines.append(f"✗ {name}: {errors[name]}")
++            elif name in plans:
++                lines.append(f"✓ {name}: " + fcs_globalfit.describe_plan(
++                    plans[name], self.dataset_names))
++        self.status.set("\n".join(lines))
++        if self._status_label is not None:
++            self._status_label.configure(fg="#a00" if errors else "#050")
++
++    # ── public ───────────────────────────────────────────────────────────────
++
++    def pack(self, **kw):
++        self.frame.pack(**kw)
++        return self.frame
++
++    def read(self) -> dict:
++        """
++        Collect and validate the table.
++
++        Returns ``{guesses, lowers, uppers, linked, fixed, plans}`` ready for
++        ``fit_linked`` / ``fit_global``.
++
++        Raises
++        ------
++        ValueError
++            With a message meant for a message box.  Bad numbers, crossed
++            bounds and unusable rules are all caught here rather than surfacing
++            from inside the fit, where the message would be about arrays.
++        """
++        try:
++            guesses = {n: float(self.guess_vars[n].get()) for n in self.names}
++        except ValueError:
++            raise ValueError("Guesses must be numbers.")
++        try:
++            lowers = {n: _parse_bound(self.lower_vars[n].get(), -np.inf)
++                      for n in self.names}
++            uppers = {n: _parse_bound(self.upper_vars[n].get(), np.inf)
++                      for n in self.names}
++        except ValueError:
++            raise ValueError("Bounds must be numbers (use 'inf' / '-inf').")
++
++        for n in self.names:
++            if lowers[n] >= uppers[n]:
++                raise ValueError(f"For '{n}', lower must be < upper.")
++
++        plans, errors = self._parse_rules()
++        if errors:
++            raise ValueError(
++                "These rules could not be used:\n\n"
++                + "\n".join(f"  {n}:  {msg}" for n, msg in errors.items())
++                + "\n\nUse the 'Rule syntax…' button for the accepted forms.")
++
++        # A rule supersedes the row's Link/Fix boxes, which are disabled while
++        # it is active; sending them anyway would be harmless (fit_linked
++        # prefers the plan) but would leave the result's flags describing
++        # controls the user could not reach.
++        linked = {n: (self.link_vars[n].get()
++                      and self.multi and n not in plans)
++                  for n in self.names}
++        fixed = {n: (self.fixed_vars[n].get() and n not in plans)
++                 for n in self.names}
++
++        # A held value is held at its guess, so a bound that excludes the guess
++        # is a contradiction the fit cannot report -- it never sees the
++        # parameter at all.
++        for n in self.names:
++            if fixed[n] and not (lowers[n] <= guesses[n] <= uppers[n]):
++                raise ValueError(
++                    f"'{n}' is fixed at {guesses[n]:g}, which is outside its "
++                    f"bounds [{_fmt(lowers[n])}, {_fmt(uppers[n])}].")
++
++        return {"guesses": guesses, "lowers": lowers, "uppers": uppers,
++                "linked": linked, "fixed": fixed,
++                "plans": plans or None}

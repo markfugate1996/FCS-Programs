@@ -1,0 +1,131 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -39,6 +39,7 @@
+ 
+ import fcs_models
+ import fcs_globalfit
++import fcs_fitdialogs
+ from fcs_models import FCSModel
+ import fcs_export
+ from fcs_reader import read_fcs, FCSData
+@@ -1854,49 +1855,24 @@
+              font=("Helvetica", 9), fg="grey").pack(pady=(0, 6))
+ 
+     guesses0 = combined_guess(model, datasets)
++    ds_names = [ds["name"] for ds in datasets]
+ 
+-    table = tk.Frame(win, padx=12, pady=4)
+-    table.pack(fill="x")
+-    for c, h in enumerate(["Parameter", "Link", "Guess", "Lower", "Upper", "Fix"]):
+-        tk.Label(table, text=h, font=("Helvetica", 10, "bold")).grid(
+-            row=0, column=c, padx=4, pady=(0, 4))
+-
+-    link_vars: Dict[str, tk.BooleanVar] = {}
+-    guess_vars: Dict[str, tk.StringVar] = {}
+-    lower_vars: Dict[str, tk.StringVar] = {}
+-    upper_vars: Dict[str, tk.StringVar] = {}
+-    fixed_vars: Dict[str, tk.BooleanVar] = {}
+-
+-    for r, p in enumerate(model.params, start=1):
+-        label = p.name + (f" ({p.unit})" if p.unit else "")
+-        tk.Label(table, text=label, anchor="w", width=12).grid(
+-            row=r, column=0, sticky="w", padx=4, pady=2)
+-
+-        lkv = tk.BooleanVar(value=p.link_default if D > 1 else False)
+-        gv  = tk.StringVar(value=f"{guesses0.get(p.name, p.default):.6g}")
+-        lv  = tk.StringVar(value=_fmt(p.lower))
+-        uv  = tk.StringVar(value=_fmt(p.upper))
+-        fv  = tk.BooleanVar(value=p.fixed)
+-
+-        tk.Checkbutton(table, variable=lkv,
+-                       state="normal" if D > 1 else "disabled").grid(row=r, column=1, padx=4)
+-        tk.Entry(table, textvariable=gv, width=12).grid(row=r, column=2, padx=4)
+-        tk.Entry(table, textvariable=lv, width=10).grid(row=r, column=3, padx=4)
+-        tk.Entry(table, textvariable=uv, width=10).grid(row=r, column=4, padx=4)
+-        tk.Checkbutton(table, variable=fv).grid(row=r, column=5, padx=4)
+-
+-        link_vars[p.name]  = lkv
+-        guess_vars[p.name] = gv
+-        lower_vars[p.name] = lv
+-        upper_vars[p.name] = uv
+-        fixed_vars[p.name] = fv
++    # The numbered dataset list: rules address datasets by number, so the
++    # numbering belongs on the same screen as the rule boxes.
++    if D > 1:
++        fcs_fitdialogs.dataset_legend(win, ds_names).pack(
++            fill="x", padx=12, pady=(0, 6))
++
++    ptable = fcs_fitdialogs.ParamTable(win, model, ds_names, guesses0)
++    ptable.pack(fill="x")
+ 
+     note = ("Linked = one shared value across all datasets; "
+-            "unlinked = an independent value per dataset.")
++            "unlinked = an independent value per dataset.  "
++            "Tick Rule for finer control over which datasets share a value.")
+     if D == 1:
+         note = "Linking applies with 2+ datasets (only one selected)."
+     tk.Label(win, text=note, font=("Helvetica", 9), fg="grey",
+-             wraplength=440, justify="left").pack(fill="x", padx=12, pady=(4, 0))
++             wraplength=560, justify="left").pack(fill="x", padx=12, pady=(4, 0))
+ 
+     weight_var = tk.BooleanVar(value=all_have_sigma)
+     tk.Checkbutton(
+@@ -1955,28 +1931,20 @@
+ 
+     def _do_fit():
+         try:
+-            guesses = {n: float(guess_vars[n].get()) for n in guess_vars}
+-            lowers  = {n: _parse_bound(lower_vars[n].get(), -np.inf) for n in lower_vars}
+-            uppers  = {n: _parse_bound(upper_vars[n].get(),  np.inf) for n in upper_vars}
+-        except ValueError:
+-            messagebox.showerror("Invalid input",
+-                                 "Guesses and bounds must be numbers "
+-                                 "(use 'inf' / '-inf').", parent=win)
++            setup = ptable.read()
++        except ValueError as e:
++            messagebox.showerror("Invalid input", str(e), parent=win)
+             return
+-        linked = {n: (link_vars[n].get() if D > 1 else False) for n in link_vars}
+-        fixed  = {n: fixed_vars[n].get() for n in fixed_vars}
+-        for n in guesses:
+-            if lowers[n] >= uppers[n]:
+-                messagebox.showerror("Invalid bounds",
+-                                     f"For '{n}', lower must be < upper.", parent=win)
+-                return
+-        
++
+         weighted = all_have_sigma and weight_var.get()
+ 
+         try:
+-            result = fit_global(model, datasets, linked, guesses,
+-                                lowers, uppers, fixed, weighted=weighted,
+-                                drop_pair_starved=starved_var.get())
++            result = fit_global(model, datasets, setup["linked"],
++                                setup["guesses"], setup["lowers"],
++                                setup["uppers"], setup["fixed"],
++                                weighted=weighted,
++                                drop_pair_starved=starved_var.get(),
++                                plans=setup["plans"])
+         except Exception as e:
+             messagebox.showerror("Fit failed", str(e), parent=win)
+             return
+@@ -1994,16 +1962,14 @@
+         # costs us the report and tables already on disk.
+         fcs_plottools.save_figure(fig, report_path.with_suffix(""))
+ 
+-        linked_lines = [
+-            f"{n} = {result['datasets'][0]['values'][n]:.4g} (linked)"
+-            for n in result["names"] if result["linked"].get(n)
+-        ]
++        linked_lines = [f"{label} = {val:.4g}  ± {err}"
++                        for label, val, err, _u in _shared_value_rows(result, model)]
+         gof = (f"red. χ² = {result['red_chi2']:.3g}"
+                if result["weighted"] else f"{result['n_datasets']} datasets")
+         messagebox.showinfo(
+             "Global fit complete",
+             f"{model.name}\n\n"
+-            + ("\n".join(linked_lines) if linked_lines else "(no linked parameters)")
++            + ("\n".join(linked_lines) if linked_lines else "(no shared parameters)")
+             + f"\n\n{gof}\n\nResults saved to:\n{report_path.parent}",
+             parent=parent,
+         )

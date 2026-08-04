@@ -38,6 +38,8 @@ import fcs_plottools
 from scipy.optimize import least_squares
 
 import fcs_models
+import fcs_globalfit
+import fcs_fitdialogs
 from fcs_models import FCSModel
 import fcs_export
 from fcs_reader import read_fcs, FCSData
@@ -65,9 +67,9 @@ from fcs_fitcommon import (
 #
 # Membership is otherwise still decided by fresh discovery on each open, so a
 # correlation CSV written since the last visit shows up on its own.
-_last_dataset_order: list[str] = []       # row order, included rows and not
-_last_dataset_removed: set[str] = set()   # rows removed from the list by hand
-_last_browse_dir: Optional[str] = None    # folder the dialog last worked in
+# The picker's remembered order, removals and folder now live in
+# fcs_fitdialogs, in a bucket per analysis, so curating a list of decays does
+# not disturb a list of correlations left mid-session.
 
 # ── CSV loading ───────────────────────────────────────────────────────────────
 
@@ -388,6 +390,7 @@ def fit_global(
     maxfev: int = 20000,
     drop_pair_starved: bool = True,
     pair_starved_cutoff: float = _PAIR_STARVED_CUTOFF,
+    plans: Optional[Dict[str, tuple]] = None,
 ) -> dict:
     """
     Global least-squares fit of one model to several correlation datasets.
@@ -396,6 +399,12 @@ def fit_global(
       * fixed   — held at its guess for every dataset (no free variable);
       * linked  — a single shared free variable used by every dataset;
       * unlinked— one independent free variable per dataset.
+
+    A parameter can also be partitioned rather than treated as a whole: pass
+    *plans* (see :func:`fcs_globalfit.parse_dataset_rule`) to share a value
+    across some datasets, hold it on others and leave the rest free.  The
+    ``linked`` and ``fixed`` flags still apply to every parameter absent from
+    *plans*.
 
     ``datasets`` is a list of dicts with keys ``name``, ``tau``, ``G`` and
     optionally ``sigma``.  Weighting is applied only if ``weighted`` is True
@@ -410,34 +419,62 @@ def fit_global(
 
     Returns a result dict with global goodness-of-fit plus a per-dataset
     breakdown (values, 1σ errors, fit curve, residuals, R²).
+
+    Implementation
+    --------------
+    The linked-parameter arithmetic — the free-parameter vector, the index map
+    from (parameter, dataset) into it, the concatenated residual and the
+    covariance — now lives in :mod:`fcs_globalfit`, which the PCH and lifetime
+    fitters use as well.  This function is what remains once that is taken out:
+    the correlation-specific parts, which are the pair-starved censoring, the
+    tau > 0 domain, and the key names the rest of this module reads.
+
+    The extraction is exact rather than approximate.  ``fit_linked`` was
+    written against this function's behaviour and is checked against it —
+    values, errors, R², dof, chi², and free-parameter labels compared with
+    ``==`` — so migrating changes no number that this module has ever
+    reported.
     """
     names = model.param_names()
 
-    # ── Mask each dataset to finite, positive-lag points ─────────────────────
-    prepped = []
+    # ── Mask each dataset to finite, positive-lag, non-censored points ───────
+    # Counted here rather than inside the shared masker because "pair-starved"
+    # is a fact about photon correlation, not about fitting.  The running mask
+    # is used so a lag already dropped for want of a sigma is not ALSO counted
+    # as pair-starved, which would overstate the censoring in the report.
     starved_counts: Dict[str, int] = {}
-    for ds in datasets:
-        t = np.asarray(ds["tau"], dtype=np.float64)
-        y = np.asarray(ds["G"],   dtype=np.float64)
-        m = np.isfinite(t) & np.isfinite(y) & (t > 0)
-        s = None
-        if weighted and ds.get("sigma") is not None:
-            s = np.asarray(ds["sigma"], dtype=np.float64)
-            m &= np.isfinite(s) & (s > 0)
 
+    def _keep(ds, tau, G, mask):
+        keep = tau > 0
         n_starved = 0
         if drop_pair_starved:
-            starved = m & (y <= pair_starved_cutoff)
+            starved = mask & keep & (G <= pair_starved_cutoff)
             n_starved = int(np.count_nonzero(starved))
-            m &= ~starved
+            keep = keep & ~starved
         starved_counts[ds["name"]] = n_starved
+        return keep
 
-        t, y = t[m], y[m]
-        s = s[m] if s is not None else None
-        if len(t) < 2:
+    core_datasets = [
+        {"name": ds["name"], "x": ds["tau"], "y": ds["G"],
+         "sigma": ds.get("sigma"), "meta": ds.get("meta", {})}
+        for ds in datasets
+    ]
+
+    # min_points=0 so the shared masker never raises: the "too few points"
+    # message belongs here, where it can say WHY.  A dataset left short by
+    # censoring is reporting a count rate too low for the lag range -- a fact
+    # about the measurement -- and a generic message would send the user
+    # looking at their fit settings instead.
+    prepped = fcs_globalfit.prepare_datasets(
+        core_datasets, weighted=weighted, extra_mask=_keep, min_points=0)
+
+    for pp in prepped:
+        n_starved = starved_counts.get(pp["name"], 0)
+        pp["n_pair_starved"] = n_starved
+        if len(pp["x"]) < 2:
             if n_starved:
                 raise ValueError(
-                    f"Dataset '{ds['name']}' has too few usable points to fit: "
+                    f"Dataset '{pp['name']}' has too few usable points to fit: "
                     f"{n_starved} lag channel"
                     f"{'s' if n_starved != 1 else ''} were discarded as "
                     f"pair-starved (G <= {pair_starved_cutoff:g}, meaning no "
@@ -447,121 +484,43 @@ def fit_global(
                     f"chosen lag range, not that the fit settings are wrong."
                 )
             raise ValueError(
-                f"Dataset '{ds['name']}' has too few finite points to fit.")
-        prepped.append({"name": ds["name"], "tau": t, "G": y, "sigma": s,
-                        "meta": ds.get("meta", {}),
-                        "n_pair_starved": n_starved})
+                f"Dataset '{pp['name']}' has too few finite points to fit.")
 
-    D = len(prepped)
-    if D == 0:
-        raise ValueError("No datasets selected.")
-    use_weights = weighted and all(p["sigma"] is not None for p in prepped)
+    out = fcs_globalfit.fit_linked(
+        names, prepped,
+        lambda ds, tau, values: model.func(tau, **values),
+        linked, guesses, lowers, uppers, fixed,
+        weighted=weighted, maxfev=maxfev, plans=plans,
+    )
 
-    # ── Lay out the free-parameter vector ────────────────────────────────────
-    free_spec: list = []          # (param_name, dataset_index | None)
-    for p in names:
-        if fixed.get(p, False):
-            continue
-        if linked.get(p, False):
-            free_spec.append((p, None))
-        else:
-            free_spec.extend((p, di) for di in range(D))
-    if not free_spec:
-        raise ValueError("At least one parameter must be free (not fixed).")
-    idx = {spec: i for i, spec in enumerate(free_spec)}
-    fixed_value = {p: guesses[p] for p in names if fixed.get(p, False)}
-
-    def value_of(theta, p, di):
-        if fixed.get(p, False):
-            return fixed_value[p]
-        if linked.get(p, False):
-            return theta[idx[(p, None)]]
-        return theta[idx[(p, di)]]
-
-    def residuals(theta):
-        chunks = []
-        for di, pp in enumerate(prepped):
-            vals = {p: value_of(theta, p, di) for p in names}
-            mvals = model.func(pp["tau"], **vals)
-            r = pp["G"] - mvals
-            if use_weights:
-                r = r / pp["sigma"]
-            chunks.append(r)
-        return np.concatenate(chunks)
-
-    theta0, lb, ub = [], [], []
-    for (p, _di) in free_spec:
-        theta0.append(guesses[p]); lb.append(lowers[p]); ub.append(uppers[p])
-    theta0 = [min(max(v, lo), hi) for v, lo, hi in zip(theta0, lb, ub)]
-
-    sol = least_squares(residuals, theta0, bounds=(lb, ub), max_nfev=maxfev)
-
-    # ── Covariance / parameter errors ────────────────────────────────────────
-    n_obs = int(sum(len(pp["tau"]) for pp in prepped))
-    n_par = len(free_spec)
-    dof = n_obs - n_par
-    cov = None
-    try:
-        JtJ = sol.jac.T @ sol.jac
-        cov = np.linalg.pinv(JtJ)
-        if not use_weights and dof > 0:
-            cov = cov * (2.0 * sol.cost / dof)   # scale by residual variance
-        perr_free = np.sqrt(np.clip(np.diag(cov), 0.0, np.inf))
-    except Exception:
-        perr_free = np.full(n_par, np.nan)
-
-    def err_of(p, di):
-        if fixed.get(p, False):
-            return 0.0
-        if linked.get(p, False):
-            return float(perr_free[idx[(p, None)]])
-        return float(perr_free[idx[(p, di)]])
-
-    # ── Per-dataset breakdown ────────────────────────────────────────────────
-    theta = sol.x
+    # ── Restore this module's key names ──────────────────────────────────────
+    # The shared core speaks x/y/yfit because it fits curves, not correlations.
+    # Everything downstream here — plot_global_fit, export_global_fit,
+    # rebuild_plot, the noise/Fisher block — reads tau/G/Gfit, and renaming
+    # them for the sake of the refactor would be churn with no benefit.
     per_dataset = []
-    for di, pp in enumerate(prepped):
-        vals = {p: value_of(theta, p, di) for p in names}
-        errs = {p: err_of(p, di) for p in names}
-        mvals = model.func(pp["tau"], **vals)
-        resid = pp["G"] - mvals
-        ss_res = float(np.sum(resid ** 2))
-        ss_tot = float(np.sum((pp["G"] - pp["G"].mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    for entry in out["datasets"]:
         per_dataset.append({
-            "name": pp["name"], "tau": pp["tau"], "G": pp["G"],
-            "Gfit": mvals, "resid": resid, "sigma": pp["sigma"],
-            "values": vals, "errors": errs, "r2": r2,
-            "ss_res": ss_res, "n_points": len(pp["tau"]),
-            "n_pair_starved": pp.get("n_pair_starved", 0),
-            "meta": pp.get("meta", {}),
+            "name": entry["name"],
+            "tau": entry["x"], "G": entry["y"], "Gfit": entry["yfit"],
+            "resid": entry["resid"], "sigma": entry["sigma"],
+            "values": entry["values"], "errors": entry["errors"],
+            "r2": entry["r2"], "ss_res": entry["ss_res"],
+            "n_points": entry["n_points"],
+            "n_pair_starved": entry.get("n_pair_starved", 0),
+            "meta": entry.get("meta", {}),
+            # Per-dataset roles, which the report and parameter table read to
+            # tell a fitted value from a shared or held one row by row.
+            "fixed": entry.get("fixed", {}),
+            "linked": entry.get("linked", {}),
         })
 
-    full_res = residuals(theta)
-    ss_res_tot = float(np.sum(full_res ** 2))
-    if use_weights and dof > 0:
-        chi2, red_chi2 = ss_res_tot, ss_res_tot / dof
-    else:
-        chi2 = red_chi2 = float("nan")
-
-    #this builds labels for the free param vector
-    free_labels = [
-        p if di is None else f"{p}[{prepped[di]['name']}]"
-        for (p, di) in free_spec
-    ]
-
-    return {
-        "model": model, "names": names, "datasets": per_dataset,
-        "linked": dict(linked), "fixed": dict(fixed),
-        "lowers": dict(lowers), "uppers": dict(uppers), "guesses": dict(guesses),
-        "weighted": use_weights, "n_datasets": D,
-        "drop_pair_starved": bool(drop_pair_starved),
-        "pair_starved_cutoff": float(pair_starved_cutoff),
-        "dof": dof, "n_free": n_par, "n_obs": n_obs,
-        "chi2": chi2, "red_chi2": red_chi2, "ss_res": ss_res_tot,
-        "success": bool(sol.success), "message": str(sol.message),
-        "cov": cov, "free_labels": free_labels,
-    }
+    result = dict(out)
+    result["datasets"] = per_dataset
+    result["model"] = model
+    result["drop_pair_starved"] = bool(drop_pair_starved)
+    result["pair_starved_cutoff"] = float(pair_starved_cutoff)
+    return result
 
 
 def plot_global_fit(result: dict, show: bool = True):
@@ -930,6 +889,75 @@ def _fit_file_stem(name_override: Optional[str] = None,
     return f"{stamp}_{slug}" if slug else f"globalfit_{stamp}"
 
 
+def _param_role(result: dict, ds: dict, name: str) -> str:
+    """
+    What this dataset did with this parameter: ``free``, ``shared`` or ``held``.
+
+    Written into the parameter table as a ``<param>_role`` column so the table
+    is self-describing.  Without it a reader cannot tell a genuinely equal pair
+    of fitted values from two datasets that were forced to share one, and those
+    mean very different things: the first is agreement, the second is an
+    assumption.
+    """
+    if ds.get("fixed", {}).get(name, result["fixed"].get(name, False)):
+        return "held"
+    if ds.get("linked", {}).get(name, result["linked"].get(name, False)):
+        return "shared"
+    return "free"
+
+
+def _shared_value_rows(result: dict, model) -> list:
+    """
+    One row per link GROUP: ``(label, value, err_text, unit)``.
+
+    Groups are read off the per-dataset ``linked`` flags and the fitted values,
+    so a parameter shared by datasets 1, 3 and 4 is reported as its own row
+    naming those three -- not folded in with a parameter shared by all of them.
+    """
+    rows = []
+    dsets = result["datasets"]
+    for n in result["names"]:
+        members = [i for i, ds in enumerate(dsets)
+                   if ds.get("linked", {}).get(n, result["linked"].get(n, False))]
+        if not members:
+            continue
+        unit = next((p.unit for p in model.params if p.name == n), "")
+        # Datasets sharing one value have identical fitted values, so grouping
+        # on the value recovers the groups exactly without the plan needing to
+        # be re-read here.
+        by_value: dict = {}
+        for i in members:
+            by_value.setdefault(dsets[i]["values"][n], []).append(i)
+        whole = len(members) == len(dsets) and len(by_value) == 1
+        for val, group in by_value.items():
+            label = n if whole else \
+                f"{n}[{'+'.join(dsets[i]['name'] for i in group)}]"
+            err = f"{dsets[group[0]]['errors'][n]:.6g}"
+            rows.append((label, float(val), err, unit))
+    return rows
+
+
+def _held_value_rows(result: dict, model) -> list:
+    """One row per held value: ``(label, value, unit)``."""
+    rows = []
+    dsets = result["datasets"]
+    for n in result["names"]:
+        members = [i for i, ds in enumerate(dsets)
+                   if ds.get("fixed", {}).get(n, result["fixed"].get(n, False))]
+        if not members:
+            continue
+        unit = next((p.unit for p in model.params if p.name == n), "")
+        by_value: dict = {}
+        for i in members:
+            by_value.setdefault(dsets[i]["values"][n], []).append(i)
+        whole = len(members) == len(dsets) and len(by_value) == 1
+        for val, group in by_value.items():
+            label = n if whole else \
+                f"{n}[{'+'.join(dsets[i]['name'] for i in group)}]"
+            rows.append((label, float(val), unit))
+    return rows
+
+
 def export_global_fit(result: dict, out_source: str | Path,
                       name_override: Optional[str] = None,
                       ) -> Tuple[Path, Path, Path]:
@@ -980,22 +1008,47 @@ def export_global_fit(result: dict, out_source: str | Path,
     L.append("")
     L.append("Parameter linking")
     L.append("-" * 64)
+    # The plan summary rather than a fixed/linked/per-dataset label: a
+    # parameter can now be shared across some datasets, held on others and free
+    # on the rest, and a single word cannot say which.  The whole-parameter
+    # cases still render as the one word they always did.
+    summaries = result.get("plan_summaries", {})
+    n_ds = len(result["datasets"])
     for n in result["names"]:
-        state = ("fixed" if result["fixed"].get(n)
-                 else "linked" if result["linked"].get(n) else "per-dataset")
-        L.append(f"  {n:<8} : {state:<11} "
-                 f"bounds [{_fmt(result['lowers'][n])}, {_fmt(result['uppers'][n])}]")
+        if result["fixed"].get(n):
+            state = "fixed"
+        elif result["linked"].get(n):
+            state = "linked"
+        elif all(not ds.get("fixed", {}).get(n, False)
+                 and not ds.get("linked", {}).get(n, False)
+                 for ds in result["datasets"]):
+            # Every dataset independent: the old wording, because listing all
+            # of them by name says nothing a single word does not.
+            state = "per-dataset"
+        else:
+            state = summaries.get(n, "per-dataset")
+        L.append(f"  {n:<8} : {state}")
+        L.append(f"  {'':<8}   bounds [{_fmt(result['lowers'][n])}, "
+                 f"{_fmt(result['uppers'][n])}]")
     L.append("")
 
-    linked_names = [n for n in result["names"] if result["linked"].get(n)]
-    if linked_names:
-        L.append("Linked / shared parameters")
+    # Shared values: one line per GROUP, naming its members.  A value shared by
+    # datasets 1, 3 and 4 is a different quantity from one shared by all six,
+    # and a report that does not say which was which cannot be checked later.
+    shared = _shared_value_rows(result, model)
+    if shared:
+        L.append("Shared values")
         L.append("-" * 64)
-        ref, referr = result["datasets"][0]["values"], result["datasets"][0]["errors"]
-        for n in linked_names:
-            unit = next((p.unit for p in model.params if p.name == n), "")
-            err = "—" if result["fixed"].get(n) else f"{referr[n]:.6g}"
-            L.append(f"  {n:<8} = {ref[n]:.6g}  ± {err}  {unit}".rstrip())
+        for label, val, err, unit in shared:
+            L.append(f"  {label:<28} = {val:.6g}  ± {err}  {unit}".rstrip())
+        L.append("")
+
+    held = _held_value_rows(result, model)
+    if held:
+        L.append("Held values")
+        L.append("-" * 64)
+        for label, val, unit in held:
+            L.append(f"  {label:<28} = {val:.6g}  (held){'  ' + unit if unit else ''}")
         L.append("")
 
     L.append("Per-dataset results")
@@ -1014,11 +1067,23 @@ def export_global_fit(result: dict, out_source: str | Path,
             L.append("               (± is the Poisson floor sqrt(N)/T; a "
                      "fluctuating sample exceeds it)")
         for n in result["names"]:
-            if result["linked"].get(n):
-                continue  # already reported above
+            # Whole-parameter links and holds are already reported above; a
+            # value shared or held by only SOME datasets still belongs on each
+            # row, so the reader can see this dataset's number without
+            # cross-referencing the group list.
+            if result["linked"].get(n) or result["fixed"].get(n):
+                continue
             unit = next((p.unit for p in model.params if p.name == n), "")
-            err = "—" if result["fixed"].get(n) else f"{ds['errors'][n]:.6g}"
-            L.append(f"    {n:<8} = {ds['values'][n]:.6g}  ± {err}  {unit}".rstrip())
+            ds_fixed = ds.get("fixed", {}).get(n, False)
+            ds_linked = ds.get("linked", {}).get(n, False)
+            if ds_fixed:
+                tag = "  (held)"
+                err = "—"
+            else:
+                tag = "  (shared)" if ds_linked else ""
+                err = f"{ds['errors'][n]:.6g}"
+            L.append(f"    {n:<8} = {ds['values'][n]:.6g}  ± {err}  "
+                     f"{unit}{tag}".rstrip())
         L.append("")
     
     corr = [(ds["name"], _bg_corr_from_meta(ds.get("meta")))
@@ -1056,8 +1121,11 @@ def export_global_fit(result: dict, out_source: str | Path,
                 nc = fcs_noise.noise_covariance(
                     model, ds["values"], ds["tau"],
                     T=float(_T), count_rate=float(_R))
+                # Per dataset: a parameter held for THIS dataset contributes
+                # no information here even if it is free for the next one.
                 free_names = [p for p in result["names"]
-                              if not result["fixed"].get(p, False)]
+                              if not ds.get("fixed", {}).get(
+                                  p, result["fixed"].get(p, False))]
                 info = fcs_noise.fisher_information(
                     model, ds["values"], ds["tau"], nc.sigma, free_names)
                 L.extend(fcs_noise.information_report_lines(info))
@@ -1090,6 +1158,15 @@ def export_global_fit(result: dict, out_source: str | Path,
         fh.write(f"# n_free     : {result['n_free']}\n")
         fh.write(f"# linked     : {', '.join(linked_names)}\n")
         fh.write(f"# fixed      : {', '.join(fixed_names)}\n")
+        for _n, _summary in (result.get("plan_summaries") or {}).items():
+            # Same reasoning as the two lines above: a partitioned parameter is
+            # not recoverable from the numbers, because datasets that were made
+            # to share a value look exactly like datasets that happened to
+            # agree.  Only the non-trivial rules, so the header stays readable.
+            if result["fixed"].get(_n) or result["linked"].get(_n):
+                continue
+            if _summary and not _summary.startswith("free "):
+                fh.write(f"# rule_{_n} : {_summary}\n")
         if weighted:
             fh.write(f"# red_chi2   : {result['red_chi2']:.10g}\n")
         else:
@@ -1121,7 +1198,7 @@ def export_global_fit(result: dict, out_source: str | Path,
 
     p_header = ["dataset"]
     for n in result["names"]:
-        p_header += [n, f"{n}_err"]
+        p_header += [n, f"{n}_err", f"{n}_role"]
     has_N = "G0" in result["names"]
     if has_N:
         p_header += ["N", "N_err"]                 # <N> = 1/G0, propagated error
@@ -1145,8 +1222,18 @@ def export_global_fit(result: dict, out_source: str | Path,
     for ds in result["datasets"]:
         row: list = [ds["name"]]
         for n in result["names"]:
+            role = _param_role(result, ds, n)
             row.append(float(ds["values"][n]))
-            row.append(float(ds["errors"][n]))
+            # A held parameter has NO fitted error, and this table used to
+            # write the 0.0 that fit_global returns for one -- which reads as a
+            # measurement of perfect precision, the opposite of the truth.  NaN
+            # renders as a blank cell (params_cell), which is what the lifetime
+            # and PCH tables have always written and what read_export maps back
+            # to NaN.  With per-dataset rules this is decided per ROW, since
+            # the same parameter can be held here and fitted on the next line.
+            row.append(float("nan") if role == "held"
+                       else float(ds["errors"][n]))
+            row.append(role)
         N = N_err = float("nan")
         if has_N:
             g0  = ds["values"]["G0"]
@@ -1190,6 +1277,17 @@ def export_global_fit(result: dict, out_source: str | Path,
     comments.append(f"weighted : {'yes' if result['weighted'] else 'no'}")
     comments.append(f"linked : {', '.join(linked_names) if linked_names else '(none)'}")
     comments.append(f"fixed : {', '.join(fixed_names) if fixed_names else '(none)'}")
+    comments.append("note_role : <param>_role is per dataset - free, shared "
+                    "(one value across a group) or held (not fitted); a blank "
+                    "*_err means held")
+    for _n, _summary in (result.get("plan_summaries") or {}).items():
+        # Only the parameters whose rule is not the whole-parameter case: the
+        # simple ones are already covered by the linked/fixed lines above, and
+        # repeating them would bury the interesting rules.
+        if result["fixed"].get(_n) or result["linked"].get(_n):
+            continue
+        if _summary and not _summary.startswith("free "):
+            comments.append(f"rule_{_n} : {_summary}")
     if result["weighted"]:
         comments.append(f"global_red_chi2 : {result['red_chi2']:.6g}")
     comments.append("units : tau_D in seconds")
@@ -1306,10 +1404,9 @@ def _default_dataset_dir(fcs_data=None) -> Optional[Path]:
         start = Path(fcs_data.filepath).parent
         analysis = start / "analysis"
         return analysis if analysis.exists() else start
-    if _last_browse_dir:
-        prev = Path(_last_browse_dir)
-        if prev.exists():
-            return prev
+    prev = fcs_fitdialogs.session_dir("correlation")
+    if prev is not None:
+        return prev
     return None
 
 
@@ -1365,9 +1462,9 @@ def _source_name_of_csv(path: Path) -> str:
         return ""
 
 
-def _order_paths_by_workspace(paths: list, order_names: list) -> list:
+def _order_entries_by_workspace(entries: list, order_names: list) -> list:
     """
-    Sort correlation CSV *paths* to match the workspace file order.
+    Sort picker entries to match the workspace file order.
 
     Each CSV is matched to its source .fcs (via the 'source file' header) and
     ordered by that file's position in *order_names*.  Datasets whose source
@@ -1375,364 +1472,65 @@ def _order_paths_by_workspace(paths: list, order_names: list) -> list:
     workspace ones, ordered alphabetically.
     """
     order_index = {name: i for i, name in enumerate(order_names)}
-    src = {p: _source_name_of_csv(p) for p in paths}
+    src = {e: _source_name_of_csv(e.path) for e in entries}
     return sorted(
-        paths,
-        key=lambda p: (order_index.get(src[p], len(order_names)), p.name.lower()),
+        entries,
+        key=lambda e: (order_index.get(src[e], len(order_names)),
+                       e.path.name.lower()),
     )
 
 
-def _apply_remembered_order(paths: list) -> list:
+def _correlation_source() -> fcs_fitdialogs.DatasetSource:
     """
-    Re-apply the manual row order confirmed earlier in this session.
+    Describe correlation CSVs to the shared dataset picker.
 
-    Paths that were present last time keep their hand-made positions; anything
-    new (a CSV written since, or a file just added) follows afterwards in the
-    order it was passed in.  Returns *paths* unchanged when nothing has been
-    remembered yet, so a fresh session still gets the workspace ordering.
+    The picker itself -- discover, add, remove, reorder, remember -- is the
+    same for correlation, PCH and lifetime, and used to exist here in full.
+    What is genuinely per-analysis is this: where the files are, what to call
+    them, and how to turn one into a dataset dict.
     """
-    if not _last_dataset_order:
-        return list(paths)
-    rank = {s: i for i, s in enumerate(_last_dataset_order)}
-    n = len(rank)
-    decorated = [(rank.get(str(p), n), i, p) for i, p in enumerate(paths)]
-    return [p for _, _, p in sorted(decorated, key=lambda t: (t[0], t[1]))]
+    def _load(entry: fcs_fitdialogs.DatasetEntry) -> dict:
+        tau, G, Gstd, _cols, meta = load_correlation_csv(entry.path)
+        return {"name": entry.path.stem, "path": entry.path, "meta": meta,
+                "tau": tau, "G": G, "sigma": Gstd}
+
+    def _discover(folder) -> list:
+        # One curve per correlation CSV, so no series dimension: the entry's
+        # series stays None and its label is just the filename.
+        return [fcs_fitdialogs.DatasetEntry(path=p)
+                for p in _discover_correlation_csvs(Path(folder))]
+
+    return fcs_fitdialogs.DatasetSource(
+        key="correlation",
+        title="Select correlation datasets",
+        noun="correlation CSVs",
+        discover=_discover,
+        load=_load,
+        filetypes=(("CSV files", "*.csv"),
+                   ("Correlation CSV", "*correlation*.csv"),
+                   ("All files", "*.*")),
+        empty_hint=("These are the CSVs written by 'Export plotted data to "
+                    "CSV'; they need a lag axis and a G column."),
+    )
 
 
 def _select_datasets_dialog(parent, init_dir, on_done, order=None):
     """
     Screen — build the list of correlation CSVs to fit.
 
-    The list is the user's to curate: seeded by discovering *init_dir* (may be
-    None, in which case it starts empty), then extended by browsing for files
-    or folders anywhere, pruned with Remove, and ordered with Move ↑ / ↓.  The
-    arrangement and the removals last for the session; "Reset list" undoes both
-    and re-discovers the current folder.
+    Thin wrapper over :func:`fcs_fitdialogs.select_datasets`, which holds the
+    list-curation behaviour this function used to implement directly.  What is
+    left here is the correlation-specific part: the workspace ordering, which
+    the other two analyses have no equivalent of because their datasets are not
+    tied to a file open in the workspace.
     """
-    import tkinter as tk
-    from tkinter import filedialog, messagebox
+    def _preorder(entries):
+        if not order:
+            return list(entries)
+        return _order_entries_by_workspace(entries, order)
 
-    init_dir = Path(init_dir) if init_dir else None
-    # Session-local working copy of the removals — committed only by Next →.
-    removed = set(_last_dataset_removed)
-
-    path_list = _discover_correlation_csvs(init_dir) if init_dir else []
-    path_list = [p for p in path_list if str(p) not in removed]
-    if order:
-        path_list = _order_paths_by_workspace(path_list, order)
-    # A manual arrangement made earlier this session wins over the workspace
-    # ordering; on the first visit this is a no-op.
-    path_list = _apply_remembered_order(path_list)
-
-    win = tk.Toplevel(parent)
-    win.title("Select correlation datasets")
-    win.geometry("640x520")
-    win.minsize(560, 440)
-    win.grab_set()
-
-    tk.Label(win, text="Select datasets to include in the fit",
-             font=("Helvetica", 12, "bold"), pady=6).pack()
-    tk.Label(win, text="Selected (highlighted) rows are included.  "
-                       "Ctrl-click toggles one row · Shift-click selects a range · "
-                       "click empty space below the list to clear.\n"
-                       "Row order sets the dataset order in the fit and its "
-                       "output — use Move ↑ / Move ↓ to change it.",
-             font=("Helvetica", 9), fg="grey",
-             wraplength=600, justify="left").pack()
-
-    folder_var = tk.StringVar(value="")
-
-    def _update_folder():
-        folder_var.set(f"Folder: {init_dir}" if init_dir
-                       else "Folder: none chosen yet")
-
-    tk.Label(win, textvariable=folder_var, font=("Courier", 8), fg="grey",
-             wraplength=600, justify="left").pack()
-
-    lb_frame = tk.Frame(win)
-    lb_frame.pack(fill="both", expand=True, padx=12, pady=6)
-    scroll = tk.Scrollbar(lb_frame, orient="vertical")
-    listbox = tk.Listbox(lb_frame, selectmode="extended",
-                         yscrollcommand=scroll.set, activestyle="none",
-                         font=("Courier", 9))
-    scroll.config(command=listbox.yview)
-    scroll.pack(side="right", fill="y")
-    listbox.pack(side="left", fill="both", expand=True)
-
-    info = tk.StringVar(value="")
-
-    def _populate(select_all=True, keep=None, keep_indices=None):
-        """Refill the listbox from *path_list*.
-
-        Selection is restored either by path (*keep*) or by row index
-        (*keep_indices*, used by the reorder buttons, which know exactly which
-        rows moved and are unambiguous even if a path appears twice).
-        """
-        keep = keep or set()
-        keep_indices = set(keep_indices or ())
-        listbox.delete(0, tk.END)
-        for i, p in enumerate(path_list):
-            listbox.insert(tk.END, p.name)
-            if select_all or p in keep or i in keep_indices:
-                listbox.selection_set(i)
-        _update_info()
-
-    def _update_info(*_):
-        if not path_list:
-            info.set("Nothing listed — use 'Add files…' or 'Browse folder…'.")
-        else:
-            info.set(f"{len(listbox.curselection())} of {len(path_list)} included")
-
-    def _selected_paths() -> set:
-        return {path_list[i] for i in listbox.curselection()}
-
-    def _click_deselect(event):
-        """File-explorer feel: clicking the empty space below the rows clears."""
-        idx = listbox.nearest(event.y)
-        bbox = listbox.bbox(idx) if idx >= 0 else None
-        if bbox is None or event.y > bbox[1] + bbox[3]:
-            listbox.selection_clear(0, tk.END)
-            _update_info()
-            return "break"          # swallow it, so Tk does not re-select a row
-        # On a real row: fall through to Tk's native extended-select handling,
-        # which is what provides plain-click / Ctrl-click / Shift-click.
-
-    def _select_all(*_):
-        listbox.selection_set(0, tk.END)
-        _update_info()
-        return "break"
-
-    def _select_none(*_):
-        listbox.selection_clear(0, tk.END)
-        _update_info()
-
-    def _move(delta):
-        """Shift the selected row(s) up (delta=-1) or down (delta=+1) by one.
-
-        A multi-row selection moves as a block and keeps its internal order;
-        rows that would run off the end, or push into another selected row,
-        simply stay put.
-        """
-        sel = sorted(listbox.curselection())
-        if not sel:
-            return
-        n = len(path_list)
-        sel_set = set(sel)
-        items = [{"path": p, "sel": i in sel_set} for i, p in enumerate(path_list)]
-        # Move the leading edge of the block first, so rows never leapfrog.
-        seq = [items[i] for i in (sel if delta < 0 else reversed(sel))]
-        pos = {id(it): k for k, it in enumerate(items)}
-        for it in seq:
-            cur = pos[id(it)]
-            tgt = cur + delta
-            if tgt < 0 or tgt >= n or items[tgt]["sel"]:
-                continue
-            items[cur], items[tgt] = items[tgt], items[cur]
-            pos[id(items[cur])] = cur
-            pos[id(items[tgt])] = tgt
-        path_list[:] = [it["path"] for it in items]
-        moved = [k for k, it in enumerate(items) if it["sel"]]
-        _populate(select_all=False, keep_indices=moved)
-        if moved:
-            listbox.see(min(moved))
-            listbox.see(max(moved))
-
-    def _reset_list():
-        """Undo this session's curation: re-discover the folder, drop removals.
-
-        Only local state is touched — the remembered order/removals are
-        overwritten wholesale by Next →, so Cancel after a Reset still leaves
-        the previous session state intact.  Files added by hand from other
-        folders are dropped too: this is a full reset to "what is in the
-        current folder", not a partial one.
-        """
-        if not messagebox.askyesno(
-                "Reset list",
-                "Rebuild the list from the current folder?\n\n"
-                "This undoes the manual order and restores removed rows.\n"
-                "Files added by hand from other folders are dropped.\n"
-                "(No file on disk is affected.)",
-                parent=win):
-            return
-        removed.clear()
-        base = _discover_correlation_csvs(init_dir) if init_dir else []
-        if order:
-            base = _order_paths_by_workspace(base, order)
-        path_list[:] = base
-        _populate(select_all=True)
-
-    listbox.bind("<<ListboxSelect>>", _update_info)
-    listbox.bind("<Button-1>", _click_deselect)
-    listbox.bind("<Control-a>", _select_all)
-    listbox.bind("<Control-A>", _select_all)
-    _populate(select_all=True)
-
-    def _browse_dir_str() -> str:
-        """initialdir for the file/folder browsers ('' lets Tk pick the cwd)."""
-        return str(init_dir) if init_dir else ""
-
-    def _extend(new_paths, keep):
-        """Append paths that are not already listed; un-remove any re-added."""
-        added = 0
-        for p in new_paths:
-            removed.discard(str(p))     # an explicit re-add overrides a Remove
-            if p not in path_list:
-                path_list.append(p)
-                keep.add(p)
-                added += 1
-        return added
-
-    def _add_files():
-        nonlocal init_dir
-        new = filedialog.askopenfilenames(
-            title="Add correlation CSV files",
-            initialdir=_browse_dir_str(),
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"),
-                       ("Correlation CSV", "*correlation*.csv"),
-                       ("All files", "*.*")],
-            parent=win)
-        if not new:
-            return
-        keep = _selected_paths()
-        added = _extend([Path(n) for n in new], keep)
-        init_dir = Path(new[0]).parent
-        _update_folder()
-        _populate(select_all=False, keep=keep)
-        if added == 0:
-            messagebox.showinfo("Already listed",
-                                "Every file picked is already in the list.",
-                                parent=win)
-
-    def _browse_folder():
-        """Point the dialog at any folder of saved correlations."""
-        nonlocal init_dir
-        chosen = filedialog.askdirectory(
-            title="Choose a folder of correlation CSVs",
-            initialdir=_browse_dir_str(), mustexist=True, parent=win)
-        if not chosen:
-            return
-        folder = Path(chosen)
-        found = _discover_correlation_csvs(folder)
-        if not found:
-            messagebox.showinfo(
-                "No correlation CSVs",
-                f"Nothing in '{folder.name}' parsed as a correlation export.\n\n"
-                "These are the CSVs written by 'Export plotted data to CSV'; "
-                "they need a lag axis and a G column.",
-                parent=win)
-            return
-        keep = _selected_paths()
-        added = _extend(found, keep)
-        init_dir = folder
-        _update_folder()
-        _populate(select_all=False, keep=keep)
-        if added == 0:
-            messagebox.showinfo("Already listed",
-                                f"All {len(found)} correlation CSVs in "
-                                f"'{folder.name}' are already in the list.",
-                                parent=win)
-
-    def _remove_files():
-        """Drop the selected row(s) from the list (never from disk).
-
-        Selection does double duty here — it marks both what gets fitted and
-        what Remove acts on — so the rows that stay keep whatever inclusion
-        state they had; if that would leave nothing included, everything left
-        is re-included rather than handing back an empty list.
-        """
-        sel = sorted(listbox.curselection(), reverse=True)
-        if not sel:
-            messagebox.showinfo("Nothing selected",
-                                "Select the row(s) to remove from the list first.",
-                                parent=win)
-            return
-        keep = _selected_paths() - {path_list[i] for i in sel}
-        for i in sel:
-            removed.add(str(path_list[i]))
-            del path_list[i]
-        if path_list and not keep:
-            _populate(select_all=True)
-        else:
-            _populate(select_all=False, keep=keep)
-
-    # ── List management ──────────────────────────────────────────────────────
-    lst = tk.Frame(win)
-    lst.pack(fill="x", padx=12, pady=(0, 2))
-    tk.Label(lst, text="List:", font=("Helvetica", 8), fg="grey",
-             width=7, anchor="w").pack(side="left")
-    tk.Button(lst, text="Add files…", command=_add_files,
-              width=11, pady=3).pack(side="left", padx=(0, 4))
-    tk.Button(lst, text="Browse folder…", command=_browse_folder,
-              width=13, pady=3).pack(side="left", padx=4)
-    tk.Button(lst, text="Remove", command=_remove_files,
-              fg="tomato", width=9, pady=3).pack(side="left", padx=4)
-    tk.Button(lst, text="Reset list", command=_reset_list,
-              width=10, pady=3).pack(side="left", padx=4)
-
-    # ── Selection / reorder tools ────────────────────────────────────────────
-    tools = tk.Frame(win)
-    tools.pack(fill="x", padx=12, pady=(0, 2))
-    tk.Label(tools, text="Include:", font=("Helvetica", 8), fg="grey",
-             width=7, anchor="w").pack(side="left")
-    tk.Button(tools, text="Select all", command=_select_all,
-              width=9, pady=3).pack(side="left", padx=(0, 4))
-    tk.Button(tools, text="Select none", command=_select_none,
-              width=9, pady=3).pack(side="left", padx=4)
-    tk.Label(tools, text="Order:", font=("Helvetica", 8), fg="grey",
-             anchor="w").pack(side="left", padx=(14, 2))
-    tk.Button(tools, text="Move ↑", command=lambda: _move(-1),
-              width=8, pady=3).pack(side="left", padx=4)
-    tk.Button(tools, text="Move ↓", command=lambda: _move(+1),
-              width=8, pady=3).pack(side="left", padx=4)
-
-    _update_folder()
-    _update_info()
-
-    tk.Label(win, textvariable=info, font=("Helvetica", 9), fg="grey").pack()
-
-    btns = tk.Frame(win)
-    btns.pack(pady=8)
-
-    def _next():
-        global _last_dataset_order, _last_dataset_removed, _last_browse_dir
-        sel = listbox.curselection()
-        if not sel:
-            messagebox.showinfo("No datasets",
-                                "Select at least one dataset (click a row to "
-                                "highlight it).",
-                                parent=win)
-            return
-        # Commit the curated list: the arrangement of every row (included or
-        # not, so excluded datasets keep their place if re-included later), the
-        # rows removed by hand, and the folder to come back to next time.
-        _last_dataset_order = [str(p) for p in path_list]
-        _last_dataset_removed = set(removed)
-        if init_dir:
-            _last_browse_dir = str(init_dir)
-        chosen = [path_list[i] for i in sel]
-        loaded, errors = [], []
-        for p in chosen:
-            try:
-                tau, G, Gstd, _cols, meta = load_correlation_csv(p)
-                loaded.append({"name": p.stem, "path": p, "meta": meta,
-                               "tau": tau, "G": G, "sigma": Gstd})
-            except Exception as e:
-                errors.append(f"{p.name}: {e}")
-        if errors:
-            messagebox.showerror("Some files could not be read",
-                                 "\n".join(errors), parent=win)
-        if not loaded:
-            return
-        win.destroy()
-        on_done(loaded)
-
-    tk.Button(btns, text="Next →", command=_next,
-              width=12, pady=4).pack(side="left", padx=6)
-    tk.Button(btns, text="Cancel", command=win.destroy,
-              width=10, pady=4).pack(side="left", padx=6)
-
-    win.wait_window()
+    fcs_fitdialogs.select_datasets(
+        parent, _correlation_source(), init_dir, on_done, preorder=_preorder)
 
 
 def _global_setup_dialog(parent, model, datasets, out_source):
@@ -1757,49 +1555,24 @@ def _global_setup_dialog(parent, model, datasets, out_source):
              font=("Helvetica", 9), fg="grey").pack(pady=(0, 6))
 
     guesses0 = combined_guess(model, datasets)
+    ds_names = [ds["name"] for ds in datasets]
 
-    table = tk.Frame(win, padx=12, pady=4)
-    table.pack(fill="x")
-    for c, h in enumerate(["Parameter", "Link", "Guess", "Lower", "Upper", "Fix"]):
-        tk.Label(table, text=h, font=("Helvetica", 10, "bold")).grid(
-            row=0, column=c, padx=4, pady=(0, 4))
+    # The numbered dataset list: rules address datasets by number, so the
+    # numbering belongs on the same screen as the rule boxes.
+    if D > 1:
+        fcs_fitdialogs.dataset_legend(win, ds_names).pack(
+            fill="x", padx=12, pady=(0, 6))
 
-    link_vars: Dict[str, tk.BooleanVar] = {}
-    guess_vars: Dict[str, tk.StringVar] = {}
-    lower_vars: Dict[str, tk.StringVar] = {}
-    upper_vars: Dict[str, tk.StringVar] = {}
-    fixed_vars: Dict[str, tk.BooleanVar] = {}
-
-    for r, p in enumerate(model.params, start=1):
-        label = p.name + (f" ({p.unit})" if p.unit else "")
-        tk.Label(table, text=label, anchor="w", width=12).grid(
-            row=r, column=0, sticky="w", padx=4, pady=2)
-
-        lkv = tk.BooleanVar(value=p.link_default if D > 1 else False)
-        gv  = tk.StringVar(value=f"{guesses0.get(p.name, p.default):.6g}")
-        lv  = tk.StringVar(value=_fmt(p.lower))
-        uv  = tk.StringVar(value=_fmt(p.upper))
-        fv  = tk.BooleanVar(value=p.fixed)
-
-        tk.Checkbutton(table, variable=lkv,
-                       state="normal" if D > 1 else "disabled").grid(row=r, column=1, padx=4)
-        tk.Entry(table, textvariable=gv, width=12).grid(row=r, column=2, padx=4)
-        tk.Entry(table, textvariable=lv, width=10).grid(row=r, column=3, padx=4)
-        tk.Entry(table, textvariable=uv, width=10).grid(row=r, column=4, padx=4)
-        tk.Checkbutton(table, variable=fv).grid(row=r, column=5, padx=4)
-
-        link_vars[p.name]  = lkv
-        guess_vars[p.name] = gv
-        lower_vars[p.name] = lv
-        upper_vars[p.name] = uv
-        fixed_vars[p.name] = fv
+    ptable = fcs_fitdialogs.ParamTable(win, model, ds_names, guesses0)
+    ptable.pack(fill="x")
 
     note = ("Linked = one shared value across all datasets; "
-            "unlinked = an independent value per dataset.")
+            "unlinked = an independent value per dataset.  "
+            "Tick Rule for finer control over which datasets share a value.")
     if D == 1:
         note = "Linking applies with 2+ datasets (only one selected)."
     tk.Label(win, text=note, font=("Helvetica", 9), fg="grey",
-             wraplength=440, justify="left").pack(fill="x", padx=12, pady=(4, 0))
+             wraplength=560, justify="left").pack(fill="x", padx=12, pady=(4, 0))
 
     weight_var = tk.BooleanVar(value=all_have_sigma)
     tk.Checkbutton(
@@ -1858,28 +1631,20 @@ def _global_setup_dialog(parent, model, datasets, out_source):
 
     def _do_fit():
         try:
-            guesses = {n: float(guess_vars[n].get()) for n in guess_vars}
-            lowers  = {n: _parse_bound(lower_vars[n].get(), -np.inf) for n in lower_vars}
-            uppers  = {n: _parse_bound(upper_vars[n].get(),  np.inf) for n in upper_vars}
-        except ValueError:
-            messagebox.showerror("Invalid input",
-                                 "Guesses and bounds must be numbers "
-                                 "(use 'inf' / '-inf').", parent=win)
+            setup = ptable.read()
+        except ValueError as e:
+            messagebox.showerror("Invalid input", str(e), parent=win)
             return
-        linked = {n: (link_vars[n].get() if D > 1 else False) for n in link_vars}
-        fixed  = {n: fixed_vars[n].get() for n in fixed_vars}
-        for n in guesses:
-            if lowers[n] >= uppers[n]:
-                messagebox.showerror("Invalid bounds",
-                                     f"For '{n}', lower must be < upper.", parent=win)
-                return
-        
+
         weighted = all_have_sigma and weight_var.get()
 
         try:
-            result = fit_global(model, datasets, linked, guesses,
-                                lowers, uppers, fixed, weighted=weighted,
-                                drop_pair_starved=starved_var.get())
+            result = fit_global(model, datasets, setup["linked"],
+                                setup["guesses"], setup["lowers"],
+                                setup["uppers"], setup["fixed"],
+                                weighted=weighted,
+                                drop_pair_starved=starved_var.get(),
+                                plans=setup["plans"])
         except Exception as e:
             messagebox.showerror("Fit failed", str(e), parent=win)
             return
@@ -1897,16 +1662,14 @@ def _global_setup_dialog(parent, model, datasets, out_source):
         # costs us the report and tables already on disk.
         fcs_plottools.save_figure(fig, report_path.with_suffix(""))
 
-        linked_lines = [
-            f"{n} = {result['datasets'][0]['values'][n]:.4g} (linked)"
-            for n in result["names"] if result["linked"].get(n)
-        ]
+        linked_lines = [f"{label} = {val:.4g}  ± {err}"
+                        for label, val, err, _u in _shared_value_rows(result, model)]
         gof = (f"red. χ² = {result['red_chi2']:.3g}"
                if result["weighted"] else f"{result['n_datasets']} datasets")
         messagebox.showinfo(
             "Global fit complete",
             f"{model.name}\n\n"
-            + ("\n".join(linked_lines) if linked_lines else "(no linked parameters)")
+            + ("\n".join(linked_lines) if linked_lines else "(no shared parameters)")
             + f"\n\n{gof}\n\nResults saved to:\n{report_path.parent}",
             parent=parent,
         )

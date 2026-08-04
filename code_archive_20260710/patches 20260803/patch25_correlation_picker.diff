@@ -1,0 +1,452 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -67,9 +67,9 @@
+ #
+ # Membership is otherwise still decided by fresh discovery on each open, so a
+ # correlation CSV written since the last visit shows up on its own.
+-_last_dataset_order: list[str] = []       # row order, included rows and not
+-_last_dataset_removed: set[str] = set()   # rows removed from the list by hand
+-_last_browse_dir: Optional[str] = None    # folder the dialog last worked in
++# The picker's remembered order, removals and folder now live in
++# fcs_fitdialogs, in a bucket per analysis, so curating a list of decays does
++# not disturb a list of correlations left mid-session.
+ 
+ # ── CSV loading ───────────────────────────────────────────────────────────────
+ 
+@@ -1404,10 +1404,9 @@
+         start = Path(fcs_data.filepath).parent
+         analysis = start / "analysis"
+         return analysis if analysis.exists() else start
+-    if _last_browse_dir:
+-        prev = Path(_last_browse_dir)
+-        if prev.exists():
+-            return prev
++    prev = fcs_fitdialogs.session_dir("correlation")
++    if prev is not None:
++        return prev
+     return None
+ 
+ 
+@@ -1463,9 +1462,9 @@
+         return ""
+ 
+ 
+-def _order_paths_by_workspace(paths: list, order_names: list) -> list:
++def _order_entries_by_workspace(entries: list, order_names: list) -> list:
+     """
+-    Sort correlation CSV *paths* to match the workspace file order.
++    Sort picker entries to match the workspace file order.
+ 
+     Each CSV is matched to its source .fcs (via the 'source file' header) and
+     ordered by that file's position in *order_names*.  Datasets whose source
+@@ -1473,364 +1472,65 @@
+     workspace ones, ordered alphabetically.
+     """
+     order_index = {name: i for i, name in enumerate(order_names)}
+-    src = {p: _source_name_of_csv(p) for p in paths}
++    src = {e: _source_name_of_csv(e.path) for e in entries}
+     return sorted(
+-        paths,
+-        key=lambda p: (order_index.get(src[p], len(order_names)), p.name.lower()),
++        entries,
++        key=lambda e: (order_index.get(src[e], len(order_names)),
++                       e.path.name.lower()),
+     )
+ 
+ 
+-def _apply_remembered_order(paths: list) -> list:
++def _correlation_source() -> fcs_fitdialogs.DatasetSource:
+     """
+-    Re-apply the manual row order confirmed earlier in this session.
++    Describe correlation CSVs to the shared dataset picker.
+ 
+-    Paths that were present last time keep their hand-made positions; anything
+-    new (a CSV written since, or a file just added) follows afterwards in the
+-    order it was passed in.  Returns *paths* unchanged when nothing has been
+-    remembered yet, so a fresh session still gets the workspace ordering.
+-    """
+-    if not _last_dataset_order:
+-        return list(paths)
+-    rank = {s: i for i, s in enumerate(_last_dataset_order)}
+-    n = len(rank)
+-    decorated = [(rank.get(str(p), n), i, p) for i, p in enumerate(paths)]
+-    return [p for _, _, p in sorted(decorated, key=lambda t: (t[0], t[1]))]
++    The picker itself -- discover, add, remove, reorder, remember -- is the
++    same for correlation, PCH and lifetime, and used to exist here in full.
++    What is genuinely per-analysis is this: where the files are, what to call
++    them, and how to turn one into a dataset dict.
++    """
++    def _load(entry: fcs_fitdialogs.DatasetEntry) -> dict:
++        tau, G, Gstd, _cols, meta = load_correlation_csv(entry.path)
++        return {"name": entry.path.stem, "path": entry.path, "meta": meta,
++                "tau": tau, "G": G, "sigma": Gstd}
++
++    def _discover(folder) -> list:
++        # One curve per correlation CSV, so no series dimension: the entry's
++        # series stays None and its label is just the filename.
++        return [fcs_fitdialogs.DatasetEntry(path=p)
++                for p in _discover_correlation_csvs(Path(folder))]
++
++    return fcs_fitdialogs.DatasetSource(
++        key="correlation",
++        title="Select correlation datasets",
++        noun="correlation CSVs",
++        discover=_discover,
++        load=_load,
++        filetypes=(("CSV files", "*.csv"),
++                   ("Correlation CSV", "*correlation*.csv"),
++                   ("All files", "*.*")),
++        empty_hint=("These are the CSVs written by 'Export plotted data to "
++                    "CSV'; they need a lag axis and a G column."),
++    )
+ 
+ 
+ def _select_datasets_dialog(parent, init_dir, on_done, order=None):
+     """
+     Screen — build the list of correlation CSVs to fit.
+ 
+-    The list is the user's to curate: seeded by discovering *init_dir* (may be
+-    None, in which case it starts empty), then extended by browsing for files
+-    or folders anywhere, pruned with Remove, and ordered with Move ↑ / ↓.  The
+-    arrangement and the removals last for the session; "Reset list" undoes both
+-    and re-discovers the current folder.
+-    """
+-    import tkinter as tk
+-    from tkinter import filedialog, messagebox
+-
+-    init_dir = Path(init_dir) if init_dir else None
+-    # Session-local working copy of the removals — committed only by Next →.
+-    removed = set(_last_dataset_removed)
+-
+-    path_list = _discover_correlation_csvs(init_dir) if init_dir else []
+-    path_list = [p for p in path_list if str(p) not in removed]
+-    if order:
+-        path_list = _order_paths_by_workspace(path_list, order)
+-    # A manual arrangement made earlier this session wins over the workspace
+-    # ordering; on the first visit this is a no-op.
+-    path_list = _apply_remembered_order(path_list)
+-
+-    win = tk.Toplevel(parent)
+-    win.title("Select correlation datasets")
+-    win.geometry("640x520")
+-    win.minsize(560, 440)
+-    win.grab_set()
+-
+-    tk.Label(win, text="Select datasets to include in the fit",
+-             font=("Helvetica", 12, "bold"), pady=6).pack()
+-    tk.Label(win, text="Selected (highlighted) rows are included.  "
+-                       "Ctrl-click toggles one row · Shift-click selects a range · "
+-                       "click empty space below the list to clear.\n"
+-                       "Row order sets the dataset order in the fit and its "
+-                       "output — use Move ↑ / Move ↓ to change it.",
+-             font=("Helvetica", 9), fg="grey",
+-             wraplength=600, justify="left").pack()
+-
+-    folder_var = tk.StringVar(value="")
+-
+-    def _update_folder():
+-        folder_var.set(f"Folder: {init_dir}" if init_dir
+-                       else "Folder: none chosen yet")
+-
+-    tk.Label(win, textvariable=folder_var, font=("Courier", 8), fg="grey",
+-             wraplength=600, justify="left").pack()
+-
+-    lb_frame = tk.Frame(win)
+-    lb_frame.pack(fill="both", expand=True, padx=12, pady=6)
+-    scroll = tk.Scrollbar(lb_frame, orient="vertical")
+-    listbox = tk.Listbox(lb_frame, selectmode="extended",
+-                         yscrollcommand=scroll.set, activestyle="none",
+-                         font=("Courier", 9))
+-    scroll.config(command=listbox.yview)
+-    scroll.pack(side="right", fill="y")
+-    listbox.pack(side="left", fill="both", expand=True)
+-
+-    info = tk.StringVar(value="")
+-
+-    def _populate(select_all=True, keep=None, keep_indices=None):
+-        """Refill the listbox from *path_list*.
+-
+-        Selection is restored either by path (*keep*) or by row index
+-        (*keep_indices*, used by the reorder buttons, which know exactly which
+-        rows moved and are unambiguous even if a path appears twice).
+-        """
+-        keep = keep or set()
+-        keep_indices = set(keep_indices or ())
+-        listbox.delete(0, tk.END)
+-        for i, p in enumerate(path_list):
+-            listbox.insert(tk.END, p.name)
+-            if select_all or p in keep or i in keep_indices:
+-                listbox.selection_set(i)
+-        _update_info()
+-
+-    def _update_info(*_):
+-        if not path_list:
+-            info.set("Nothing listed — use 'Add files…' or 'Browse folder…'.")
+-        else:
+-            info.set(f"{len(listbox.curselection())} of {len(path_list)} included")
+-
+-    def _selected_paths() -> set:
+-        return {path_list[i] for i in listbox.curselection()}
++    Thin wrapper over :func:`fcs_fitdialogs.select_datasets`, which holds the
++    list-curation behaviour this function used to implement directly.  What is
++    left here is the correlation-specific part: the workspace ordering, which
++    the other two analyses have no equivalent of because their datasets are not
++    tied to a file open in the workspace.
++    """
++    def _preorder(entries):
++        if not order:
++            return list(entries)
++        return _order_entries_by_workspace(entries, order)
+ 
+-    def _click_deselect(event):
+-        """File-explorer feel: clicking the empty space below the rows clears."""
+-        idx = listbox.nearest(event.y)
+-        bbox = listbox.bbox(idx) if idx >= 0 else None
+-        if bbox is None or event.y > bbox[1] + bbox[3]:
+-            listbox.selection_clear(0, tk.END)
+-            _update_info()
+-            return "break"          # swallow it, so Tk does not re-select a row
+-        # On a real row: fall through to Tk's native extended-select handling,
+-        # which is what provides plain-click / Ctrl-click / Shift-click.
+-
+-    def _select_all(*_):
+-        listbox.selection_set(0, tk.END)
+-        _update_info()
+-        return "break"
+-
+-    def _select_none(*_):
+-        listbox.selection_clear(0, tk.END)
+-        _update_info()
+-
+-    def _move(delta):
+-        """Shift the selected row(s) up (delta=-1) or down (delta=+1) by one.
+-
+-        A multi-row selection moves as a block and keeps its internal order;
+-        rows that would run off the end, or push into another selected row,
+-        simply stay put.
+-        """
+-        sel = sorted(listbox.curselection())
+-        if not sel:
+-            return
+-        n = len(path_list)
+-        sel_set = set(sel)
+-        items = [{"path": p, "sel": i in sel_set} for i, p in enumerate(path_list)]
+-        # Move the leading edge of the block first, so rows never leapfrog.
+-        seq = [items[i] for i in (sel if delta < 0 else reversed(sel))]
+-        pos = {id(it): k for k, it in enumerate(items)}
+-        for it in seq:
+-            cur = pos[id(it)]
+-            tgt = cur + delta
+-            if tgt < 0 or tgt >= n or items[tgt]["sel"]:
+-                continue
+-            items[cur], items[tgt] = items[tgt], items[cur]
+-            pos[id(items[cur])] = cur
+-            pos[id(items[tgt])] = tgt
+-        path_list[:] = [it["path"] for it in items]
+-        moved = [k for k, it in enumerate(items) if it["sel"]]
+-        _populate(select_all=False, keep_indices=moved)
+-        if moved:
+-            listbox.see(min(moved))
+-            listbox.see(max(moved))
+-
+-    def _reset_list():
+-        """Undo this session's curation: re-discover the folder, drop removals.
+-
+-        Only local state is touched — the remembered order/removals are
+-        overwritten wholesale by Next →, so Cancel after a Reset still leaves
+-        the previous session state intact.  Files added by hand from other
+-        folders are dropped too: this is a full reset to "what is in the
+-        current folder", not a partial one.
+-        """
+-        if not messagebox.askyesno(
+-                "Reset list",
+-                "Rebuild the list from the current folder?\n\n"
+-                "This undoes the manual order and restores removed rows.\n"
+-                "Files added by hand from other folders are dropped.\n"
+-                "(No file on disk is affected.)",
+-                parent=win):
+-            return
+-        removed.clear()
+-        base = _discover_correlation_csvs(init_dir) if init_dir else []
+-        if order:
+-            base = _order_paths_by_workspace(base, order)
+-        path_list[:] = base
+-        _populate(select_all=True)
+-
+-    listbox.bind("<<ListboxSelect>>", _update_info)
+-    listbox.bind("<Button-1>", _click_deselect)
+-    listbox.bind("<Control-a>", _select_all)
+-    listbox.bind("<Control-A>", _select_all)
+-    _populate(select_all=True)
+-
+-    def _browse_dir_str() -> str:
+-        """initialdir for the file/folder browsers ('' lets Tk pick the cwd)."""
+-        return str(init_dir) if init_dir else ""
+-
+-    def _extend(new_paths, keep):
+-        """Append paths that are not already listed; un-remove any re-added."""
+-        added = 0
+-        for p in new_paths:
+-            removed.discard(str(p))     # an explicit re-add overrides a Remove
+-            if p not in path_list:
+-                path_list.append(p)
+-                keep.add(p)
+-                added += 1
+-        return added
+-
+-    def _add_files():
+-        nonlocal init_dir
+-        new = filedialog.askopenfilenames(
+-            title="Add correlation CSV files",
+-            initialdir=_browse_dir_str(),
+-            defaultextension=".csv",
+-            filetypes=[("CSV files", "*.csv"),
+-                       ("Correlation CSV", "*correlation*.csv"),
+-                       ("All files", "*.*")],
+-            parent=win)
+-        if not new:
+-            return
+-        keep = _selected_paths()
+-        added = _extend([Path(n) for n in new], keep)
+-        init_dir = Path(new[0]).parent
+-        _update_folder()
+-        _populate(select_all=False, keep=keep)
+-        if added == 0:
+-            messagebox.showinfo("Already listed",
+-                                "Every file picked is already in the list.",
+-                                parent=win)
+-
+-    def _browse_folder():
+-        """Point the dialog at any folder of saved correlations."""
+-        nonlocal init_dir
+-        chosen = filedialog.askdirectory(
+-            title="Choose a folder of correlation CSVs",
+-            initialdir=_browse_dir_str(), mustexist=True, parent=win)
+-        if not chosen:
+-            return
+-        folder = Path(chosen)
+-        found = _discover_correlation_csvs(folder)
+-        if not found:
+-            messagebox.showinfo(
+-                "No correlation CSVs",
+-                f"Nothing in '{folder.name}' parsed as a correlation export.\n\n"
+-                "These are the CSVs written by 'Export plotted data to CSV'; "
+-                "they need a lag axis and a G column.",
+-                parent=win)
+-            return
+-        keep = _selected_paths()
+-        added = _extend(found, keep)
+-        init_dir = folder
+-        _update_folder()
+-        _populate(select_all=False, keep=keep)
+-        if added == 0:
+-            messagebox.showinfo("Already listed",
+-                                f"All {len(found)} correlation CSVs in "
+-                                f"'{folder.name}' are already in the list.",
+-                                parent=win)
+-
+-    def _remove_files():
+-        """Drop the selected row(s) from the list (never from disk).
+-
+-        Selection does double duty here — it marks both what gets fitted and
+-        what Remove acts on — so the rows that stay keep whatever inclusion
+-        state they had; if that would leave nothing included, everything left
+-        is re-included rather than handing back an empty list.
+-        """
+-        sel = sorted(listbox.curselection(), reverse=True)
+-        if not sel:
+-            messagebox.showinfo("Nothing selected",
+-                                "Select the row(s) to remove from the list first.",
+-                                parent=win)
+-            return
+-        keep = _selected_paths() - {path_list[i] for i in sel}
+-        for i in sel:
+-            removed.add(str(path_list[i]))
+-            del path_list[i]
+-        if path_list and not keep:
+-            _populate(select_all=True)
+-        else:
+-            _populate(select_all=False, keep=keep)
+-
+-    # ── List management ──────────────────────────────────────────────────────
+-    lst = tk.Frame(win)
+-    lst.pack(fill="x", padx=12, pady=(0, 2))
+-    tk.Label(lst, text="List:", font=("Helvetica", 8), fg="grey",
+-             width=7, anchor="w").pack(side="left")
+-    tk.Button(lst, text="Add files…", command=_add_files,
+-              width=11, pady=3).pack(side="left", padx=(0, 4))
+-    tk.Button(lst, text="Browse folder…", command=_browse_folder,
+-              width=13, pady=3).pack(side="left", padx=4)
+-    tk.Button(lst, text="Remove", command=_remove_files,
+-              fg="tomato", width=9, pady=3).pack(side="left", padx=4)
+-    tk.Button(lst, text="Reset list", command=_reset_list,
+-              width=10, pady=3).pack(side="left", padx=4)
+-
+-    # ── Selection / reorder tools ────────────────────────────────────────────
+-    tools = tk.Frame(win)
+-    tools.pack(fill="x", padx=12, pady=(0, 2))
+-    tk.Label(tools, text="Include:", font=("Helvetica", 8), fg="grey",
+-             width=7, anchor="w").pack(side="left")
+-    tk.Button(tools, text="Select all", command=_select_all,
+-              width=9, pady=3).pack(side="left", padx=(0, 4))
+-    tk.Button(tools, text="Select none", command=_select_none,
+-              width=9, pady=3).pack(side="left", padx=4)
+-    tk.Label(tools, text="Order:", font=("Helvetica", 8), fg="grey",
+-             anchor="w").pack(side="left", padx=(14, 2))
+-    tk.Button(tools, text="Move ↑", command=lambda: _move(-1),
+-              width=8, pady=3).pack(side="left", padx=4)
+-    tk.Button(tools, text="Move ↓", command=lambda: _move(+1),
+-              width=8, pady=3).pack(side="left", padx=4)
+-
+-    _update_folder()
+-    _update_info()
+-
+-    tk.Label(win, textvariable=info, font=("Helvetica", 9), fg="grey").pack()
+-
+-    btns = tk.Frame(win)
+-    btns.pack(pady=8)
+-
+-    def _next():
+-        global _last_dataset_order, _last_dataset_removed, _last_browse_dir
+-        sel = listbox.curselection()
+-        if not sel:
+-            messagebox.showinfo("No datasets",
+-                                "Select at least one dataset (click a row to "
+-                                "highlight it).",
+-                                parent=win)
+-            return
+-        # Commit the curated list: the arrangement of every row (included or
+-        # not, so excluded datasets keep their place if re-included later), the
+-        # rows removed by hand, and the folder to come back to next time.
+-        _last_dataset_order = [str(p) for p in path_list]
+-        _last_dataset_removed = set(removed)
+-        if init_dir:
+-            _last_browse_dir = str(init_dir)
+-        chosen = [path_list[i] for i in sel]
+-        loaded, errors = [], []
+-        for p in chosen:
+-            try:
+-                tau, G, Gstd, _cols, meta = load_correlation_csv(p)
+-                loaded.append({"name": p.stem, "path": p, "meta": meta,
+-                               "tau": tau, "G": G, "sigma": Gstd})
+-            except Exception as e:
+-                errors.append(f"{p.name}: {e}")
+-        if errors:
+-            messagebox.showerror("Some files could not be read",
+-                                 "\n".join(errors), parent=win)
+-        if not loaded:
+-            return
+-        win.destroy()
+-        on_done(loaded)
+-
+-    tk.Button(btns, text="Next →", command=_next,
+-              width=12, pady=4).pack(side="left", padx=6)
+-    tk.Button(btns, text="Cancel", command=win.destroy,
+-              width=10, pady=4).pack(side="left", padx=6)
+-
+-    win.wait_window()
++    fcs_fitdialogs.select_datasets(
++        parent, _correlation_source(), init_dir, on_done, preorder=_preorder)
+ 
+ 
+ def _global_setup_dialog(parent, model, datasets, out_source):

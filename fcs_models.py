@@ -582,7 +582,17 @@ _PCH_1SPECIES = FCSModel(
     formula="Π(k) = 3DG-PCH(N, ε)",
     params=[
         Param("N",       1.0, 1e-6, np.inf, "",            "mean molecules in observation volume"),
-        Param("epsilon", 1.0, 1e-4, np.inf, "cnts/mol/bin", "molecular brightness"),
+        # epsilon is linked by default and N is not: across a dilution or
+        # titration series the molecular brightness is a property of the
+        # fluorophore while the occupation is what the dilution changes.  This
+        # is only the initial state of the checkbox -- if the experiment is
+        # about brightness itself (monomer vs dimer, say) untick it, because
+        # then epsilon is the quantity being measured and must be free to
+        # differ.  Note epsilon is counts per molecule per BIN, so linking it
+        # across datasets exported at different bin widths links two
+        # quantities that are not the same quantity.
+        Param("epsilon", 1.0, 1e-4, np.inf, "cnts/mol/bin", "molecular brightness",
+              link_default=True),
     ],
     func=_pch_1species,
 )
@@ -610,9 +620,11 @@ _PCH_2SPECIES = FCSModel(
     formula="Π(k) = conv(PCH(N1,ε1), PCH(N2,ε2))",
     params=[
         Param("N1",       1.0, 1e-6, np.inf, "",            "occupation of species 1"),
-        Param("epsilon1", 1.5, 1e-4, np.inf, "cnts/mol/bin", "brightness of species 1 (brighter)"),
+        Param("epsilon1", 1.5, 1e-4, np.inf, "cnts/mol/bin", "brightness of species 1 (brighter)",
+              link_default=True),
         Param("N2",       1.0, 1e-6, np.inf, "",            "occupation of species 2"),
-        Param("epsilon2", 0.5, 1e-4, np.inf, "cnts/mol/bin", "brightness of species 2 (dimmer)"),
+        Param("epsilon2", 0.5, 1e-4, np.inf, "cnts/mol/bin", "brightness of species 2 (dimmer)",
+              link_default=True),
     ],
     func=_pch_2species,
 )

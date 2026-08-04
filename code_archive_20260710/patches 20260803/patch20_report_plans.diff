@@ -1,0 +1,283 @@
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -389,6 +389,7 @@
+     maxfev: int = 20000,
+     drop_pair_starved: bool = True,
+     pair_starved_cutoff: float = _PAIR_STARVED_CUTOFF,
++    plans: Optional[Dict[str, tuple]] = None,
+ ) -> dict:
+     """
+     Global least-squares fit of one model to several correlation datasets.
+@@ -398,6 +399,12 @@
+       * linked  — a single shared free variable used by every dataset;
+       * unlinked— one independent free variable per dataset.
+ 
++    A parameter can also be partitioned rather than treated as a whole: pass
++    *plans* (see :func:`fcs_globalfit.parse_dataset_rule`) to share a value
++    across some datasets, hold it on others and leave the rest free.  The
++    ``linked`` and ``fixed`` flags still apply to every parameter absent from
++    *plans*.
++
+     ``datasets`` is a list of dicts with keys ``name``, ``tau``, ``G`` and
+     optionally ``sigma``.  Weighting is applied only if ``weighted`` is True
+     *and* every included dataset carries a usable sigma.
+@@ -482,7 +489,7 @@
+         names, prepped,
+         lambda ds, tau, values: model.func(tau, **values),
+         linked, guesses, lowers, uppers, fixed,
+-        weighted=weighted, maxfev=maxfev,
++        weighted=weighted, maxfev=maxfev, plans=plans,
+     )
+ 
+     # ── Restore this module's key names ──────────────────────────────────────
+@@ -501,6 +508,10 @@
+             "n_points": entry["n_points"],
+             "n_pair_starved": entry.get("n_pair_starved", 0),
+             "meta": entry.get("meta", {}),
++            # Per-dataset roles, which the report and parameter table read to
++            # tell a fitted value from a shared or held one row by row.
++            "fixed": entry.get("fixed", {}),
++            "linked": entry.get("linked", {}),
+         })
+ 
+     result = dict(out)
+@@ -877,6 +888,75 @@
+     return f"{stamp}_{slug}" if slug else f"globalfit_{stamp}"
+ 
+ 
++def _param_role(result: dict, ds: dict, name: str) -> str:
++    """
++    What this dataset did with this parameter: ``free``, ``shared`` or ``held``.
++
++    Written into the parameter table as a ``<param>_role`` column so the table
++    is self-describing.  Without it a reader cannot tell a genuinely equal pair
++    of fitted values from two datasets that were forced to share one, and those
++    mean very different things: the first is agreement, the second is an
++    assumption.
++    """
++    if ds.get("fixed", {}).get(name, result["fixed"].get(name, False)):
++        return "held"
++    if ds.get("linked", {}).get(name, result["linked"].get(name, False)):
++        return "shared"
++    return "free"
++
++
++def _shared_value_rows(result: dict, model) -> list:
++    """
++    One row per link GROUP: ``(label, value, err_text, unit)``.
++
++    Groups are read off the per-dataset ``linked`` flags and the fitted values,
++    so a parameter shared by datasets 1, 3 and 4 is reported as its own row
++    naming those three -- not folded in with a parameter shared by all of them.
++    """
++    rows = []
++    dsets = result["datasets"]
++    for n in result["names"]:
++        members = [i for i, ds in enumerate(dsets)
++                   if ds.get("linked", {}).get(n, result["linked"].get(n, False))]
++        if not members:
++            continue
++        unit = next((p.unit for p in model.params if p.name == n), "")
++        # Datasets sharing one value have identical fitted values, so grouping
++        # on the value recovers the groups exactly without the plan needing to
++        # be re-read here.
++        by_value: dict = {}
++        for i in members:
++            by_value.setdefault(dsets[i]["values"][n], []).append(i)
++        whole = len(members) == len(dsets) and len(by_value) == 1
++        for val, group in by_value.items():
++            label = n if whole else \
++                f"{n}[{'+'.join(dsets[i]['name'] for i in group)}]"
++            err = f"{dsets[group[0]]['errors'][n]:.6g}"
++            rows.append((label, float(val), err, unit))
++    return rows
++
++
++def _held_value_rows(result: dict, model) -> list:
++    """One row per held value: ``(label, value, unit)``."""
++    rows = []
++    dsets = result["datasets"]
++    for n in result["names"]:
++        members = [i for i, ds in enumerate(dsets)
++                   if ds.get("fixed", {}).get(n, result["fixed"].get(n, False))]
++        if not members:
++            continue
++        unit = next((p.unit for p in model.params if p.name == n), "")
++        by_value: dict = {}
++        for i in members:
++            by_value.setdefault(dsets[i]["values"][n], []).append(i)
++        whole = len(members) == len(dsets) and len(by_value) == 1
++        for val, group in by_value.items():
++            label = n if whole else \
++                f"{n}[{'+'.join(dsets[i]['name'] for i in group)}]"
++            rows.append((label, float(val), unit))
++    return rows
++
++
+ def export_global_fit(result: dict, out_source: str | Path,
+                       name_override: Optional[str] = None,
+                       ) -> Tuple[Path, Path, Path]:
+@@ -927,22 +1007,47 @@
+     L.append("")
+     L.append("Parameter linking")
+     L.append("-" * 64)
++    # The plan summary rather than a fixed/linked/per-dataset label: a
++    # parameter can now be shared across some datasets, held on others and free
++    # on the rest, and a single word cannot say which.  The whole-parameter
++    # cases still render as the one word they always did.
++    summaries = result.get("plan_summaries", {})
++    n_ds = len(result["datasets"])
+     for n in result["names"]:
+-        state = ("fixed" if result["fixed"].get(n)
+-                 else "linked" if result["linked"].get(n) else "per-dataset")
+-        L.append(f"  {n:<8} : {state:<11} "
+-                 f"bounds [{_fmt(result['lowers'][n])}, {_fmt(result['uppers'][n])}]")
++        if result["fixed"].get(n):
++            state = "fixed"
++        elif result["linked"].get(n):
++            state = "linked"
++        elif all(not ds.get("fixed", {}).get(n, False)
++                 and not ds.get("linked", {}).get(n, False)
++                 for ds in result["datasets"]):
++            # Every dataset independent: the old wording, because listing all
++            # of them by name says nothing a single word does not.
++            state = "per-dataset"
++        else:
++            state = summaries.get(n, "per-dataset")
++        L.append(f"  {n:<8} : {state}")
++        L.append(f"  {'':<8}   bounds [{_fmt(result['lowers'][n])}, "
++                 f"{_fmt(result['uppers'][n])}]")
+     L.append("")
+ 
+-    linked_names = [n for n in result["names"] if result["linked"].get(n)]
+-    if linked_names:
+-        L.append("Linked / shared parameters")
++    # Shared values: one line per GROUP, naming its members.  A value shared by
++    # datasets 1, 3 and 4 is a different quantity from one shared by all six,
++    # and a report that does not say which was which cannot be checked later.
++    shared = _shared_value_rows(result, model)
++    if shared:
++        L.append("Shared values")
+         L.append("-" * 64)
+-        ref, referr = result["datasets"][0]["values"], result["datasets"][0]["errors"]
+-        for n in linked_names:
+-            unit = next((p.unit for p in model.params if p.name == n), "")
+-            err = "—" if result["fixed"].get(n) else f"{referr[n]:.6g}"
+-            L.append(f"  {n:<8} = {ref[n]:.6g}  ± {err}  {unit}".rstrip())
++        for label, val, err, unit in shared:
++            L.append(f"  {label:<28} = {val:.6g}  ± {err}  {unit}".rstrip())
++        L.append("")
++
++    held = _held_value_rows(result, model)
++    if held:
++        L.append("Held values")
++        L.append("-" * 64)
++        for label, val, unit in held:
++            L.append(f"  {label:<28} = {val:.6g}  (held){'  ' + unit if unit else ''}")
+         L.append("")
+ 
+     L.append("Per-dataset results")
+@@ -961,11 +1066,23 @@
+             L.append("               (± is the Poisson floor sqrt(N)/T; a "
+                      "fluctuating sample exceeds it)")
+         for n in result["names"]:
+-            if result["linked"].get(n):
+-                continue  # already reported above
++            # Whole-parameter links and holds are already reported above; a
++            # value shared or held by only SOME datasets still belongs on each
++            # row, so the reader can see this dataset's number without
++            # cross-referencing the group list.
++            if result["linked"].get(n) or result["fixed"].get(n):
++                continue
+             unit = next((p.unit for p in model.params if p.name == n), "")
+-            err = "—" if result["fixed"].get(n) else f"{ds['errors'][n]:.6g}"
+-            L.append(f"    {n:<8} = {ds['values'][n]:.6g}  ± {err}  {unit}".rstrip())
++            ds_fixed = ds.get("fixed", {}).get(n, False)
++            ds_linked = ds.get("linked", {}).get(n, False)
++            if ds_fixed:
++                tag = "  (held)"
++                err = "—"
++            else:
++                tag = "  (shared)" if ds_linked else ""
++                err = f"{ds['errors'][n]:.6g}"
++            L.append(f"    {n:<8} = {ds['values'][n]:.6g}  ± {err}  "
++                     f"{unit}{tag}".rstrip())
+         L.append("")
+     
+     corr = [(ds["name"], _bg_corr_from_meta(ds.get("meta")))
+@@ -1003,8 +1120,11 @@
+                 nc = fcs_noise.noise_covariance(
+                     model, ds["values"], ds["tau"],
+                     T=float(_T), count_rate=float(_R))
++                # Per dataset: a parameter held for THIS dataset contributes
++                # no information here even if it is free for the next one.
+                 free_names = [p for p in result["names"]
+-                              if not result["fixed"].get(p, False)]
++                              if not ds.get("fixed", {}).get(
++                                  p, result["fixed"].get(p, False))]
+                 info = fcs_noise.fisher_information(
+                     model, ds["values"], ds["tau"], nc.sigma, free_names)
+                 L.extend(fcs_noise.information_report_lines(info))
+@@ -1037,6 +1157,15 @@
+         fh.write(f"# n_free     : {result['n_free']}\n")
+         fh.write(f"# linked     : {', '.join(linked_names)}\n")
+         fh.write(f"# fixed      : {', '.join(fixed_names)}\n")
++        for _n, _summary in (result.get("plan_summaries") or {}).items():
++            # Same reasoning as the two lines above: a partitioned parameter is
++            # not recoverable from the numbers, because datasets that were made
++            # to share a value look exactly like datasets that happened to
++            # agree.  Only the non-trivial rules, so the header stays readable.
++            if result["fixed"].get(_n) or result["linked"].get(_n):
++                continue
++            if _summary and not _summary.startswith("free "):
++                fh.write(f"# rule_{_n} : {_summary}\n")
+         if weighted:
+             fh.write(f"# red_chi2   : {result['red_chi2']:.10g}\n")
+         else:
+@@ -1068,7 +1197,7 @@
+ 
+     p_header = ["dataset"]
+     for n in result["names"]:
+-        p_header += [n, f"{n}_err"]
++        p_header += [n, f"{n}_err", f"{n}_role"]
+     has_N = "G0" in result["names"]
+     if has_N:
+         p_header += ["N", "N_err"]                 # <N> = 1/G0, propagated error
+@@ -1092,8 +1221,18 @@
+     for ds in result["datasets"]:
+         row: list = [ds["name"]]
+         for n in result["names"]:
++            role = _param_role(result, ds, n)
+             row.append(float(ds["values"][n]))
+-            row.append(float(ds["errors"][n]))
++            # A held parameter has NO fitted error, and this table used to
++            # write the 0.0 that fit_global returns for one -- which reads as a
++            # measurement of perfect precision, the opposite of the truth.  NaN
++            # renders as a blank cell (params_cell), which is what the lifetime
++            # and PCH tables have always written and what read_export maps back
++            # to NaN.  With per-dataset rules this is decided per ROW, since
++            # the same parameter can be held here and fitted on the next line.
++            row.append(float("nan") if role == "held"
++                       else float(ds["errors"][n]))
++            row.append(role)
+         N = N_err = float("nan")
+         if has_N:
+             g0  = ds["values"]["G0"]
+@@ -1137,6 +1276,17 @@
+     comments.append(f"weighted : {'yes' if result['weighted'] else 'no'}")
+     comments.append(f"linked : {', '.join(linked_names) if linked_names else '(none)'}")
+     comments.append(f"fixed : {', '.join(fixed_names) if fixed_names else '(none)'}")
++    comments.append("note_role : <param>_role is per dataset - free, shared "
++                    "(one value across a group) or held (not fitted); a blank "
++                    "*_err means held")
++    for _n, _summary in (result.get("plan_summaries") or {}).items():
++        # Only the parameters whose rule is not the whole-parameter case: the
++        # simple ones are already covered by the linked/fixed lines above, and
++        # repeating them would bury the interesting rules.
++        if result["fixed"].get(_n) or result["linked"].get(_n):
++            continue
++        if _summary and not _summary.startswith("free "):
++            comments.append(f"rule_{_n} : {_summary}")
+     if result["weighted"]:
+         comments.append(f"global_red_chi2 : {result['red_chi2']:.6g}")
+     comments.append("units : tau_D in seconds")
