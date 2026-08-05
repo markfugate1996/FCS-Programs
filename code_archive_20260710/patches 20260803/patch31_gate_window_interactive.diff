@@ -1,0 +1,358 @@
+--- a/fcs_lifetime_fit.py
++++ b/fcs_lifetime_fit.py
+@@ -1030,107 +1030,252 @@
+ # level → persists across files for the session.
+ _last_fit_window: dict = {"start": None, "end": None}
+ 
++def _nearest_gate_line(x: float, lo: float, hi: float,
++                       radius: float) -> Optional[str]:
++    """
++    Which gate line a click at *x* grabs: ``"lo"``, ``"hi"`` or None.
++
++    Same rule as fcs_lifetime.select_gate: the nearer line, but only if the
++    click landed within *radius* of it, so clicking in open space pans the plot
++    instead of yanking a gate across the axes.
++    """
++    d_lo, d_hi = abs(x - lo), abs(x - hi)
++    if min(d_lo, d_hi) > radius:
++        return None
++    return "lo" if d_lo <= d_hi else "hi"
++
++
++def _move_gate_line(which: str, x: float, lo: float, hi: float,
++                    t_min: float, t_max: float,
++                    min_sep: float = 0.05) -> Tuple[float, float]:
++    """
++    Move one gate line to *x*, clamped to the axis and kept clear of the other.
++
++    Returns the new ``(lo, hi)``.  The separation floor is what stops a drag
++    from inverting the window, which would otherwise produce an empty fit range
++    only discovered on the next screen.
++    """
++    x = float(np.clip(x, t_min, t_max))
++    if which == "lo":
++        return min(x, hi - min_sep), hi
++    return lo, max(x, lo + min_sep)
++
++
+ def _lifetime_window_dialog(parent, datasets: list, on_done):
+     """
+-    Screen — the fit window: one common to all, or one per dataset.
++    Screen — the fit window.
+ 
+-    A common window is the default and is usually right.  It stops being right
+-    when the time tagger's settings changed between measurements, which moves
+-    the histogram's phase: a window that starts just past the peak of one decay
+-    can start halfway up the rising edge of another, and a tail fit has no IRF
+-    with which to model a rise, so it would fit that edge as if it were decay.
+-    "Show overlay" draws every decay on one axes, which is how you see that
+-    before it costs you a lifetime.
++    ONE dataset takes the ordinary single-file route: :func:`_lifetime_data_dialog`,
++    which offers the channel, the histogram resolution and the interactive gate
++    picker, exactly as fitting a single decay always has.  There is nothing to
++    overlay and no per-dataset choice to make, so asking about either is noise.
++
++    SEVERAL datasets get the same interactivity against all of them at once:
++    the overlay is drawn in this window with draggable gate lines, and the two
++    entry boxes and the lines follow each other.  The alternative -- type
++    numbers, press a button, judge a separate figure, close it, try again --
++    makes you carry the picture in your head between steps and leaves a trail
++    of throwaway figures.
++
++    Calls ``on_done(datasets, windows)``: the datasets may have been re-binned
++    or had their channel changed on the way through, so they come back rather
++    than being assumed unchanged.
+     """
+     import tkinter as tk
+     from tkinter import messagebox
+ 
+     D = len(datasets)
++
++    # ── One dataset: the ordinary single-decay flow ──────────────────────────
++    if D == 1:
++        ds = dict(datasets[0])
++
++        def _got(channel, n_bins, t_ns, counts, fit_start, fit_end):
++            ds["t_ns"], ds["counts"] = np.asarray(t_ns), np.asarray(counts)
++            ds["channel"] = channel
++            if n_bins:
++                ds["n_bins"] = int(n_bins)
++            # The channel is chosen again here, so the label has to follow it
++            # rather than keep whatever the file picker guessed.
++            base = Path(ds["path"]).stem
++            ds["series"] = "decay" if ds.get("series") == "decay" else f"Ch{channel}"
++            ds["name"] = f"{base}[{ds['series']}]"
++            on_done([ds], [(float(fit_start), float(fit_end))])
++
++        _lifetime_data_dialog(parent, ds["decay"], _got)
++        return
++
++    # ── Several datasets: interactive overlay ────────────────────────────────
+     start0, end0 = default_window_for(datasets)
++    t_min = min(float(d["t_ns"][0]) for d in datasets)
++    t_max = max(float(d["t_ns"][-1]) for d in datasets)
++    period = max(float(d.get("laser_period_ns") or t_max) for d in datasets)
++    pick_radius = period * 0.015
+ 
+     win = tk.Toplevel(parent)
+     win.title("Lifetime global fit — fit window")
++    win.geometry("980x680")
++    win.minsize(760, 560)
+     win.grab_set()
+ 
+     tk.Label(win, text="Fit window", font=("Helvetica", 12, "bold"),
+-             pady=6).pack()
+-    tk.Label(win, text=f"{D} dataset{'s' if D != 1 else ''}.  The window starts "
+-                       f"past the LATEST peak across them, so it begins after "
+-                       f"the rise of every decay.",
+-             font=("Helvetica", 9), fg="grey", wraplength=560,
++             pady=4).pack()
++    tk.Label(win, text=f"{D} datasets overlaid.  Drag either dashed line, or "
++                       f"type below.  The window starts past the LATEST peak "
++                       f"across the datasets, so it begins after the rise of "
++                       f"every decay.",
++             font=("Helvetica", 9), fg="grey", wraplength=900,
+              justify="left").pack(padx=12)
+ 
+-    per_var = tk.BooleanVar(value=False)
+-    common = tk.LabelFrame(win, text="Common window (ns)", padx=10, pady=6)
+-    common.pack(fill="x", padx=12, pady=6)
+-    s_var = tk.StringVar(value=f"{start0:.3f}")
+-    e_var = tk.StringVar(value=f"{end0:.3f}")
+-    tk.Label(common, text="Start").grid(row=0, column=0, padx=4)
+-    tk.Entry(common, textvariable=s_var, width=12).grid(row=0, column=1, padx=4)
+-    tk.Label(common, text="End").grid(row=0, column=2, padx=4)
+-    tk.Entry(common, textvariable=e_var, width=12).grid(row=0, column=3, padx=4)
++    # Built once and embedded, not popped up per click: the gate lines below
++    # are live, so there is nothing to regenerate when the window changes.
++    fig, ax = plot_decay_overlay(datasets, window=None, show=False)
++    shade = ax.axvspan(start0, end0, color="orange", alpha=0.12, zorder=1)
++    line_lo = ax.axvline(start0, color="darkorange", lw=1.6, ls="--", zorder=5)
++    line_hi = ax.axvline(end0, color="darkorange", lw=1.6, ls="--", zorder=5)
++    gate_text = ax.text(0.5, 1.01, "", transform=ax.transAxes, ha="center",
++                        va="bottom", fontsize=9, color="darkorange")
++
++    from matplotlib.backends.backend_tkagg import (
++        FigureCanvasTkAgg, NavigationToolbar2Tk)
++    canvas = FigureCanvasTkAgg(fig, master=win)
++    canvas.draw()
++    canvas.get_tk_widget().pack(fill="both", expand=True, padx=8)
++    NavigationToolbar2Tk(canvas, win).update()
++
++    def _gate() -> Tuple[float, float]:
++        return (float(line_lo.get_xdata()[0]), float(line_hi.get_xdata()[0]))
++
++    def _redraw():
++        nonlocal shade
++        lo, hi = _gate()
++        # Remove and redraw the span rather than reshaping it: Polygon.set_xy's
++        # calling convention has changed across matplotlib versions, and
++        # select_gate avoids it for the same reason.
++        shade.remove()
++        shade = ax.axvspan(lo, hi, color="orange", alpha=0.12, zorder=1)
++        gate_text.set_text(f"Fit window: {lo:.2f} – {hi:.2f} ns")
++        canvas.draw_idle()
++
++    _drag = {"which": None}
++
++    def _on_press(event):
++        if event.inaxes is not ax or event.xdata is None:
++            return
++        lo, hi = _gate()
++        _drag["which"] = _nearest_gate_line(float(event.xdata), lo, hi,
++                                            pick_radius)
+ 
+-    def _overlay():
++    def _on_motion(event):
++        if _drag["which"] is None or event.inaxes is not ax:
++            return
++        if event.xdata is None:
++            return
++        lo, hi = _move_gate_line(_drag["which"], float(event.xdata),
++                                 *_gate(), t_min, t_max)
++        line_lo.set_xdata([lo, lo])
++        line_hi.set_xdata([hi, hi])
++        _redraw()
++        _sync_entries()
++
++    def _on_release(_event):
++        _drag["which"] = None
++
++    canvas.mpl_connect("button_press_event", _on_press)
++    canvas.mpl_connect("motion_notify_event", _on_motion)
++    canvas.mpl_connect("button_release_event", _on_release)
++
++    ctrl = tk.Frame(win)
++    ctrl.pack(fill="x", padx=12, pady=(4, 2))
++    tk.Label(ctrl, text="Start (ns):", anchor="e", width=10).pack(side="left")
++    s_var = tk.StringVar(value=f"{start0:.2f}")
++    s_entry = tk.Entry(ctrl, textvariable=s_var, width=9)
++    s_entry.pack(side="left", padx=(2, 16))
++    tk.Label(ctrl, text="End (ns):", anchor="e", width=10).pack(side="left")
++    e_var = tk.StringVar(value=f"{end0:.2f}")
++    e_entry = tk.Entry(ctrl, textvariable=e_var, width=9)
++    e_entry.pack(side="left", padx=2)
++
++    def _sync_entries():
++        lo, hi = _gate()
++        s_var.set(f"{lo:.2f}")
++        e_var.set(f"{hi:.2f}")
++
++    def _sync_lines(*_a):
+         try:
+-            w = (float(s_var.get()), float(e_var.get()))
++            lo, hi = float(s_var.get()), float(e_var.get())
+         except ValueError:
+-            w = None
+-        plot_decay_overlay(datasets, window=w, show=True)
++            return
++        lo = float(np.clip(lo, t_min, t_max))
++        hi = float(np.clip(hi, t_min, t_max))
++        if lo >= hi:
++            return
++        line_lo.set_xdata([lo, lo])
++        line_hi.set_xdata([hi, hi])
++        _redraw()
+ 
+-    tk.Button(common, text="Show overlay", command=_overlay,
+-              pady=2).grid(row=0, column=4, padx=(12, 4))
++    for widget in (s_entry, e_entry):
++        widget.bind("<Return>", _sync_lines)
++        widget.bind("<FocusOut>", _sync_lines)
+ 
+-    # Per-dataset overrides, hidden until asked for.
++    _redraw()
++
++    # ── Per-dataset override ─────────────────────────────────────────────────
++    per_var = tk.BooleanVar(value=False)
+     per_frame = tk.LabelFrame(win, text="Per-dataset windows (ns)",
+-                              padx=10, pady=6)
++                              padx=10, pady=4)
+     per_s: Dict[str, object] = {}
+     per_e: Dict[str, object] = {}
+-    for r, ds in enumerate(datasets):
+-        tk.Label(per_frame, text=f"{r + 1}  {ds['name']}", anchor="w",
+-                 font=("Courier", 8), width=34).grid(row=r, column=0, sticky="w")
+-        sv = tk.StringVar(value=f"{start0:.3f}")
+-        ev = tk.StringVar(value=f"{end0:.3f}")
+-        tk.Entry(per_frame, textvariable=sv, width=10).grid(row=r, column=1, padx=3)
+-        tk.Entry(per_frame, textvariable=ev, width=10).grid(row=r, column=2, padx=3)
+-        tk.Button(per_frame, text="Pick…", pady=1,
+-                  command=lambda d=ds, a=sv, b=ev: _pick_one(d, a, b)
+-                  ).grid(row=r, column=3, padx=4)
+-        per_s[ds["name"]] = sv
+-        per_e[ds["name"]] = ev
+ 
+     def _pick_one(ds, sv, ev):
+-        """Pick this dataset's gate on its own histogram."""
++        """Pick this dataset's window on its own histogram, interactively."""
+         try:
+             gate = fcs_lifetime.select_gate(
+-                ds["decay"],
+-                n_bins=ds["decay"].gate_n_bins(512),
++                ds["decay"], n_bins=ds["decay"].gate_n_bins(512),
+                 channels=(ds["channel"] or ds["decay"].channels[0],),
+                 initial_gate=(float(sv.get()), float(ev.get())),
+-                parent=win, title=f"Fit window — {ds['name']}")
+-        except Exception as e:                  # noqa: BLE001 — shown below
+-            messagebox.showerror("Cannot open the picker", str(e), parent=win)
++                title=f"Fit window — {ds['name']}")
++        except Exception as exc:                # noqa: BLE001 — shown below
++            messagebox.showerror("Cannot open the picker", str(exc), parent=win)
+             return
+         if gate:
+-            sv.set(f"{gate[0]:.3f}")
+-            ev.set(f"{gate[1]:.3f}")
++            sv.set(f"{gate[0]:.2f}")
++            ev.set(f"{gate[1]:.2f}")
++
++    for r, ds in enumerate(datasets):
++        tk.Label(per_frame, text=f"{r + 1}  {ds['name']}", anchor="w",
++                 font=("Courier", 8), width=36).grid(row=r, column=0, sticky="w")
++        sv = tk.StringVar(value=f"{start0:.2f}")
++        ev = tk.StringVar(value=f"{end0:.2f}")
++        tk.Entry(per_frame, textvariable=sv, width=9).grid(row=r, column=1, padx=3)
++        tk.Entry(per_frame, textvariable=ev, width=9).grid(row=r, column=2, padx=3)
++        tk.Button(per_frame, text="Pick…", pady=1,
++                  command=lambda d=ds, a=sv, b=ev: _pick_one(d, a, b)
++                  ).grid(row=r, column=3, padx=4)
++        per_s[ds["name"]] = sv
++        per_e[ds["name"]] = ev
+ 
+     def _toggle_per():
+         if per_var.get():
+-            per_frame.pack(fill="x", padx=12, pady=(0, 6))
++            for ds in datasets:
++                per_s[ds["name"]].set(s_var.get())
++                per_e[ds["name"]].set(e_var.get())
++            per_frame.pack(fill="x", padx=12, pady=(0, 4))
+         else:
+             per_frame.pack_forget()
+ 
+-    tk.Checkbutton(win, text="Use a separate window per dataset",
++    tk.Checkbutton(win, text="Use a separate window per dataset  "
++                             "(for decays whose histogram phase differs)",
+                    variable=per_var, command=_toggle_per,
+                    anchor="w").pack(fill="x", padx=14)
+     tk.Label(win, text="Amplitudes are measured from the window start, so "
+                        "per-dataset windows make A values incomparable between "
+                        "datasets — lifetimes are unaffected.",
+-             font=("Helvetica", 8), fg="grey", wraplength=560,
++             font=("Helvetica", 8), fg="grey", wraplength=900,
+              justify="left").pack(fill="x", padx=16)
+ 
+     btns = tk.Frame(win)
+-    btns.pack(pady=10)
++    btns.pack(pady=8)
+ 
+     def _next():
+         try:
+@@ -1138,7 +1283,8 @@
+                 windows = [(float(per_s[d["name"]].get()),
+                             float(per_e[d["name"]].get())) for d in datasets]
+             else:
+-                windows = [(float(s_var.get()), float(e_var.get()))] * len(datasets)
++                lo, hi = _gate()
++                windows = [(lo, hi)] * D
+         except ValueError:
+             messagebox.showerror("Invalid window",
+                                  "Window bounds must be numbers (ns).",
+@@ -1156,16 +1302,22 @@
+                     "Window outside the data",
+                     f"{ds['name']}: its histogram spans "
+                     f"{ds['t_ns'][0]:.3f}–{ds['t_ns'][-1]:.3f} ns, which does "
+-                    f"not contain a start of {a:g} ns.\n\nUse 'Show overlay' "
+-                    f"to compare the decays, or set a window per dataset.",
++                    f"not contain a start of {a:g} ns.\n\nThe overlay shows "
++                    f"which decay is out of step; tick 'Use a separate window "
++                    f"per dataset' to gate it on its own.",
+                     parent=win)
+                 return
++        plt.close(fig)
++        win.destroy()
++        on_done(datasets, windows)
++
++    def _cancel():
++        plt.close(fig)
+         win.destroy()
+-        on_done(windows)
+ 
+     tk.Button(btns, text="Next →", width=12, command=_next,
+               pady=4).pack(side="left", padx=6)
+-    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
++    tk.Button(btns, text="Cancel", width=10, command=_cancel,
+               pady=4).pack(side="left", padx=6)
+     win.wait_window()
+ 
+@@ -1675,9 +1827,9 @@
+         # selected it IS the single fit, and adding a second is one click
+         # rather than a different menu item.
+         def _after_datasets(datasets: list):
+-            def _after_windows(windows: list):
++            def _after_windows(chosen: list, windows: list):
+                 def _after_model(model: FCSModel):
+-                    _lifetime_global_setup_dialog(parent, model, datasets,
++                    _lifetime_global_setup_dialog(parent, model, chosen,
+                                                   windows)
+                 _select_lifetime_model_dialog(parent, _after_model)
+             _lifetime_window_dialog(parent, datasets, _after_windows)

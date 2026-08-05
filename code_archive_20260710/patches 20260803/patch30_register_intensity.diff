@@ -1,0 +1,19 @@
+--- a/fcs_plotopen.py
++++ b/fcs_plotopen.py
+@@ -28,7 +28,7 @@
+ Implement ``rebuild_plot(meta, columns, show=True, path=None) -> (fig, ax)``
+ in the module that owns the analysis, then register it::
+ 
+-    register_rebuilder("intensity", "fcs_intensity", "rebuild_plot")
++    register_rebuilder("intensity", "fcs_plot", "rebuild_plot")
+ 
+ The rebuilder receives exactly what :func:`fcs_export.read_export` returns,
+ plus the source path, so it can find sibling files -- a global fit reads its
+@@ -63,6 +63,7 @@
+     "calibration points": ("fcs_calib",    "rebuild_plot"),
+     "lifetime":           ("fcs_lifetime", "rebuild_plot"),
+     "pch":                ("fcs_pch",      "rebuild_plot"),
++    "intensity":          ("fcs_plot",     "rebuild_plot"),
+ }
+ 
+ 
