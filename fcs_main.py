@@ -54,9 +54,6 @@ def _unique_key(path: Path) -> str:
 
 def _add_file(path: Path) -> str:
     key = _unique_key(path)
-    #if key not in workspace:
-    #    workspace[key] = read_fcs(path)
-    # changed 20260624
     if key not in workspace:
         workspace[key] = load_dataset(path)
     return key

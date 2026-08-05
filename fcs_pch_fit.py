@@ -56,6 +56,8 @@ from fcs_reader import FCSData
 import fcs_pch
 import fcs_export
 import fcs_fisher
+import fcs_globalfit
+import fcs_fitdialogs
 
 from fcs_fitcommon import (
     fits_dir as _fits_dir,
@@ -63,6 +65,7 @@ from fcs_fitcommon import (
     fmt_bound as _fmt,
     parse_bound as _parse_bound,
     write_params_table as _write_params_table,
+    slug_name as _slug_name,
 )
 
 # ── Data preparation ──────────────────────────────────────────────────────────
@@ -808,6 +811,323 @@ def export_pch_fit(result: dict, source_path: str | Path
 
 # ── GUI: entry point and dialogs ──────────────────────────────────────────────
 
+# ── Batch / global fitting ────────────────────────────────────────────────────
+
+def pch_dataset_source():
+    """
+    Describe saved PCH histograms to the shared dataset picker.
+
+    One row per SERIES, not per file: an export holding Ch1 and Ch2 holds two
+    histograms, and they are two datasets to a fit -- separately linkable,
+    separately removable, separately numbered in a rule.
+    """
+    def _discover(folder) -> list:
+        out = []
+        for path in discover_pch_csvs(Path(folder)):
+            try:
+                series, _meta = load_pch_csv(path)
+            except Exception:
+                continue
+            order = {"Ch1": 0, "Ch2": 1, "Ch1+Ch2": 2}
+            for label in sorted(series, key=lambda L: (order.get(L, 3), L)):
+                out.append(fcs_fitdialogs.DatasetEntry(
+                    path=path, series=label,
+                    label=f"{path.name}  [{label}]"))
+        return out
+
+    def _load(entry) -> dict:
+        loaded = load_pch_object(entry.path)
+        ser = loaded.get(entry.series)
+        return {
+            "name": f"{entry.path.stem}[{entry.series}]",
+            "path": entry.path, "series": entry.series,
+            "x": ser["k"], "y": ser["n_k"],
+            # Poisson counting error on each histogram bin.  max(n,1) keeps an
+            # empty bin from having zero sigma (an infinite weight) while still
+            # letting it constrain the fit, which is the same convention the
+            # single-file fit uses.
+            "sigma": np.sqrt(np.maximum(ser["n_k"], 1.0)),
+            "M": int(ser["M"]), "bin_width_s": float(ser["bin_width_s"]),
+            "mean": float(ser["mean"]), "var": float(ser["var"]),
+            "cps": ser["cps"], "origin": loaded.source_name,
+            "meta": loaded.meta,
+        }
+
+    return fcs_fitdialogs.DatasetSource(
+        key="pch",
+        title="Select PCH histograms",
+        noun="PCH histograms",
+        discover=_discover,
+        load=_load,
+        filetypes=(("CSV files", "*.csv"), ("PCH export", "*pch*.csv"),
+                   ("All files", "*.*")),
+        empty_hint=("These are the CSVs written by the PCH task with 'Export "
+                    "plotted data to CSV' ticked; they need raw counts and a "
+                    "sampled-bin count M."),
+    )
+
+
+def fit_pch_global(model: FCSModel, datasets: list, linked, guesses, lowers,
+                   uppers, fixed, weighted: bool = True, plans=None,
+                   maxfev: int = 20000) -> dict:
+    """
+    Fit one PCH model to several histograms at once, with shared, held and
+    independent parameters.
+
+    The counting histogram is compared as COUNTS, not probabilities: the model
+    gives Pi(k) and each dataset contributes ``M * Pi(k)`` against its observed
+    ``n_k``.  M differs per dataset, so it travels on the dataset rather than
+    being a fit parameter -- which is also what makes the Poisson weights
+    absolute and the reduced chi-squared meaningful.
+
+    Linking ``epsilon`` across a dilution series is the canonical use: the
+    brightness is a property of the fluorophore while N is what the dilution
+    changes.  Note that epsilon is counts per molecule per BIN, so datasets
+    exported at different bin widths do not share one -- the bin widths are
+    recorded in the report so a reader can check.
+    """
+    prepped = fcs_globalfit.prepare_datasets(datasets, weighted=weighted)
+
+    def _predict(ds, k, values):
+        return ds["M"] * model.func(k, **values)
+
+    out = fcs_globalfit.fit_linked(
+        model.param_names(), prepped, _predict, linked, guesses, lowers,
+        uppers, fixed, weighted=weighted, maxfev=maxfev, plans=plans)
+
+    # Per-dataset derived quantities, the same ones the single fit reports.
+    for entry in out["datasets"]:
+        vals = entry["values"]
+        bw = entry.get("bin_width_s") or float("nan")
+        derived: Dict[str, float] = {}
+        if "epsilon" in vals:
+            derived["eta_cps_per_molecule"] = vals["epsilon"] / bw
+        for tag in ("1", "2"):
+            if f"epsilon{tag}" in vals:
+                derived[f"eta{tag}_cps_per_molecule"] = vals[f"epsilon{tag}"] / bw
+        pred = sum(vals[n] * vals[e] for n, e in
+                   (("N", "epsilon"), ("N1", "epsilon1"), ("N2", "epsilon2"))
+                   if n in vals and e in vals) / bw
+        derived["predicted_cps"] = pred
+        if entry.get("cps") and np.isfinite(entry["cps"]):
+            derived["observed_cps"] = float(entry["cps"])
+            derived["predicted_over_observed"] = pred / float(entry["cps"])
+        entry["derived"] = derived
+        # pk for plotting: the fit works in counts, the eye reads probabilities.
+        entry["pk"] = entry["y"] / entry["M"]
+        entry["pk_fit"] = entry["yfit"] / entry["M"]
+
+    out["model"] = model
+    return out
+
+
+def export_pch_global(result: dict, source_path, name_override=None):
+    """
+    Write a global PCH fit's report, fitted curves and parameter table.
+
+    Returns (report_path, curves_path, params_path).
+
+    The parameter table uses a FIXED schema -- every model parameter as a
+    value / _err / _role triple, and the same derived columns for every row --
+    so rows from different datasets line up even when one of them could not
+    supply an observed count rate.  A per-fit table can afford to vary its
+    columns; a table whose whole purpose is comparison across datasets cannot.
+    """
+    source_path = Path(source_path)
+    model = result["model"]
+    out_dir = _new_fit_dir(source_path, name_override)
+    stem = "pch_globalfit"
+    if name_override:
+        stem = f"{stem}_{_slug_name(name_override)}"
+    report_path = out_dir / f"{stem}_report.txt"
+    curves_path = out_dir / f"{stem}_curves.csv"
+    params_path = out_dir / f"{stem}_params.csv"
+
+    dsets = result["datasets"]
+    names = result["names"]
+
+    # ── Report ───────────────────────────────────────────────────────────────
+    L: list = []
+    L.append("PCH global fit report")
+    L.append("=" * 64)
+    L.append(f"generated  : {datetime.now().isoformat(timespec='seconds')}")
+    L.append(f"model      : {model.name}  [{model.key}]")
+    L.append(f"formula    : {model.formula}")
+    L.append(f"datasets   : {result['n_datasets']}")
+    L.append(f"weighted   : {'yes (Poisson)' if result['weighted'] else 'no'}")
+    L.append("")
+
+    # Bin widths, stated whether or not they agree.  epsilon is counts per
+    # molecule per BIN, so a mixed-bin-width fit is one where a shared epsilon
+    # is not one quantity -- the reader should not have to open the sources to
+    # find that out.
+    bws = [ds.get("bin_width_s") for ds in dsets]
+    uniq = sorted({f"{b:.10g}" for b in bws if b})
+    L.append("Bin widths")
+    L.append("-" * 64)
+    if len(uniq) == 1:
+        L.append(f"  all datasets: {fcs_pch._format_bin_width(float(uniq[0]))}")
+    else:
+        L.append("  DIFFER between datasets — epsilon is counts per molecule")
+        L.append("  per BIN, so it is not the same quantity in each:")
+        for ds in dsets:
+            L.append(f"    {ds['name']:<32} "
+                     f"{fcs_pch._format_bin_width(ds['bin_width_s'])}")
+    L.append("")
+
+    L.append("Parameter linking")
+    L.append("-" * 64)
+    for n in names:
+        if result["fixed"].get(n):
+            state = "fixed"
+        elif result["linked"].get(n):
+            state = "linked"
+        elif all(not d.get("fixed", {}).get(n) and not d.get("linked", {}).get(n)
+                 for d in dsets):
+            state = "per-dataset"
+        else:
+            state = result["plan_summaries"].get(n, "per-dataset")
+        L.append(f"  {n:<10} : {state}")
+    L.append("")
+
+    shared = _global_value_rows(result, "linked")
+    if shared:
+        L.append("Shared values")
+        L.append("-" * 64)
+        for label, val, err in shared:
+            L.append(f"  {label:<30} = {val:.6g}  ± {err}")
+        L.append("")
+    held = _global_value_rows(result, "fixed")
+    if held:
+        L.append("Held values")
+        L.append("-" * 64)
+        for label, val, _err in held:
+            L.append(f"  {label:<30} = {val:.6g}  (held)")
+        L.append("")
+
+    if result["weighted"] and np.isfinite(result["red_chi2"]):
+        L.append(f"Goodness of fit:  chi^2 = {result['chi2']:.6g}   "
+                 f"red. chi^2 = {result['red_chi2']:.4g}   dof = {result['dof']}")
+        L.append("")
+
+    L.append("Per-dataset results")
+    L.append("-" * 64)
+    for ds in dsets:
+        L.append(f"  {ds['name']}")
+        L.append(f"    bin {fcs_pch._format_bin_width(ds['bin_width_s'])}  ·  "
+                 f"M = {ds['M']:,}  ·  <k> = {ds['mean']:.4g}  ·  "
+                 f"Q = {ds['var'] / ds['mean'] - 1:.4g}")
+        for n in names:
+            if result["linked"].get(n) or result["fixed"].get(n):
+                continue
+            tag = ("  (held)" if ds.get("fixed", {}).get(n)
+                   else "  (shared)" if ds.get("linked", {}).get(n) else "")
+            err = "—" if ds.get("fixed", {}).get(n) else f"{ds['errors'][n]:.6g}"
+            L.append(f"    {n:<10} = {ds['values'][n]:.6g}  ± {err}{tag}")
+        for key, val in ds["derived"].items():
+            L.append(f"    {key:<24} = {val:.6g}")
+        L.append(f"    R^2 = {ds['r2']:.6f}   points = {ds['n_points']}")
+        L.append("")
+
+    report_path.write_text("\n".join(L), encoding="utf-8")
+    print(f"[pch globalfit] wrote {report_path}")
+
+    # ── Fitted curves ────────────────────────────────────────────────────────
+    k_max = max(int(ds["x"][-1]) for ds in dsets)
+    k_full = np.arange(0, k_max + 1)
+    cols: Dict[str, np.ndarray] = {"k": k_full.astype(float)}
+    for ds in dsets:
+        idx = np.asarray(ds["x"], dtype=int)
+        for suffix, values in (("pk", ds["pk"]), ("pk_fit", ds["pk_fit"]),
+                               ("n", ds["y"]), ("n_fit", ds["yfit"])):
+            col = np.full(k_max + 1, np.nan)
+            col[idx] = values
+            cols[f"{suffix}_{ds['name']}"] = col
+    with curves_path.open("w", encoding="utf-8", newline="") as fh:
+        fh.write("# FCS analysis export — pch global fit curves\n")
+        fh.write("# analysis : pch global fit\n")
+        fh.write(f"# model : {model.name} [{model.key}]\n")
+        fh.write(f"# datasets : {result['n_datasets']}\n")
+        fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
+        fh.write(",".join(cols) + "\n")
+        for row in zip(*cols.values()):
+            fh.write(",".join(fcs_export.csv_value(v) for v in row) + "\n")
+    print(f"[pch globalfit] wrote {curves_path}")
+
+    # ── Parameter table (fixed schema) ───────────────────────────────────────
+    derived_keys = ["eta_cps_per_molecule", "eta1_cps_per_molecule",
+                    "eta2_cps_per_molecule", "predicted_cps", "observed_cps",
+                    "predicted_over_observed"]
+    present = [k for k in derived_keys
+               if any(k in ds["derived"] for ds in dsets)]
+    p_header = ["dataset", "source", "series", "bin_width_s", "sampled_bins_M"]
+    for n in names:
+        p_header += [n, f"{n}_err", f"{n}_role"]
+    p_header += present + ["mean_k", "var_k", "Q", "r2", "n_points"]
+
+    rows = []
+    for ds in dsets:
+        role = lambda n: ("held" if ds.get("fixed", {}).get(n)
+                          else "shared" if ds.get("linked", {}).get(n)
+                          else "free")
+        row = [ds["name"], Path(ds["path"]).name, ds.get("series") or "",
+               ds["bin_width_s"], ds["M"]]
+        for n in names:
+            row.append(float(ds["values"][n]))
+            row.append(float("nan") if role(n) == "held"
+                       else float(ds["errors"][n]))
+            row.append(role(n))
+        # Fixed schema: a dataset that could not supply a derived quantity gets
+        # a blank cell, not a missing column, so the rows line up.
+        row += [ds["derived"].get(k, float("nan")) for k in present]
+        row += [ds["mean"], ds["var"], ds["var"] / ds["mean"] - 1,
+                ds["r2"], ds["n_points"]]
+        rows.append(row)
+
+    comments = ["PCH global fit — parameter table",
+                f"model : {model.name} [{model.key}]",
+                f"datasets : {result['n_datasets']}",
+                f"weighted : {'yes (Poisson)' if result['weighted'] else 'no'}",
+                f"exported : {datetime.now().isoformat(timespec='seconds')}"]
+    if len(uniq) > 1:
+        comments.append("warning_bin_width : datasets have DIFFERENT bin "
+                        "widths; epsilon is per bin and is not the same "
+                        "quantity across them")
+    comments.append("note_role : <param>_role is per dataset — free, shared "
+                    "or held; a blank *_err means held")
+    for n, summary in (result.get("plan_summaries") or {}).items():
+        if result["fixed"].get(n) or result["linked"].get(n):
+            continue
+        if summary and not summary.startswith("free "):
+            comments.append(f"rule_{n} : {summary}")
+
+    _write_params_table(params_path, comments, p_header, rows,
+                        log_tag="pch globalfit",
+                        sheet_title="pch global fit")
+    return report_path, curves_path, params_path
+
+
+def _global_value_rows(result: dict, kind: str) -> list:
+    """Group rows for the report: ``(label, value, err)`` per shared/held set."""
+    rows = []
+    dsets = result["datasets"]
+    for n in result["names"]:
+        members = [i for i, d in enumerate(dsets)
+                   if d.get(kind, {}).get(n, result[kind].get(n, False))]
+        if not members:
+            continue
+        by_value: Dict[float, list] = {}
+        for i in members:
+            by_value.setdefault(dsets[i]["values"][n], []).append(i)
+        whole = len(members) == len(dsets) and len(by_value) == 1
+        for val, group in by_value.items():
+            label = n if whole else \
+                f"{n}[{'+'.join(dsets[i]['name'] for i in group)}]"
+            rows.append((label, float(val),
+                         f"{dsets[group[0]]['errors'][n]:.6g}"))
+    return rows
+
+
 def run_pch_fit_dialog(fcs_data: Optional[FCSData] = None, parent=None):
     """
     Full GUI flow: choose a source, then a model, then fit, plot and export.
@@ -829,19 +1149,155 @@ def run_pch_fit_dialog(fcs_data: Optional[FCSData] = None, parent=None):
         _pch_data_dialog(parent, fcs_data, _after_data)
 
     def _from_csv():
-        def _after_series(loaded: "LoadedPCH", label: str):
-            s = loaded.get(label)
+        # Saved histograms always go through the multi-dataset path.  With one
+        # selected it IS the single fit -- linking is meaningless for one
+        # dataset and the table disables it -- so there is no second flow to
+        # keep in step, and picking a second file is one click rather than a
+        # different menu item.
+        def _after_datasets(datasets: list):
             def _after_model(model: FCSModel):
-                _pch_setup_dialog(parent, loaded, model, label,
-                                  s["bin_width_s"], s["k"], s["n_k"], s["M"],
-                                  s["mean"], s["var"], observed_cps=s["cps"])
+                _pch_global_setup_dialog(parent, model, datasets)
             _select_pch_model_dialog(parent, _after_model)
-        _pch_csv_dialog(parent, fcs_data, _after_series)
+        fcs_fitdialogs.select_datasets(
+            parent, pch_dataset_source(),
+            _default_pch_dir(fcs_data), _after_datasets)
 
     if fcs_data is None:
         _from_csv()
         return
     _pch_source_dialog(parent, fcs_data, _from_photons, _from_csv)
+
+
+def _pch_global_setup_dialog(parent, model: FCSModel, datasets: list):
+    """Screen — per-parameter link / guess / bounds / fix / rule, then fit."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    D = len(datasets)
+    ds_names = [d["name"] for d in datasets]
+    out_source = Path(datasets[0]["path"])
+
+    win = tk.Toplevel(parent)
+    win.title(f"PCH fit — {model.name}")
+    win.resizable(False, False)
+    win.grab_set()
+
+    tk.Label(win, text=f"PCH {'global ' if D > 1 else ''}fit — {model.name}",
+             font=("Helvetica", 12, "bold"), pady=6).pack()
+    tk.Label(win, text=f"{D} dataset{'s' if D != 1 else ''}  ·  {model.formula}",
+             font=("Helvetica", 9), fg="grey").pack(pady=(0, 4))
+
+    # Bin widths on screen, not just in the report: a shared epsilon across
+    # mismatched bin widths is the one easy way to get a confidently wrong
+    # brightness out of this dialog.
+    bws = {f"{d['bin_width_s']:.10g}" for d in datasets}
+    if len(bws) > 1:
+        tk.Label(win, text="⚠ these datasets have DIFFERENT bin widths — "
+                           "ε is counts per molecule per bin, so linking it "
+                           "links quantities that are not the same",
+                 font=("Helvetica", 8), fg="#a00", wraplength=560,
+                 justify="left").pack(fill="x", padx=12)
+
+    if D > 1:
+        fcs_fitdialogs.dataset_legend(win, ds_names).pack(
+            fill="x", padx=12, pady=(0, 6))
+
+    guesses0 = fcs_globalfit.combined_guess_from(
+        [auto_guess_pch(model, d["mean"], d["var"]) for d in datasets],
+        model.defaults())
+    ptable = fcs_fitdialogs.ParamTable(win, model, ds_names, guesses0)
+    ptable.pack(fill="x")
+
+    weight_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(win, text="Weight by Poisson σ = √counts",
+                   variable=weight_var, anchor="w").pack(fill="x", padx=12,
+                                                         pady=(6, 0))
+
+    name_row = tk.Frame(win)
+    name_row.pack(fill="x", padx=12, pady=(8, 0))
+    tk.Label(name_row, text="Save as:", anchor="w",
+             font=("Helvetica", 9)).pack(side="left")
+    name_var = tk.StringVar(value="")
+    tk.Entry(name_row, textvariable=name_var,
+             font=("Helvetica", 9)).pack(side="left", fill="x", expand=True,
+                                         padx=(4, 0))
+
+    btns = tk.Frame(win)
+    btns.pack(pady=10)
+
+    def _do_fit():
+        try:
+            setup = ptable.read()
+        except ValueError as e:
+            messagebox.showerror("Invalid input", str(e), parent=win)
+            return
+        try:
+            result = fit_pch_global(
+                model, datasets, setup["linked"], setup["guesses"],
+                setup["lowers"], setup["uppers"], setup["fixed"],
+                weighted=weight_var.get(), plans=setup["plans"])
+        except Exception as e:                  # noqa: BLE001 — shown below
+            messagebox.showerror("Fit failed", str(e), parent=win)
+            return
+
+        label = name_var.get().strip()
+        win.destroy()
+        report_path, _c, _p = export_pch_global(result, out_source,
+                                                name_override=label)
+        fig, _axes = plot_pch_global_fit(result, show=False)
+        fcs_plottools.save_figure(fig, report_path.with_suffix(""))
+
+        shared = _global_value_rows(result, "linked")
+        lines = [f"{lab} = {val:.4g} ± {err}" for lab, val, err in shared]
+        gof = (f"red. χ² = {result['red_chi2']:.3g}"
+               if result["weighted"] else f"{D} dataset{'s' if D != 1 else ''}")
+        messagebox.showinfo(
+            "PCH fit complete",
+            f"{model.name}\n\n"
+            + ("\n".join(lines) if lines else "(no shared parameters)")
+            + f"\n\n{gof}\n\nResults saved to:\n{report_path.parent}",
+            parent=parent)
+        fcs_plottools.show_figure(fig)
+
+    tk.Button(btns, text="Fit", width=12, command=_do_fit,
+              pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(side="left", padx=6)
+    win.wait_window()
+
+
+def plot_pch_global_fit(result: dict, show: bool = True):
+    """Overlay every dataset's PCH with its fit, plus weighted residuals."""
+    model = result["model"]
+    dsets = result["datasets"]
+    colours = fcs_plottools.palette(len(dsets))
+
+    fig, (ax, axr) = plt.subplots(
+        2, 1, sharex=True, figsize=(9, 5.5),
+        gridspec_kw={"height_ratios": [3, 1]}, layout="constrained")
+
+    for ds, colour in zip(dsets, colours):
+        ax.plot(ds["x"], ds["pk"], linestyle="none", marker="o",
+                markersize=3.5, color=colour, alpha=0.85, label=ds["name"])
+        ax.plot(ds["x"], ds["pk_fit"], "-", color=colour, linewidth=1.4)
+        sig = ds["sigma"] if ds.get("sigma") is not None else 1.0
+        axr.plot(ds["x"], ds["resid"] / sig, marker="o", markersize=3,
+                 linestyle="none", color=colour)
+
+    ax.set_yscale("log")
+    ax.set_ylabel("Probability  p(k)", fontsize=12)
+    ax.set_title(f"PCH global fit — {model.name}  ·  "
+                 f"{len(dsets)} dataset{'s' if len(dsets) != 1 else ''}",
+                 fontsize=10)
+    ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
+    ax.legend(fontsize=8, framealpha=0.85)
+    axr.axhline(0.0, color="grey", linewidth=0.8)
+    axr.set_xlabel("Photons per bin  k", fontsize=12)
+    axr.set_ylabel("resid/σ", fontsize=10)
+    axr.grid(True, linestyle=":", linewidth=0.3, alpha=0.5)
+    if show:
+        fcs_plottools.show_figure(fig)
+    return fig, np.array([ax, axr])
 
 
 def _pch_source_dialog(parent, fcs_data, on_photons, on_csv):

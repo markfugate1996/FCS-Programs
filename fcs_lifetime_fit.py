@@ -54,6 +54,8 @@ from fcs_models import FCSModel
 from fcs_reader import FCSData
 import fcs_lifetime
 import fcs_fisher
+import fcs_globalfit
+import fcs_fitdialogs
 
 import fcs_export
 
@@ -1028,6 +1030,623 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
 # level → persists across files for the session.
 _last_fit_window: dict = {"start": None, "end": None}
 
+def _lifetime_window_dialog(parent, datasets: list, on_done):
+    """
+    Screen — the fit window: one common to all, or one per dataset.
+
+    A common window is the default and is usually right.  It stops being right
+    when the time tagger's settings changed between measurements, which moves
+    the histogram's phase: a window that starts just past the peak of one decay
+    can start halfway up the rising edge of another, and a tail fit has no IRF
+    with which to model a rise, so it would fit that edge as if it were decay.
+    "Show overlay" draws every decay on one axes, which is how you see that
+    before it costs you a lifetime.
+    """
+    import tkinter as tk
+    from tkinter import messagebox
+
+    D = len(datasets)
+    start0, end0 = default_window_for(datasets)
+
+    win = tk.Toplevel(parent)
+    win.title("Lifetime global fit — fit window")
+    win.grab_set()
+
+    tk.Label(win, text="Fit window", font=("Helvetica", 12, "bold"),
+             pady=6).pack()
+    tk.Label(win, text=f"{D} dataset{'s' if D != 1 else ''}.  The window starts "
+                       f"past the LATEST peak across them, so it begins after "
+                       f"the rise of every decay.",
+             font=("Helvetica", 9), fg="grey", wraplength=560,
+             justify="left").pack(padx=12)
+
+    per_var = tk.BooleanVar(value=False)
+    common = tk.LabelFrame(win, text="Common window (ns)", padx=10, pady=6)
+    common.pack(fill="x", padx=12, pady=6)
+    s_var = tk.StringVar(value=f"{start0:.3f}")
+    e_var = tk.StringVar(value=f"{end0:.3f}")
+    tk.Label(common, text="Start").grid(row=0, column=0, padx=4)
+    tk.Entry(common, textvariable=s_var, width=12).grid(row=0, column=1, padx=4)
+    tk.Label(common, text="End").grid(row=0, column=2, padx=4)
+    tk.Entry(common, textvariable=e_var, width=12).grid(row=0, column=3, padx=4)
+
+    def _overlay():
+        try:
+            w = (float(s_var.get()), float(e_var.get()))
+        except ValueError:
+            w = None
+        plot_decay_overlay(datasets, window=w, show=True)
+
+    tk.Button(common, text="Show overlay", command=_overlay,
+              pady=2).grid(row=0, column=4, padx=(12, 4))
+
+    # Per-dataset overrides, hidden until asked for.
+    per_frame = tk.LabelFrame(win, text="Per-dataset windows (ns)",
+                              padx=10, pady=6)
+    per_s: Dict[str, object] = {}
+    per_e: Dict[str, object] = {}
+    for r, ds in enumerate(datasets):
+        tk.Label(per_frame, text=f"{r + 1}  {ds['name']}", anchor="w",
+                 font=("Courier", 8), width=34).grid(row=r, column=0, sticky="w")
+        sv = tk.StringVar(value=f"{start0:.3f}")
+        ev = tk.StringVar(value=f"{end0:.3f}")
+        tk.Entry(per_frame, textvariable=sv, width=10).grid(row=r, column=1, padx=3)
+        tk.Entry(per_frame, textvariable=ev, width=10).grid(row=r, column=2, padx=3)
+        tk.Button(per_frame, text="Pick…", pady=1,
+                  command=lambda d=ds, a=sv, b=ev: _pick_one(d, a, b)
+                  ).grid(row=r, column=3, padx=4)
+        per_s[ds["name"]] = sv
+        per_e[ds["name"]] = ev
+
+    def _pick_one(ds, sv, ev):
+        """Pick this dataset's gate on its own histogram."""
+        try:
+            gate = fcs_lifetime.select_gate(
+                ds["decay"],
+                n_bins=ds["decay"].gate_n_bins(512),
+                channels=(ds["channel"] or ds["decay"].channels[0],),
+                initial_gate=(float(sv.get()), float(ev.get())),
+                parent=win, title=f"Fit window — {ds['name']}")
+        except Exception as e:                  # noqa: BLE001 — shown below
+            messagebox.showerror("Cannot open the picker", str(e), parent=win)
+            return
+        if gate:
+            sv.set(f"{gate[0]:.3f}")
+            ev.set(f"{gate[1]:.3f}")
+
+    def _toggle_per():
+        if per_var.get():
+            per_frame.pack(fill="x", padx=12, pady=(0, 6))
+        else:
+            per_frame.pack_forget()
+
+    tk.Checkbutton(win, text="Use a separate window per dataset",
+                   variable=per_var, command=_toggle_per,
+                   anchor="w").pack(fill="x", padx=14)
+    tk.Label(win, text="Amplitudes are measured from the window start, so "
+                       "per-dataset windows make A values incomparable between "
+                       "datasets — lifetimes are unaffected.",
+             font=("Helvetica", 8), fg="grey", wraplength=560,
+             justify="left").pack(fill="x", padx=16)
+
+    btns = tk.Frame(win)
+    btns.pack(pady=10)
+
+    def _next():
+        try:
+            if per_var.get():
+                windows = [(float(per_s[d["name"]].get()),
+                            float(per_e[d["name"]].get())) for d in datasets]
+            else:
+                windows = [(float(s_var.get()), float(e_var.get()))] * len(datasets)
+        except ValueError:
+            messagebox.showerror("Invalid window",
+                                 "Window bounds must be numbers (ns).",
+                                 parent=win)
+            return
+        for ds, (a, b) in zip(datasets, windows):
+            if b <= a:
+                messagebox.showerror(
+                    "Invalid window",
+                    f"{ds['name']}: end ({b:g} ns) must be after start "
+                    f"({a:g} ns).", parent=win)
+                return
+            if not (ds["t_ns"][0] <= a < ds["t_ns"][-1]):
+                messagebox.showerror(
+                    "Window outside the data",
+                    f"{ds['name']}: its histogram spans "
+                    f"{ds['t_ns'][0]:.3f}–{ds['t_ns'][-1]:.3f} ns, which does "
+                    f"not contain a start of {a:g} ns.\n\nUse 'Show overlay' "
+                    f"to compare the decays, or set a window per dataset.",
+                    parent=win)
+                return
+        win.destroy()
+        on_done(windows)
+
+    tk.Button(btns, text="Next →", width=12, command=_next,
+              pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(side="left", padx=6)
+    win.wait_window()
+
+
+def _lifetime_global_setup_dialog(parent, model: FCSModel, datasets: list,
+                                  windows: list):
+    """Screen — per-parameter link / guess / bounds / fix / rule, then fit."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    D = len(datasets)
+    ds_names = [d["name"] for d in datasets]
+    out_source = Path(datasets[0]["path"])
+
+    win = tk.Toplevel(parent)
+    win.title(f"Lifetime fit — {model.name}")
+    win.resizable(False, False)
+    win.grab_set()
+
+    tk.Label(win, text=f"Lifetime {'global ' if D > 1 else ''}fit — {model.name}",
+             font=("Helvetica", 12, "bold"), pady=6).pack()
+    tk.Label(win, text=f"{D} dataset{'s' if D != 1 else ''}  ·  tail fit  ·  "
+                       f"{model.formula}",
+             font=("Helvetica", 9), fg="grey").pack(pady=(0, 4))
+
+    if D > 1:
+        fcs_fitdialogs.dataset_legend(win, ds_names).pack(
+            fill="x", padx=12, pady=(0, 6))
+
+    per_dataset_guesses = []
+    for ds, (a, b) in zip(datasets, windows):
+        t_win, c_win, t_rel = prepare_decay(ds["t_ns"], ds["counts"], a, b)
+        per_dataset_guesses.append(auto_guess_lifetime(model, t_rel, c_win))
+    guesses0 = fcs_globalfit.combined_guess_from(per_dataset_guesses,
+                                                 model.defaults())
+
+    ptable = fcs_fitdialogs.ParamTable(win, model, ds_names, guesses0)
+    ptable.pack(fill="x")
+
+    weight_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(win, text="Weight by Poisson σ = √counts",
+                   variable=weight_var, anchor="w").pack(fill="x", padx=12,
+                                                         pady=(6, 0))
+    name_row = tk.Frame(win)
+    name_row.pack(fill="x", padx=12, pady=(8, 0))
+    tk.Label(name_row, text="Save as:", anchor="w",
+             font=("Helvetica", 9)).pack(side="left")
+    name_var = tk.StringVar(value="")
+    tk.Entry(name_row, textvariable=name_var,
+             font=("Helvetica", 9)).pack(side="left", fill="x", expand=True,
+                                         padx=(4, 0))
+
+    btns = tk.Frame(win)
+    btns.pack(pady=10)
+
+    def _do_fit():
+        try:
+            setup = ptable.read()
+        except ValueError as e:
+            messagebox.showerror("Invalid input", str(e), parent=win)
+            return
+        try:
+            result = fit_lifetime_global(
+                model, datasets, windows, setup["linked"], setup["guesses"],
+                setup["lowers"], setup["uppers"], setup["fixed"],
+                weighted=weight_var.get(), plans=setup["plans"])
+        except Exception as e:                  # noqa: BLE001 — shown below
+            messagebox.showerror("Fit failed", str(e), parent=win)
+            return
+        label = name_var.get().strip()
+        win.destroy()
+        report_path, _c, _p = export_lifetime_global(result, out_source,
+                                                     name_override=label)
+        fig, _axes = plot_lifetime_global_fit(result, show=False)
+        fcs_plottools.save_figure(fig, report_path.with_suffix(""))
+        shared = _lt_global_value_rows(result, "linked")
+        lines = [f"{lab} = {val:.4g} ± {err}" for lab, val, err in shared]
+        gof = (f"red. χ² = {result['red_chi2']:.3g}"
+               if result["weighted"] else f"{D} dataset{'s' if D != 1 else ''}")
+        messagebox.showinfo(
+            "Lifetime fit complete",
+            f"{model.name}\n\n"
+            + ("\n".join(lines) if lines else "(no shared parameters)")
+            + f"\n\n{gof}\n\nResults saved to:\n{report_path.parent}",
+            parent=parent)
+        fcs_plottools.show_figure(fig)
+
+    tk.Button(btns, text="Fit", width=12, command=_do_fit,
+              pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy,
+              pady=4).pack(side="left", padx=6)
+    win.wait_window()
+
+
+# ── Batch / global fitting ────────────────────────────────────────────────────
+
+def lifetime_dataset_source():
+    """
+    Describe saved decays to the shared dataset picker.
+
+    One row per CHANNEL: a two-channel export holds two decays with, in
+    general, two different lifetimes, so they are two datasets to a fit.
+    """
+    def _discover(folder) -> list:
+        out = []
+        for path in discover_lifetime_csvs(Path(folder)):
+            try:
+                d = load_decay_object(path)
+            except Exception:
+                continue
+            if d._single:
+                out.append(fcs_fitdialogs.DatasetEntry(
+                    path=path, series="decay", label=f"{path.name}  [decay]"))
+            else:
+                for ch in d.channels:
+                    out.append(fcs_fitdialogs.DatasetEntry(
+                        path=path, series=f"Ch{ch}",
+                        label=f"{path.name}  [Ch{ch}]"))
+        return out
+
+    def _load(entry) -> dict:
+        d = load_decay_object(entry.path)
+        channel = (None if entry.series == "decay"
+                   else int(str(entry.series)[2:]))
+        t_ns, counts = d.lifetime_histogram(
+            channel=channel if channel is not None else 1)
+        return {
+            "name": f"{entry.path.stem}[{entry.series}]",
+            "path": entry.path, "series": entry.series, "channel": channel,
+            "decay": d, "t_ns": t_ns, "counts": counts,
+            "n_bins": int(d.n_bins), "laser_period_ns": float(d.laser_period_ns),
+            "origin": d.source_name, "meta": d.meta,
+        }
+
+    return fcs_fitdialogs.DatasetSource(
+        key="lifetime",
+        title="Select lifetime decays",
+        noun="lifetime decays",
+        discover=_discover,
+        load=_load,
+        filetypes=(("CSV files", "*.csv"), ("Lifetime export", "*lifetime*.csv"),
+                   ("All files", "*.*")),
+        empty_hint="These are the CSVs written by the lifetime plotting task.",
+    )
+
+
+def default_window_for(datasets: list) -> Tuple[float, float]:
+    """
+    A common fit window that suits every decay in *datasets*.
+
+    Taken from the LATEST peak across the datasets, so the window starts past
+    the rise of all of them rather than of the first: a window that begins
+    before another decay's peak would fit its rising edge as if it were decay,
+    and a tail fit has no IRF with which to model a rise.
+    """
+    starts, ends = [], []
+    for ds in datasets:
+        t_ns, counts = ds["t_ns"], ds["counts"]
+        peak = float(t_ns[int(np.argmax(counts))])
+        starts.append(peak + 1.0)
+        ends.append(float(t_ns[-1]))
+    return max(starts), min(ends)
+
+
+def plot_decay_overlay(datasets: list, window=None, show: bool = True):
+    """
+    Overlay every selected decay on one log-y axes.
+
+    This is the screen that answers "can these share one fit window?".  Decays
+    recorded with different time-tagger settings sit at different phases in the
+    microtime histogram, and a common window that looks right for one of them
+    can start halfway up another's rising edge.  Seeing them together makes
+    that obvious in a way that a list of numbers does not.
+    """
+    colours = fcs_plottools.palette(len(datasets))
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    for ds, colour in zip(datasets, colours):
+        ax.plot(ds["t_ns"], np.maximum(ds["counts"], 0.5), color=colour,
+                linewidth=1.0, alpha=0.85, label=ds["name"])
+    if window is not None:
+        for x in window:
+            ax.axvline(float(x), color="grey", linestyle="--", linewidth=1.0)
+        ax.axvspan(float(window[0]), float(window[1]), color="grey", alpha=0.08)
+    ax.set_yscale("log")
+    ax.set_xlabel("Microtime (ns)", fontsize=12)
+    ax.set_ylabel("Counts", fontsize=12)
+    ax.set_title(f"Decay overlay — {len(datasets)} dataset"
+                 f"{'s' if len(datasets) != 1 else ''}"
+                 + ("   ·   shaded = common fit window" if window else ""),
+                 fontsize=10)
+    ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
+    ax.legend(fontsize=8, framealpha=0.85)
+    fig.tight_layout()
+    if show:
+        fcs_plottools.show_figure(fig)
+    return fig, ax
+
+
+def fit_lifetime_global(model: FCSModel, datasets: list, windows: list,
+                        linked, guesses, lowers, uppers, fixed,
+                        weighted: bool = True, plans=None,
+                        drop_edges: bool = True, maxfev: int = 20000) -> dict:
+    """
+    Fit one decay model to several TCSPC histograms at once.
+
+    *windows* is one ``(start_ns, end_ns)`` per dataset — the same pair
+    repeated for a common window, or different pairs when the histograms sit at
+    different phases.
+
+    Each decay is windowed by :func:`prepare_decay` and the model evaluated on
+    time re-zeroed to that window's start, exactly as the single fit does.  One
+    consequence is worth stating: the amplitudes therefore refer to each
+    dataset's OWN window start, so linking A across datasets with different
+    windows links values measured from different origins.  Lifetimes are
+    immune, which is why they are the parameters linked by default.
+    """
+    if len(windows) != len(datasets):
+        raise ValueError(
+            f"{len(windows)} windows for {len(datasets)} datasets.")
+
+    prepared = []
+    for ds, (start, end) in zip(datasets, windows):
+        t_win, c_win, t_rel = prepare_decay(
+            ds["t_ns"], ds["counts"], float(start), float(end),
+            drop_edges=drop_edges)
+        entry = dict(ds)
+        entry.update({
+            "x": t_rel, "y": c_win, "t_win": t_win,
+            "sigma": np.sqrt(np.maximum(c_win, 1.0)),
+            "fit_start": float(start), "fit_end": float(end),
+        })
+        prepared.append(entry)
+
+    prepped = fcs_globalfit.prepare_datasets(prepared, weighted=weighted)
+
+    def _predict(ds, t_rel, values):
+        return model.func(t_rel, **values)
+
+    out = fcs_globalfit.fit_linked(
+        model.param_names(), prepped, _predict, linked, guesses, lowers,
+        uppers, fixed, weighted=weighted, maxfev=maxfev, plans=plans)
+
+    for entry in out["datasets"]:
+        vals = entry["values"]
+        extras: Dict[str, float] = {}
+        if "A1" in vals and "A2" in vals and "tau1" in vals and "tau2" in vals:
+            a1, a2, t1, t2 = vals["A1"], vals["A2"], vals["tau1"], vals["tau2"]
+            denom = a1 + a2
+            if denom > 0:
+                extras["tau_mean_amp"] = (a1 * t1 + a2 * t2) / denom
+            w = a1 * t1 + a2 * t2
+            if w > 0:
+                extras["f1"] = a1 * t1 / w
+                extras["f2"] = a2 * t2 / w
+        entry["extras"] = extras
+    out["model"] = model
+    return out
+
+
+def export_lifetime_global(result: dict, source_path, name_override=None):
+    """
+    Write a global lifetime fit's report, fitted curves and parameter table.
+
+    Returns (report_path, curves_path, params_path).  The parameter table uses
+    a fixed schema, so rows from a bi-exponential fit line up whether or not a
+    given dataset produced a usable mean lifetime.
+    """
+    source_path = Path(source_path)
+    model = result["model"]
+    out_dir = _new_fit_dir(source_path, name_override)
+    stem = "lifetime_globalfit"
+    if name_override:
+        stem = f"{stem}_{_slug_name(name_override)}"
+    report_path = out_dir / f"{stem}_report.txt"
+    curves_path = out_dir / f"{stem}_curves.csv"
+    params_path = out_dir / f"{stem}_params.csv"
+
+    dsets = result["datasets"]
+    names = result["names"]
+
+    L: list = []
+    L.append("Lifetime global fit report  (tail fit)")
+    L.append("=" * 64)
+    L.append(f"generated  : {datetime.now().isoformat(timespec='seconds')}")
+    L.append(f"model      : {model.name}  [{model.key}]")
+    L.append(f"formula    : {model.formula}")
+    L.append(f"datasets   : {result['n_datasets']}")
+    L.append(f"weighted   : {'yes (Poisson)' if result['weighted'] else 'no'}")
+    L.append("")
+
+    wins = {(round(d["fit_start"], 6), round(d["fit_end"], 6)) for d in dsets}
+    L.append("Fit window")
+    L.append("-" * 64)
+    if len(wins) == 1:
+        a, b = next(iter(wins))
+        L.append(f"  common to all datasets: {a:.3f} – {b:.3f} ns")
+    else:
+        # Amplitudes are measured from the window start, so a per-dataset
+        # window means they are measured from different origins.  Said here
+        # rather than left for the reader to deduce from the numbers.
+        L.append("  PER-DATASET — amplitudes refer to each window's own start,")
+        L.append("  so A values are not directly comparable between datasets:")
+        for d in dsets:
+            L.append(f"    {d['name']:<34} {d['fit_start']:.3f} – "
+                     f"{d['fit_end']:.3f} ns")
+    L.append("")
+
+    L.append("Parameter linking")
+    L.append("-" * 64)
+    for n in names:
+        if result["fixed"].get(n):
+            state = "fixed"
+        elif result["linked"].get(n):
+            state = "linked"
+        elif all(not d.get("fixed", {}).get(n) and not d.get("linked", {}).get(n)
+                 for d in dsets):
+            state = "per-dataset"
+        else:
+            state = result["plan_summaries"].get(n, "per-dataset")
+        L.append(f"  {n:<10} : {state}")
+    L.append("")
+
+    for kind, title in (("linked", "Shared values"), ("fixed", "Held values")):
+        rows = _lt_global_value_rows(result, kind)
+        if not rows:
+            continue
+        L.append(title)
+        L.append("-" * 64)
+        for label, val, err in rows:
+            L.append(f"  {label:<30} = {val:.6g}"
+                     + (f"  ± {err}" if kind == "linked" else "  (held)"))
+        L.append("")
+
+    if result["weighted"] and np.isfinite(result["red_chi2"]):
+        L.append(f"Goodness of fit:  chi^2 = {result['chi2']:.6g}   "
+                 f"red. chi^2 = {result['red_chi2']:.4g}   dof = {result['dof']}")
+        L.append("")
+
+    L.append("Per-dataset results")
+    L.append("-" * 64)
+    for d in dsets:
+        L.append(f"  {d['name']}")
+        L.append(f"    window {d['fit_start']:.3f} – {d['fit_end']:.3f} ns  ·  "
+                 f"{d['n_bins']} bins  ·  {d['n_points']} points")
+        for n in names:
+            if result["linked"].get(n) or result["fixed"].get(n):
+                continue
+            tag = ("  (held)" if d.get("fixed", {}).get(n)
+                   else "  (shared)" if d.get("linked", {}).get(n) else "")
+            err = "—" if d.get("fixed", {}).get(n) else f"{d['errors'][n]:.6g}"
+            L.append(f"    {n:<10} = {d['values'][n]:.6g}  ± {err}{tag}")
+        for key, val in d["extras"].items():
+            L.append(f"    {key:<20} = {val:.6g}")
+        L.append(f"    R^2 = {d['r2']:.6f}")
+        L.append("")
+
+    report_path.write_text("\n".join(L), encoding="utf-8")
+    print(f"[lifetime globalfit] wrote {report_path}")
+
+    # ── Fitted curves, on ABSOLUTE microtime so they can be overlaid ─────────
+    n_max = max(len(d["t_win"]) for d in dsets)
+    cols: Dict[str, np.ndarray] = {}
+    for d in dsets:
+        for suffix, values in (("t_ns", d["t_win"]), ("counts", d["y"]),
+                               ("fit", d["yfit"]), ("resid_w", d["resid"] /
+                                (d["sigma"] if d.get("sigma") is not None else 1.0))):
+            col = np.full(n_max, np.nan)
+            col[:len(values)] = values
+            cols[f"{suffix}_{d['name']}"] = col
+    with curves_path.open("w", encoding="utf-8", newline="") as fh:
+        fh.write("# FCS analysis export — lifetime global fit curves\n")
+        fh.write("# analysis : lifetime global fit\n")
+        fh.write(f"# model : {model.name} [{model.key}]\n")
+        fh.write(f"# datasets : {result['n_datasets']}\n")
+        fh.write(f"# exported : {datetime.now().isoformat(timespec='seconds')}\n")
+        fh.write(",".join(cols) + "\n")
+        for row in zip(*cols.values()):
+            fh.write(",".join(fcs_export.csv_value(v) for v in row) + "\n")
+    print(f"[lifetime globalfit] wrote {curves_path}")
+
+    # ── Parameter table (fixed schema) ───────────────────────────────────────
+    extra_keys = ["tau_mean_amp", "f1", "f2"]
+    present = [k for k in extra_keys if any(k in d["extras"] for d in dsets)]
+    p_header = ["dataset", "source", "series", "n_bins",
+                "fit_start_ns", "fit_end_ns"]
+    for n in names:
+        p_header += [n, f"{n}_err", f"{n}_role"]
+    p_header += present + ["r2", "n_points"]
+
+    rows = []
+    for d in dsets:
+        role = lambda n: ("held" if d.get("fixed", {}).get(n)
+                          else "shared" if d.get("linked", {}).get(n)
+                          else "free")
+        row = [d["name"], Path(d["path"]).name, d.get("series") or "",
+               d["n_bins"], d["fit_start"], d["fit_end"]]
+        for n in names:
+            row.append(float(d["values"][n]))
+            row.append(float("nan") if role(n) == "held"
+                       else float(d["errors"][n]))
+            row.append(role(n))
+        row += [d["extras"].get(k, float("nan")) for k in present]
+        row += [d["r2"], d["n_points"]]
+        rows.append(row)
+
+    comments = ["Lifetime global fit (tail fit) — parameter table",
+                f"model : {model.name} [{model.key}]",
+                f"datasets : {result['n_datasets']}",
+                f"weighted : {'yes (Poisson)' if result['weighted'] else 'no'}",
+                f"exported : {datetime.now().isoformat(timespec='seconds')}"]
+    if len(wins) > 1:
+        comments.append("warning_windows : datasets use DIFFERENT fit windows; "
+                        "amplitudes are measured from each window's own start "
+                        "and are not directly comparable")
+    comments.append("note_role : <param>_role is per dataset — free, shared "
+                    "or held; a blank *_err means held")
+    for n, summary in (result.get("plan_summaries") or {}).items():
+        if result["fixed"].get(n) or result["linked"].get(n):
+            continue
+        if summary and not summary.startswith("free "):
+            comments.append(f"rule_{n} : {summary}")
+
+    _write_params_table(params_path, comments, p_header, rows,
+                        log_tag="lifetime globalfit",
+                        sheet_title="lifetime global fit")
+    return report_path, curves_path, params_path
+
+
+def _lt_global_value_rows(result: dict, kind: str) -> list:
+    """Group rows for the report: ``(label, value, err)`` per shared/held set."""
+    rows = []
+    dsets = result["datasets"]
+    for n in result["names"]:
+        members = [i for i, d in enumerate(dsets)
+                   if d.get(kind, {}).get(n, result[kind].get(n, False))]
+        if not members:
+            continue
+        by_value: Dict[float, list] = {}
+        for i in members:
+            by_value.setdefault(dsets[i]["values"][n], []).append(i)
+        whole = len(members) == len(dsets) and len(by_value) == 1
+        for val, group in by_value.items():
+            label = n if whole else \
+                f"{n}[{'+'.join(dsets[i]['name'] for i in group)}]"
+            rows.append((label, float(val),
+                         f"{dsets[group[0]]['errors'][n]:.6g}"))
+    return rows
+
+
+def plot_lifetime_global_fit(result: dict, show: bool = True):
+    """Overlay every windowed decay with its fit, plus weighted residuals."""
+    model = result["model"]
+    dsets = result["datasets"]
+    colours = fcs_plottools.palette(len(dsets))
+    fig, (ax, axr) = plt.subplots(
+        2, 1, sharex=True, figsize=(9, 5.5),
+        gridspec_kw={"height_ratios": [3, 1]}, layout="constrained")
+    for d, colour in zip(dsets, colours):
+        ax.plot(d["x"], np.maximum(d["y"], 0.5), linestyle="none", marker=".",
+                markersize=2.5, color=colour, alpha=0.6, label=d["name"])
+        ax.plot(d["x"], np.maximum(d["yfit"], 0.5), "-", color=colour,
+                linewidth=1.4)
+        sig = d["sigma"] if d.get("sigma") is not None else 1.0
+        axr.plot(d["x"], d["resid"] / sig, linestyle="none", marker=".",
+                 markersize=2, color=colour)
+    ax.set_yscale("log")
+    ax.set_ylabel("Counts", fontsize=12)
+    ax.set_title(f"Lifetime global fit — {model.name}  ·  "
+                 f"{len(dsets)} dataset{'s' if len(dsets) != 1 else ''}",
+                 fontsize=10)
+    ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
+    ax.legend(fontsize=8, framealpha=0.85)
+    axr.axhline(0.0, color="grey", linewidth=0.8)
+    axr.set_xlabel("Time from window start (ns)", fontsize=12)
+    axr.set_ylabel("resid/σ", fontsize=10)
+    axr.grid(True, linestyle=":", linewidth=0.3, alpha=0.5)
+    if show:
+        fcs_plottools.show_figure(fig)
+    return fig, np.array([ax, axr])
+
+
 def run_lifetime_fit_dialog(fcs_data: Optional[FCSData] = None, parent=None):
     """
     Full GUI flow for lifetime modelling: choose a source, then channel /
@@ -1052,7 +1671,19 @@ def run_lifetime_fit_dialog(fcs_data: Optional[FCSData] = None, parent=None):
         _lifetime_data_dialog(parent, source, _after_data)
 
     def _from_csv():
-        _lifetime_csv_dialog(parent, fcs_data, _run)
+        # Saved decays always go through the multi-dataset path: with one
+        # selected it IS the single fit, and adding a second is one click
+        # rather than a different menu item.
+        def _after_datasets(datasets: list):
+            def _after_windows(windows: list):
+                def _after_model(model: FCSModel):
+                    _lifetime_global_setup_dialog(parent, model, datasets,
+                                                  windows)
+                _select_lifetime_model_dialog(parent, _after_model)
+            _lifetime_window_dialog(parent, datasets, _after_windows)
+        fcs_fitdialogs.select_datasets(
+            parent, lifetime_dataset_source(),
+            _default_decay_dir(fcs_data), _after_datasets)
 
     if fcs_data is None:
         _from_csv()

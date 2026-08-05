@@ -1,0 +1,31 @@
+--- a/fcs_models.py
++++ b/fcs_models.py
+@@ -431,7 +431,13 @@
+     formula="A·exp(−t/τ) + offset",
+     params=[
+         Param("A",      1000.0, 0.0,  np.inf, "counts", "amplitude at fit-window start"),
+-        Param("tau",    3.0,    1e-3, 1e3,    "ns",     "fluorescence lifetime"),
++        # Linked by default in a global fit, on the same reasoning as the
++        # reconvolution models: tau is a property of the fluorophore and its
++        # environment, while A counts photons and so scales with concentration,
++        # acquisition time and bin width -- and, because the model is evaluated
++        # on time re-zeroed to the fit window, with where that window starts.
++        Param("tau",    3.0,    1e-3, 1e3,    "ns",     "fluorescence lifetime",
++              link_default=True),
+         Param("offset", 0.0,    0.0,  np.inf, "counts", "constant background"),
+     ],
+     func=_decay_1exp,
+@@ -459,9 +465,11 @@
+     formula="A1·exp(−t/τ1) + A2·exp(−t/τ2) + offset",
+     params=[
+         Param("A1",     700.0, 0.0,  np.inf, "counts", "amplitude of component 1 (fast)"),
+-        Param("tau1",   1.5,   1e-3, 1e3,    "ns",     "lifetime of component 1 (fast)"),
++        Param("tau1",   1.5,   1e-3, 1e3,    "ns",     "lifetime of component 1 (fast)",
++              link_default=True),
+         Param("A2",     300.0, 0.0,  np.inf, "counts", "amplitude of component 2 (slow)"),
+-        Param("tau2",   5.0,   1e-3, 1e3,    "ns",     "lifetime of component 2 (slow)"),
++        Param("tau2",   5.0,   1e-3, 1e3,    "ns",     "lifetime of component 2 (slow)",
++              link_default=True),
+         Param("offset", 0.0,   0.0,  np.inf, "counts", "constant background"),
+     ],
+     func=_decay_2exp,
