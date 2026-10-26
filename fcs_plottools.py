@@ -248,6 +248,7 @@ def show_figure(
     _build_scale_section(body, fig, axes_list)
     _build_normalize_section(body, fig, axes_list)
     _build_limits_section(body, fig, axes_list)
+    _build_grid_section(body, fig, axes_list)
     _legend_cb["fn"] = _build_legend_section(body, fig, axes_list)
     _build_annotation_section(body, fig, axes_list)
     _build_label_section(body, fig, axes_list)
@@ -798,6 +799,34 @@ def _build_traces_section(
                 art.set_facecolor(hx)
             except Exception:
                 return
+
+        # set_color reaches a Line2D's MARKERS only while their face and
+        # edge colours are 'auto'.  Set explicitly, they ignore it and
+        # this control silently does nothing -- and on a points-only
+        # trace (linestyle "none") the line colour is never drawn, so
+        # nothing at all changes on screen.  A composited overlay trace
+        # is exactly that case: fcs_plotopen copies markerfacecolor and
+        # markeredgecolor across, and the getters resolve 'auto' to a
+        # literal on the way, so the copy arrives with them pinned.
+        # 'none' is left alone: an unfilled marker is a deliberate
+        # style, not a colour waiting to be set.
+        for _getter, _setter in (("get_markerfacecolor",
+                                  "set_markerfacecolor"),
+                                 ("get_markeredgecolor",
+                                  "set_markeredgecolor")):
+            try:
+                _cur = getattr(art, _getter)()
+            except AttributeError:
+                break          # not a Line2D -- no markers to recolour
+            except Exception:
+                continue
+            if isinstance(_cur, str) and _cur.lower() == "none":
+                continue
+            try:
+                getattr(art, _setter)(hx)
+            except Exception:
+                pass
+
         colour_box["hex"] = hx
         swatch.config(bg=hx)
         _redraw()
@@ -1527,6 +1556,138 @@ def _build_limits_section(
               width=8, pady=2).pack(side="left", padx=(0, 4))
     tk.Button(btn_row, text="Auto", command=_auto_limits,
               width=8, pady=2).pack(side="left")
+
+
+# ── Gridlines ─────────────────────────────────────────────────────────────────
+
+# Style applied when gridlines are switched ON from the controls panel.  The
+# major values are the ones the suite's own plotters already pass to
+# ax.grid(), so toggling a grid off and back on returns the figure to the way
+# it was drawn rather than to the matplotlib default.  Module-level so the
+# preferences system can retarget them at runtime, the same pattern
+# _FIGURE_FORMAT and _NORMALIZE_K follow; both are re-read on every toggle.
+_GRID_MAJOR_KW = {"linestyle": "--", "linewidth": 0.4, "alpha": 0.5}
+# Minor lines are deliberately lighter.  A semilog correlation axis carries
+# eight minor lines per decade, and at major weight they read as a hatch over
+# the data rather than as a reference to measure against.
+_GRID_MINOR_KW = {"linestyle": ":", "linewidth": 0.3, "alpha": 0.3}
+
+
+def _grid_is_on(ax, which: str) -> bool:
+    """
+    Whether *ax* currently draws *which* ("major" or "minor") gridlines.
+
+    Read from the tick artists, not from the private tick kwargs: a
+    gridline's visibility is what actually renders, and ``get_xgridlines``
+    and ``Tick.gridline`` are public on every matplotlib this suite runs on.
+    Either axis counts, so a figure gridded in x only still opens with the
+    box ticked.
+    """
+    try:
+        if which == "major":
+            lines = list(ax.get_xgridlines()) + list(ax.get_ygridlines())
+        else:
+            lines = [t.gridline for t in ax.xaxis.get_minor_ticks()]
+            lines += [t.gridline for t in ax.yaxis.get_minor_ticks()]
+    except Exception:
+        return False
+    for ln in lines:
+        try:
+            if ln.get_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _build_grid_section(
+    panel,
+    fig: plt.Figure,
+    axes_list: list,
+) -> None:
+    """
+    Add the "Gridlines" LabelFrame to *panel*.
+
+    Major and minor are separate toggles, and both act on EVERY panel of the
+    figure.  Grid is unlike Y scale and Y limits in this respect: it is a
+    reading aid rather than a statement about the data, and a residual strip
+    with no grid under a main panel that has one reads as an oversight.
+
+    Initial state is read from the first panel, so a figure drawn with a grid
+    opens with its box already ticked and the first click turns the grid OFF
+    rather than appearing to do nothing.
+
+    Minor gridlines need minor TICKS to hang on, and a linear axis has none
+    by default -- ``ax.grid(True, which="minor")`` on one draws nothing at
+    all.  Enabling minor therefore switches minor ticks on for any axis that
+    lacks them, so the control cannot silently do nothing.  Disabling leaves
+    the ticks in place: removing them again would undo a tick setting the
+    figure may have arrived with.
+    """
+    import tkinter as tk
+
+    ax0 = axes_list[0]
+
+    maj_var = tk.BooleanVar(master=panel, value=_grid_is_on(ax0, "major"))
+    min_var = tk.BooleanVar(master=panel, value=_grid_is_on(ax0, "minor"))
+
+    gf = tk.LabelFrame(panel, text="Gridlines", padx=10, pady=6)
+    gf.pack(fill="x", padx=10, pady=4)
+
+    def _has_minor_ticks(ax) -> bool:
+        try:
+            # get_minorticklocs returns an ndarray, and bool() on an empty
+            # array raises rather than returning False -- len() is the only
+            # safe emptiness test here.
+            return (len(ax.xaxis.get_minorticklocs()) > 0 or
+                    len(ax.yaxis.get_minorticklocs()) > 0)
+        except Exception:
+            return False
+
+    def _apply(*_):
+        want_major = bool(maj_var.get())
+        want_minor = bool(min_var.get())
+        for ax in axes_list:
+            if want_minor and not _has_minor_ticks(ax):
+                try:
+                    ax.minorticks_on()
+                except Exception:
+                    pass
+            try:
+                if want_major:
+                    ax.grid(True, which="major", **dict(_GRID_MAJOR_KW))
+                else:
+                    ax.grid(False, which="major")
+            except Exception:
+                pass
+            try:
+                if want_minor:
+                    ax.grid(True, which="minor", **dict(_GRID_MINOR_KW))
+                else:
+                    ax.grid(False, which="minor")
+            except Exception:
+                pass
+        try:
+            fig.canvas.draw()
+        except Exception:
+            pass
+
+    row = tk.Frame(gf)
+    row.pack(fill="x")
+    tk.Checkbutton(
+        row, text="Major", variable=maj_var, command=_apply, anchor="w",
+        font=("Helvetica", 9),
+    ).pack(side="left")
+    tk.Checkbutton(
+        row, text="Minor", variable=min_var, command=_apply, anchor="w",
+        font=("Helvetica", 9),
+    ).pack(side="left", padx=(12, 0))
+    tk.Label(
+        gf,
+        text=("      applied to every panel — display only, exports\n"
+              "      and fitted values are untouched"),
+        font=("Helvetica", 8), fg="grey", anchor="w", justify="left",
+    ).pack(fill="x")
 
 
 def _build_legend_section(
