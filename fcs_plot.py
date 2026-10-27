@@ -127,6 +127,77 @@ _BIN_WIDTH_OPTIONS = {
 _DEFAULT_BIN_WIDTH_LABEL = "100 ms"
 
 
+# Unit suffixes accepted when a bin width is TYPED rather than picked from the
+# preset list.  Both micro signs are listed: U+00B5 MICRO SIGN is what Windows
+# and most keyboards emit, U+03BC GREEK SMALL LETTER MU is what many fonts and
+# copy-paste sources emit.  They are visually identical, so a user cannot tell
+# which one they have typed and must not be punished for guessing wrong.
+_BIN_WIDTH_UNITS = {
+    "s":    1.0,
+    "sec":  1.0,
+    "ms":   1e-3,
+    "us":   1e-6,
+    "µs":   1e-6,
+    "ns":   1e-9,
+}
+
+
+def parse_bin_width(text) -> float:
+    """
+    Parse a typed bin width into seconds.
+
+    Accepts a number with an optional unit -- ``2.5 ms``, ``250 us``,
+    ``250 µs``, ``1e-4 s`` -- or a bare number, which is read as SECONDS to
+    match the units used by every ``bin_width_s`` argument in the suite.  Case
+    and the space before the unit are both optional.
+
+    The preset labels in :data:`_BIN_WIDTH_OPTIONS` are themselves valid input
+    here ("100 ms", "1 s"), which is what lets the dialog keep one variable for
+    both the menu and the entry instead of trying to keep two in step.
+
+    Raises
+    ------
+    ValueError
+        With a message written for the user, not the developer: it is shown
+        verbatim in the dialog when parsing fails.
+    """
+    s = str(text).strip().replace("μ", "µ")
+    if not s:
+        raise ValueError("Enter a bin width, e.g. '2.5 ms' or '250 µs'.")
+
+    # Peel off the longest matching unit suffix, longest first so that 'ms' is
+    # never mistaken for 's'.  Peeling a known suffix rather than stripping
+    # trailing letters keeps scientific notation intact: '1e-4s' must lose the
+    # 's' and keep the 'e', which a naive rstrip of alphabetic characters
+    # would not do.
+    scale = 1.0
+    low = s.lower()
+    for suffix in sorted(_BIN_WIDTH_UNITS, key=len, reverse=True):
+        if low.endswith(suffix) and len(low) > len(suffix):
+            scale = _BIN_WIDTH_UNITS[suffix]
+            s = s[: len(s) - len(suffix)]
+            break
+
+    try:
+        value = float(s.strip())
+    except ValueError:
+        raise ValueError(
+            f"Could not read {text!r} as a bin width.  Use a number with an "
+            f"optional unit -- '2.5 ms', '250 us', '1e-4 s' -- or a bare "
+            f"number, which is read as seconds."
+        ) from None
+
+    # float() accepts 'nan' and 'inf'; both would sail through a bare > 0 test
+    # and only fail much later inside bin_intensity, where the error would no
+    # longer point at the entry box that caused it.
+    if not np.isfinite(value):
+        raise ValueError("Bin width must be a finite number.")
+    if value <= 0:
+        raise ValueError(f"Bin width must be greater than zero (got {value:g}).")
+
+    return value * scale
+
+
 # ── Drawing ───────────────────────────────────────────────────────────────────
 
 def _draw_intensity(ax, time_s, I1_cps, I2_cps,

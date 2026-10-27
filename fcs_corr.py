@@ -2557,7 +2557,8 @@ _defaults: dict = {
 
 
 def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
-                           *, collect_only: bool = False):
+                           *, collect_only: bool = False,
+                           force: Optional[dict] = None):
     """
     Show a parameter dialog, then compute and plot the segmented correlation.
     Settings persist between calls within the same session.
@@ -2569,6 +2570,18 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
     multi-file batch/overlay path to ask for parameters once and then apply
     them to every selected file via :func:`compute_correlation_for`.  Returns
     None if the user cancels.
+
+    *force* constrains parameters the caller cannot let the user set freely:
+    ``corr_type``, ``method``, ``segment``, ``full_trace_G`` and
+    ``thin_factor``.  A plain value pins the setting and disables its control
+    outright.  A set, list or tuple instead names the values that remain
+    ALLOWED: for a radio group the disallowed buttons are disabled and the
+    rest stay live, and the selection moves into the allowed set if it is not
+    already there.  Either way the control is disabled rather than hidden, so
+    the dialog shows what will actually happen instead of quietly overriding
+    a choice the user made.  A forced value is the caller's constraint, not
+    the user's choice, so it is restored in ``_defaults`` afterwards and
+    never becomes their default.
     """
     import tkinter as tk
     from tkinter import messagebox
@@ -2925,6 +2938,53 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
                               font=("Helvetica", 9), fg="grey", anchor="w")
     time_est_label.pack(fill="x")
 
+    # ── Caller-forced settings ───────────────────────────────────────────────
+    _forced_before: dict = {}
+    if force:
+        _forced_before = {k: _defaults[k] for k in force if k in _defaults}
+
+        def _lock(widget, *classes):
+            """Disable every input widget of *classes* under *widget*."""
+            for w in widget.winfo_children():
+                if isinstance(w, classes):
+                    w.configure(state="disabled")
+                _lock(w, *classes)
+
+        def _restrict(frame, var, spec):
+            """Pin a radio group to *spec*, or narrow it to the allowed set.
+
+            A scalar disables the whole group at that value.  A collection
+            leaves the allowed buttons live and disables the rest, so the
+            user can still choose among what the caller supports -- and the
+            selection is moved into the allowed set first, since a disabled
+            button can still be the one currently selected.
+            """
+            allowed = (set(spec) if isinstance(spec, (set, list, tuple))
+                       else None)
+            if allowed is None:
+                var.set(spec)
+            elif var.get() not in allowed:
+                var.set(sorted(allowed)[0])
+            for w in frame.winfo_children():
+                if not isinstance(w, tk.Radiobutton):
+                    continue
+                if allowed is None or str(w.cget("value")) not in allowed:
+                    w.configure(state="disabled")
+
+        if "corr_type" in force:
+            _restrict(type_frame, type_var, force["corr_type"])
+        if "method" in force:
+            _restrict(method_frame, method_var, force["method"])
+        if "segment" in force:
+            segment_var.set(bool(force["segment"]))
+            seg_cb.configure(state="disabled")
+        if "full_trace_G" in force:
+            full_trace_var.set(bool(force["full_trace_G"]))
+            full_trace_cb.configure(state="disabled")
+        if "thin_factor" in force:
+            thin_var.set(str(force["thin_factor"]))
+            _lock(thin_row, tk.Spinbox, tk.Entry)
+
     def _update_time_estimate(*_):
         """Recompute and display the estimated computation time."""
         try:
@@ -3125,6 +3185,11 @@ def run_correlation_dialog(fcs_data: FCSData, export: bool = False,
         _defaults["mt_coarsen"]        = mt_coarsen
         _defaults["seg_duration_s"]    = seg_duration_s
         _defaults["full_trace_G"]      = full_trace_G
+
+        # A forced value was imposed by the caller, not chosen by the user,
+        # so it must not survive into their next correlation as a default.
+        if _forced_before:
+            _defaults.update(_forced_before)
 
         # ── Batch / collect-only mode ────────────────────────────────────────
         # When called by the multi-file batch path, just hand back the chosen

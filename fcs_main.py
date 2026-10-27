@@ -28,6 +28,13 @@ import fcs_pch
 import fcs_fit
 import fcs_calib
 import fcs_plotopen
+import fcs_burst
+
+# Burst exports reopen through "Reopen Saved Plot…" like every other
+# analysis.  Registration is pushed from here rather than done on import so
+# fcs_burst keeps no dependency on fcs_plotopen; fcs_plotopen imports its
+# rebuilders lazily, on dispatch.
+fcs_burst.register(fcs_plotopen)
 # Not yet reached from any analysis task; imported so that its
 # module-level constants are present in sys.modules when
 # fcs_prefs.apply() runs below.  apply() skips absent modules
@@ -287,7 +294,7 @@ def ws_on_select(event=None):
 def task_plot_intensity():
     datasets = _selected_datasets()
     if len(datasets) >= 2:
-        params = _ask_intensity_batch(len(datasets))
+        params = _ask_intensity_batch(len(datasets), datasets)
         if params is None:
             return
         bin_width_s, mode = params
@@ -312,7 +319,7 @@ def task_plot_intensity():
     if d is None:
         _no_active_file_warning()
         return
-    bin_width_s = _ask_intensity_single()
+    bin_width_s = _ask_intensity_single(d)
     if bin_width_s is None:
         return
     fcs_plot.plot_intensity(d, bin_width_s=bin_width_s, export=export_var.get())
@@ -405,7 +412,21 @@ _batch_defaults: dict = {
     "n_bins":             4096,
     "pch_channel":        "both",
     "pch_bw_label":       None,    # filled from the PCH module default on first use
-    "intensity_bw_label": None,    # filled from the intensity module default
+    "intensity_bw_label": None,    # free text, e.g. "100 ms" or "2.5 ms";
+                                  # filled from the intensity module default
+    "burst_bw_label":     None,    # the burst view's own, finer, bin width
+}
+
+
+# Burst detection + excision settings, remembered within a session.
+# Correlation parameters are NOT here: they come from the correlation dialog
+# itself (fcs_corr.run_correlation_dialog(..., collect_only=True)), so the
+# suite has one set of correlation controls rather than a copy here that
+# drifts out of step with it.
+_burst_defaults: dict = {
+    "M":      5,
+    "F":      5.0,
+    "n_bins": 4096,
 }
 
 
@@ -426,15 +447,86 @@ def _add_output_mode_section(dialog) -> "tk.StringVar":
     return mode_var
 
 
-def _add_intensity_bin_section(dialog) -> "tk.StringVar":
-    """Add the shared intensity 'Bin width' dropdown; returns its label var."""
-    if _batch_defaults["intensity_bw_label"] is None:
-        _batch_defaults["intensity_bw_label"] = fcs_plot._DEFAULT_BIN_WIDTH_LABEL
+def _add_intensity_bin_section(dialog, duration_s: float = None,
+                               bins_prefix: str = "~",
+                               defaults_key: str = "intensity_bw_label",
+                               ) -> "tk.StringVar":
+    """Add the shared intensity 'Bin width' chooser; returns its text var.
+
+    The entry is the single source of truth and accepts any value; the preset
+    menu is a shortcut that FILLS it.  Keeping one variable avoids the classic
+    two-widget failure where the menu says one thing, the entry says another,
+    and which one wins depends on the order they happened to be touched.  It
+    works because the preset labels parse as bin widths in their own right --
+    see fcs_plot.parse_bin_width.
+
+    *duration_s*, when given, drives a live readout of the parsed width and
+    the resulting bin count, so the cost of a very fine width is visible
+    before the plot is requested rather than discovered as a hang.  It is
+    advisory only: nothing here restricts what may be entered.
+    """
+    # Which stored default this chooser reads and writes.  Burst analysis
+    # wants a far finer bin than a general intensity overview -- the whole
+    # point there is to resolve events a few ms wide -- so the two keep
+    # separate remembered values instead of overwriting each other.
+    if _batch_defaults.get(defaults_key) is None:
+        _batch_defaults[defaults_key] = fcs_plot._DEFAULT_BIN_WIDTH_LABEL
+
     frame = tk.LabelFrame(dialog, text="Bin width", padx=10, pady=6)
     frame.pack(fill="x", padx=12, pady=6)
-    bw_var = tk.StringVar(value=_batch_defaults["intensity_bw_label"])
-    tk.OptionMenu(frame, bw_var, *fcs_plot._BIN_WIDTH_OPTIONS.keys()).pack()
+
+    bw_var = tk.StringVar(value=_batch_defaults[defaults_key])
+
+    row = tk.Frame(frame)
+    row.pack(fill="x")
+    tk.Entry(row, textvariable=bw_var, width=12,
+             justify="right").pack(side="left")
+
+    # A Menubutton rather than an OptionMenu: OptionMenu insists on owning a
+    # variable of its own, which would be the second source of truth this
+    # design exists to avoid.  Here the menu only ever writes into bw_var.
+    presets_btn = tk.Menubutton(row, text="Presets ▾", relief="raised",
+                                width=9)
+    presets = tk.Menu(presets_btn, tearoff=False)
+    presets_btn.config(menu=presets)
+    for _label in fcs_plot._BIN_WIDTH_OPTIONS:
+        presets.add_command(label=_label,
+                            command=lambda l=_label: bw_var.set(l))
+    presets_btn.pack(side="left", padx=(6, 0))
+
+    info_var = tk.StringVar(value="")
+    tk.Label(frame, textvariable=info_var, font=("Helvetica", 9), fg="grey",
+             anchor="w", justify="left").pack(fill="x")
+
+    def _update_info(*_):
+        try:
+            bw = fcs_plot.parse_bin_width(bw_var.get())
+        except ValueError:
+            info_var.set("  — not a valid bin width")
+            return
+        txt = f"  = {fcs_plot._format_bin_width(bw)}"
+        if duration_s:
+            txt += f"   ·   {bins_prefix}{int(duration_s / bw):,} bins"
+        info_var.set(txt)
+
+    bw_var.trace_add("write", _update_info)
+    _update_info()
     return bw_var
+
+
+def _read_intensity_bin_section(dialog, bw_var):
+    """Parse the bin-width entry; on failure report it and return None.
+
+    Returning None rather than raising lets the caller's _ok() simply return,
+    which leaves the dialog open with the offending text still in the box for
+    the user to correct.  Closing on a bad value would discard the rest of
+    their selections along with it.
+    """
+    try:
+        return fcs_plot.parse_bin_width(bw_var.get())
+    except ValueError as e:
+        messagebox.showerror("Bin width", str(e), parent=dialog)
+        return None
 
 
 def _add_ok_cancel(dialog, on_ok, ok_text="Plot"):
@@ -447,8 +539,11 @@ def _add_ok_cancel(dialog, on_ok, ok_text="Plot"):
               pady=4).pack(side="left", padx=6)
 
 
-def _ask_intensity_single():
+def _ask_intensity_single(d=None):
     """Dialog to choose the intensity bin width for one file.
+
+    *d* is optional and used only to show the resulting bin count; the dialog
+    works without it.
 
     Returns the bin width in seconds, or None if cancelled.
     """
@@ -458,12 +553,16 @@ def _ask_intensity_single():
     dialog.grab_set()
     tk.Label(dialog, text="Intensity trace",
              font=("Helvetica", 12, "bold"), pady=8).pack()
-    bw_var = _add_intensity_bin_section(dialog)
+    bw_var = _add_intensity_bin_section(
+        dialog, getattr(d, "duration_s", None))
     result = {"bw": None}
 
     def _ok():
+        bw = _read_intensity_bin_section(dialog, bw_var)
+        if bw is None:
+            return
         _batch_defaults["intensity_bw_label"] = bw_var.get()
-        result["bw"] = fcs_plot._BIN_WIDTH_OPTIONS[bw_var.get()]
+        result["bw"] = bw
         dialog.destroy()
 
     _add_ok_cancel(dialog, _ok)
@@ -471,22 +570,34 @@ def _ask_intensity_single():
     return result["bw"]
 
 
-def _ask_intensity_batch(n: int):
-    """Dialog for a batch intensity plot.  Returns (bin_width_s, mode) or None."""
+def _ask_intensity_batch(n: int, datasets=None):
+    """Dialog for a batch intensity plot.  Returns (bin_width_s, mode) or None.
+
+    *datasets* is optional and used only to show the resulting bin count; the
+    dialog works without it.
+    """
     dialog = tk.Toplevel(root)
     dialog.title("Batch intensity — options")
     dialog.resizable(False, False)
     dialog.grab_set()
     tk.Label(dialog, text=f"Intensity — {n} files",
              font=("Helvetica", 12, "bold"), pady=8).pack()
-    bw_var   = _add_intensity_bin_section(dialog)
+    # One bin width is applied to every file in the batch, so the bin count
+    # worth showing is the worst case -- the longest file in the selection.
+    _longest = max((getattr(x, "duration_s", 0.0) or 0.0
+                    for x in (datasets or [])), default=0.0) or None
+    bw_var   = _add_intensity_bin_section(dialog, _longest,
+                                          bins_prefix="up to ~")
     mode_var = _add_output_mode_section(dialog)
     result = {"val": None}
 
     def _ok():
+        bw = _read_intensity_bin_section(dialog, bw_var)
+        if bw is None:
+            return
         _batch_defaults["intensity_bw_label"] = bw_var.get()
         _batch_defaults["mode"] = mode_var.get()
-        result["val"] = (fcs_plot._BIN_WIDTH_OPTIONS[bw_var.get()], mode_var.get())
+        result["val"] = (bw, mode_var.get())
         dialog.destroy()
 
     _add_ok_cancel(dialog, _ok)
@@ -993,12 +1104,281 @@ def task_open_plot():
     fcs_plotopen.run_open_dialog(parent=root, initialdir=init_dir)
 
 
+def _ask_burst(d):
+    """Collect every burst-analysis parameter in one dialog.
+
+    One dialog rather than four: detection has to run before the intensity,
+    lifetime and correlation outputs can be produced, so asking per output
+    would mean re-detecting three times over with no way to guarantee the
+    three answers came from the same detection.
+
+    Returns a params dict, or None if cancelled.
+    """
+    dialog = tk.Toplevel(root)
+    dialog.title("Burst detection & excision — options")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    tk.Label(dialog, text="Burst detection & excision",
+             font=("Helvetica", 12, "bold"), pady=8).pack()
+    tk.Label(dialog,
+             text="Correlation settings are asked next, in the usual "
+                  "correlation dialog.",
+             font=("Helvetica", 9), fg="grey").pack()
+
+    # ── Detection ────────────────────────────────────────────────────────
+    det = tk.LabelFrame(dialog, text="Detection", padx=10, pady=6)
+    det.pack(fill="x", padx=12, pady=6)
+
+    m_var = tk.StringVar(value=str(_burst_defaults["M"]))
+    f_var = tk.StringVar(value=f"{_burst_defaults['F']:g}")
+    for text, var in (("Photons per window, M:", m_var),
+                      ("Rate multiplier, F:", f_var)):
+        row = tk.Frame(det)
+        row.pack(fill="x", pady=1)
+        tk.Label(row, text=text, width=22, anchor="w").pack(side="left")
+        tk.Entry(row, textvariable=var, width=8,
+                 justify="right").pack(side="left")
+
+    det_info = tk.StringVar(value="")
+    tk.Label(det, textvariable=det_info, font=("Helvetica", 9), fg="grey",
+             anchor="w", justify="left", wraplength=330).pack(fill="x",
+                                                              pady=(4, 0))
+
+    n_max = max(len(getattr(d, "ch1_times_s", ())),
+                len(getattr(d, "ch2_times_s", ())))
+
+    def _update_det(*_):
+        """Show what these settings cost on pure background.
+
+        The false-alarm rate of the sliding-window criterion depends only on
+        M and F, so it can be quoted before the data is touched.  It is
+        shown rather than enforced: a permissive setting is a legitimate
+        choice when the coincidence requirement is doing the real work.
+        """
+        try:
+            M = int(float(m_var.get()))
+            F = float(f_var.get())
+            if M < 2 or F <= 0:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            det_info.set("  — M must be an integer ≥ 2 and F must be > 0")
+            return
+        p = fcs_burst.false_alarm_probability(M, F)
+        if p != p:                               # NaN: scipy unavailable
+            det_info.set("  (install scipy to see the false-alarm estimate)")
+            return
+        n_fp = fcs_burst.expected_false_windows(n_max, M, F)
+        det_info.set(
+            f"  On pure Poisson background this flags {p:.2e} of windows\n"
+            f"  — about {n_fp:,.0f} false windows in this file's "
+            f"{n_max:,} photons.\n"
+            f"  Raising M buys discrimination faster than raising F."
+        )
+
+    for _v in (m_var, f_var):
+        _v.trace_add("write", _update_det)
+    _update_det()
+
+    # ── Intensity ────────────────────────────────────────────────────────
+    bw_var = _add_intensity_bin_section(
+        dialog, getattr(d, "duration_s", None),
+        defaults_key="burst_bw_label")
+
+    # ── Lifetime ─────────────────────────────────────────────────────────
+    lt = tk.LabelFrame(dialog, text="Lifetime decay", padx=10, pady=6)
+    lt.pack(fill="x", padx=12, pady=6)
+    bins_var = tk.IntVar(value=_burst_defaults["n_bins"])
+    row = tk.Frame(lt)
+    row.pack(fill="x")
+    tk.Label(row, text="Bins:", width=10, anchor="w").pack(side="left")
+    tk.OptionMenu(row, bins_var, *fcs_lifetime._VALID_N_BINS).pack(side="left")
+
+    result = {"val": None}
+
+    def _ok():
+        try:
+            M = int(float(m_var.get()))
+            F = float(f_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Burst options",
+                                 "M and F must both be numbers.",
+                                 parent=dialog)
+            return
+        if M < 2:
+            messagebox.showerror(
+                "Burst options",
+                f"M must be at least 2 photons (got {M}); a window needs two "
+                f"photons to span any time at all.", parent=dialog)
+            return
+        if not (F > 0):
+            messagebox.showerror("Burst options",
+                                 "F must be greater than zero.",
+                                 parent=dialog)
+            return
+        bw = _read_intensity_bin_section(dialog, bw_var)
+        if bw is None:
+            return
+
+        _burst_defaults.update({"M": M, "F": F, "n_bins": bins_var.get()})
+        _batch_defaults["burst_bw_label"] = bw_var.get()
+        result["val"] = {"M": M, "F": F, "bin_width_s": bw,
+                         "n_bins": bins_var.get()}
+        dialog.destroy()
+
+    _add_ok_cancel(dialog, _ok, ok_text="Run")
+    dialog.wait_window()
+    return result["val"]
+
+
+def task_burst():
+    """
+    Detect bursts, excise the coincident ones, and produce the four outputs
+    in sequence: intensity with bursts marked, lifetime decays split burst
+    vs. burst-free, and the Ch1 × Ch2 correlation of what is left.
+
+    Active file only.  Each output is attempted independently: a failure in
+    one is reported and the remaining ones still run, because the detection
+    behind all of them is the expensive part and is already done by then.
+    """
+    d = _active_data()
+    if d is None:
+        _no_active_file_warning()
+        return
+    if getattr(d, "kind", None) == "lifetime_decay":
+        messagebox.showinfo(
+            "Not a photon record",
+            "Burst analysis needs photon arrival times.  This is an "
+            "already-binned .ifx lifetime decay.")
+        return
+
+    params = _ask_burst(d)
+    if params is None:
+        return
+    export = export_var.get()
+
+    status_set("Detecting bursts…")
+    root.update_idletasks()
+    try:
+        result = fcs_burst.analyse(d, M=params["M"], F=params["F"])
+    except Exception as e:
+        messagebox.showerror("Burst detection failed", str(e))
+        status_refresh()
+        return
+    status_set(result.summary())
+    root.update_idletasks()
+
+    if result.n_coincident == 0:
+        messagebox.showinfo(
+            "No coincident bursts",
+            "No burst was seen on both channels at once, so nothing was "
+            "excised.\n\nThe intensity trace is still plotted so the "
+            "single-channel detections can be inspected; lower F or M to "
+            "loosen detection.")
+
+    # ── 1. intensity with the bursts marked ──────────────────────────────
+    try:
+        fcs_burst.plot_intensity_bursts(
+            d, result, bin_width_s=params["bin_width_s"], export=export)
+    except Exception as e:
+        messagebox.showerror("Intensity plot failed", str(e))
+
+    # ── 2. lifetime decays, burst vs. burst-free ─────────────────────────
+    try:
+        fcs_burst.plot_burst_lifetimes(
+            d, result, n_bins=params["n_bins"], export=export)
+    except Exception as e:
+        messagebox.showerror("Lifetime plot failed", str(e))
+
+    # ── 3. correlation of the burst-free data ────────────────────
+    # Parameters come from the correlation dialog itself, not from a copy of
+    # its controls here.  fcs_burst._FORCED lists what burst excision cannot
+    # vary -- Ch1 x Ch2 multi-tau, always segmented, no full-trace G, no
+    # thinning -- and passing it as `force` disables exactly those controls
+    # at exactly those values, so the dialog shows what will actually happen
+    # rather than overriding a choice after the user has made it.
+    params = fcs_corr.run_correlation_dialog(
+        d, collect_only=True, force=dict(fcs_burst._FORCED))
+    if params is None:
+        status_set(result.summary() + "\n\n  Correlation skipped.")
+        return
+
+    try:
+        fcs_corr.require_usable_channels(d, "cross")
+    except ValueError as e:
+        messagebox.showinfo("Correlation skipped", str(e))
+        status_refresh()
+        return
+
+    # The floor correlate_clean will enforce, applied here too so the
+    # progress bar counts the segments that will actually be computed.
+    seg = fcs_burst.required_segment_s(float(params["tau_max_ms"]) * 1e-3,
+                                       float(params["seg_duration_s"]))
+    # Same arithmetic correlate_clean uses, so the bar reaches 100% exactly.
+    total_steps = sum(
+        len(fcs_corr.segment_bounds(float(lo), float(hi), seg))
+        for lo, hi in result.clean if (hi - lo) >= seg)
+    if total_steps == 0:
+        messagebox.showwarning(
+            "Nothing left to correlate",
+            f"After excision, no burst-free stretch is as long as one "
+            f"{seg:g} s segment.  Shorten the segment length, or tighten "
+            f"detection so less is removed.")
+        status_refresh()
+        return
+
+    pw = fcs_corr._ProgressWindow(root, total_steps,
+                                  title="Correlating burst-free data…")
+    cancelled = False
+
+    def _progress(completed, label):
+        nonlocal cancelled
+        if pw.cancelled():
+            cancelled = True
+            raise KeyboardInterrupt("User cancelled")
+        pw.step(completed, label)
+
+    try:
+        corr = fcs_burst.correlate_clean(d, result, params,
+                                         progress_cb=_progress)
+    except KeyboardInterrupt:
+        corr = None
+    except Exception as e:
+        pw.close()
+        messagebox.showerror("Correlation failed", str(e))
+        status_refresh()
+        return
+    finally:
+        pw.close()
+
+    if cancelled or corr is None:
+        status_set(result.summary() + "\n\n  Correlation cancelled.")
+        return
+
+    try:
+        fcs_burst.plot_burst_correlation(d, result, corr, export=export)
+    except Exception as e:
+        messagebox.showerror("Correlation plot failed", str(e))
+
+    extra = [
+        "",
+        f"  Correlation: {corr['method']}, {corr['n_segments']:,} segments "
+        f"of {corr['seg_duration_s']:g} s from "
+        f"{corr['n_regions_used']:,} burst-free regions "
+        f"({corr['T_used']:.2f} s)",
+        fcs_burst.retention_summary(corr),
+    ]
+    for note in corr.get("notes", ()):
+        extra.append(f"  ! {note}")
+    status_set(result.summary() + "\n".join(extra))
+
+
 # ── Tasks panel (right) ───────────────────────────────────────────────────────
 tasks = [
     ("Plot Intensity",              task_plot_intensity),
     ("Plot Lifetime Decay",         task_plot_lifetime),
     ("Compute Correlation",         task_correlation),
     ("Photon Counting Histogram",   task_pch),
+    ("Burst Detection & Excision",  task_burst),
     ("Model Data",                  task_model),
     ("Calibrate Volume (⟨N⟩ vs C)", task_calibrate),
     ("Reopen Saved Plot…",          task_open_plot),
