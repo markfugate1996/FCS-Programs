@@ -743,7 +743,6 @@ def run_pch_dialog(fcs_data: FCSData, export: bool = False):
 
     dialog = tk.Toplevel()
     dialog.title("PCH — options")
-    dialog.geometry("320x310")
     dialog.resizable(False, False)
     dialog.grab_set()
 
@@ -803,7 +802,15 @@ def run_pch_dialog(fcs_data: FCSData, export: bool = False):
 
     # ── Buttons ───────────────────────────────────────────────────────────────
     btn_frame = tk.Frame(dialog)
-    btn_frame.pack(pady=12)
+    btn_frame.pack(side="bottom", pady=12)
+    # [button-strip] Claim the bottom slot before anything that can grow.
+    # pack() hands out space in packing order, so a frame packed last is
+    # the one squeezed out when the content outgrows the window -- which
+    # is how action buttons end up below the bottom edge.  Re-ordering
+    # here rather than moving the code keeps the build order intact.
+    _above = [_w for _w in dialog.pack_slaves() if _w is not btn_frame]
+    if _above:
+        btn_frame.pack_configure(before=_above[0])
 
     def _on_compute():
         channel_choice  = ch_var.get()
@@ -832,6 +839,15 @@ def run_pch_dialog(fcs_data: FCSData, export: bool = False):
     tk.Button(btn_frame, text="Cancel", width=10,
               command=dialog.destroy, pady=4).pack(side="left", padx=6)
 
+    # [size-to-content] Size to what the dialog actually needs instead of a
+    # fixed height: a hard-coded height is what pushed the buttons off
+    # the bottom when the content grew.  Never smaller than the original
+    # 320x310, so a dialog deliberately given room keeps it, and never
+    # larger than the screen.
+    dialog.update_idletasks()
+    dialog.geometry("%dx%d" % (
+        min(max(320, dialog.winfo_reqwidth()),  dialog.winfo_screenwidth() - 80),
+        min(max(310, dialog.winfo_reqheight()), dialog.winfo_screenheight() - 120)))
     dialog.wait_window()
 
 

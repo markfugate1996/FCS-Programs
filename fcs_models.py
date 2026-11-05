@@ -157,6 +157,60 @@ def _g_diffusion_3d_2c_reaction(tau_s, G0, f1, tau_D1, tau_D2, tau_R, A_R, kappa
     return G0 * kin * (f1 * D1 + (1.0 - f1) * D2) + offset
 
 
+def _g_diffusion_3d_1c_triplet_aug(tau_s, G0, tau_D, kappa, alpha, T, offset):
+    """
+    Single-component 3D diffusion with a triplet term whose lifetime is tied
+    to the diffusion time:  tau_T = alpha * tau_D.
+
+        G(tau) = G0 · [1 + T/(1−T) · exp(−tau/(alpha·tau_D))] · D(tau) + offset
+
+    Mathematically identical to _g_diffusion_3d_1c_triplet under the
+    substitution tau_T -> alpha·tau_D; with both alpha and tau_D free the two
+    are exact reparameterisations of each other and give identical fits.  The
+    point of this form is that alpha can be HELD, which pins the triplet
+    lifetime to a fixed fraction of the diffusion time instead of to an
+    absolute value.
+    """
+    tau_s = np.asarray(tau_s, dtype=np.float64)
+    kk    = kappa * kappa
+    x     = tau_s / tau_D
+    D     = (1.0 / (1.0 + x)) / np.sqrt(1.0 + x / kk)
+    trip  = 1.0 + (T / (1.0 - T)) * np.exp(-tau_s / (alpha * tau_D))
+    return G0 * trip * D + offset
+
+
+def _g_diffusion_3d_2c_triplet_aug(tau_s, G0, f1, tau_D1, tau_D2, kappa,
+                                   alpha1, T1, alpha2, T2, offset):
+    """
+    Weighted sum of two augmented single-component curves, each carrying its
+    OWN triplet fraction and its own alpha:
+
+        G(tau) = G0 · [ f1·X1(tau)·D1(tau) + (1−f1)·X2(tau)·D2(tau) ] + offset
+
+        Xi(tau) = 1 + Ti/(1−Ti) · exp(−tau/(alpha_i·tau_Di))
+        Di(tau) = (1 + tau/tau_Di)^-1 · (1 + tau/(kappa^2·tau_Di))^-1/2
+
+    This differs from _g_diffusion_3d_2c_triplet, where a single triplet
+    factor multiplies the whole sum.  Here each species blinks on its own
+    timescale, so the dark-state term is inside the sum.  Consequently
+
+        G(0) = G0 · [ f1/(1−T1) + (1−f1)/(1−T2) ]
+
+    rather than G0/(1−T).  Setting T1 = T2 and alpha1·tau_D1 = alpha2·tau_D2
+    recovers the shared-triplet two-component model; setting f1 = 1 recovers
+    the augmented single-component model.
+    """
+    tau_s = np.asarray(tau_s, dtype=np.float64)
+    kk    = kappa * kappa
+    x1    = tau_s / tau_D1
+    x2    = tau_s / tau_D2
+    D1    = (1.0 / (1.0 + x1)) / np.sqrt(1.0 + x1 / kk)
+    D2    = (1.0 / (1.0 + x2)) / np.sqrt(1.0 + x2 / kk)
+    trip1 = 1.0 + (T1 / (1.0 - T1)) * np.exp(-tau_s / (alpha1 * tau_D1))
+    trip2 = 1.0 + (T2 / (1.0 - T2)) * np.exp(-tau_s / (alpha2 * tau_D2))
+    return G0 * (f1 * trip1 * D1 + (1.0 - f1) * trip2 * D2) + offset
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 _DIFFUSION_3D_1C = FCSModel(
@@ -360,12 +414,106 @@ _DIFFUSION_3D_2C_REACTION = FCSModel(
 )
 
 
+_DIFFUSION_3D_1C_AUG = FCSModel(
+    key="diffusion_3d_1comp_aug",
+    name="Augmented 3D diffusion — single component",
+    description=(
+        "Single-component 3D diffusion with a triplet (dark-state) term whose "
+        "lifetime is expressed as a fixed multiple of the diffusion time, "
+        "τT = α·τD:\n\n"
+        "    G(τ) = G0·[1 + T/(1−T)·exp(−τ/(α·τD))]·D(τ) + offset\n\n"
+        "    D(τ) = (1+τ/τD)⁻¹·(1+τ/(κ²·τD))⁻¹ᐟ²\n\n"
+        "    G0     diffusion amplitude ≈ 1/N;  G(0) = G0/(1−T)\n"
+        "    τD     diffusion time\n"
+        "    κ      structure parameter z0/w0\n"
+        "    α      dimensionless triplet/diffusion time ratio τT/τD\n"
+        "    T      triplet (dark-state) fraction  (0 ≤ T < 1)\n"
+        "    offset baseline (≈ 0)\n\n"
+        "This is the standard single-component + triplet model under the "
+        "substitution τT → α·τD.  With α free the two forms are exact "
+        "reparameterisations and fit identically; the useful case is α HELD, "
+        "which ties the blinking timescale to the diffusion timescale instead "
+        "of to an absolute value — e.g. across a dilution or viscosity series "
+        "where τD moves but the underlying ratio is taken as constant.\n\n"
+        "The product form (diffusion × triplet) assumes τT ≪ τD, i.e. α ≪ 1; "
+        "α ≈ 2e-3 corresponds to the usual τT ∼ µs against τD ∼ ms.\n\n"
+        "Reference: Widengren J, Mets U, Rigler R (1995) J Phys Chem "
+        "99:13368–13379."
+    ),
+    formula="G0·(1+T/(1−T)·e^(−τ/(ατD)))·D(τ) + offset",
+    params=[
+        Param("G0",     1.0,   0.0,    np.inf, "",  "diffusion amplitude ≈ 1/N; G(0) = G0/(1−T)"),
+        Param("tau_D",  1e-3,  1e-9,   1e2,    "s", "diffusion time"),
+        Param("kappa",  5.0,   1.0,    50.0,   "",  "structure parameter z0/w0",
+              link_default=True),
+        Param("alpha",  2e-3,  1e-9,   1.0,    "",  "triplet/diffusion time ratio  τT = α·τD",
+              link_default=True),
+        Param("T",      0.10,  0.0,    0.9999, "",  "triplet (dark-state) fraction"),
+        Param("offset", 0.0,  -np.inf, np.inf, "",  "baseline offset",
+              link_default=True),
+    ],
+    func=_g_diffusion_3d_1c_triplet_aug,
+)
+
+_DIFFUSION_3D_2C_AUG = FCSModel(
+    key="diffusion_3d_2comp_aug",
+    name="Augmented 3D diffusion — two components",
+    description=(
+        "Weighted sum of two augmented single-component curves.  Each species "
+        "carries its own triplet fraction and its own α, so each dark-state "
+        "term sits INSIDE the sum rather than multiplying it:\n\n"
+        "    G(τ) = G0·[f1·X1(τ)·D1(τ) + (1−f1)·X2(τ)·D2(τ)] + offset\n\n"
+        "    Xi(τ) = 1 + Ti/(1−Ti)·exp(−τ/(αi·τDi))\n"
+        "    Di(τ) = (1+τ/τDi)⁻¹·(1+τ/(κ²·τDi))⁻¹ᐟ²\n\n"
+        "    G0     diffusion amplitude ≈ 1/N  (N = total mean molecules);\n"
+        "           G(0) = G0·[f1/(1−T1) + (1−f1)/(1−T2)]\n"
+        "    f1     fraction of species 1  (f2 = 1 − f1)\n"
+        "    τD1    diffusion time of species 1\n"
+        "    τD2    diffusion time of species 2\n"
+        "    κ      structure parameter z0/w0  (shared — one observation volume)\n"
+        "    α1, T1 triplet ratio and fraction of species 1\n"
+        "    α2, T2 triplet ratio and fraction of species 2\n"
+        "    offset baseline (≈ 0)\n\n"
+        "Unlike the shared-triplet two-component model, this form allows the "
+        "two species to blink on different timescales — two different labels, "
+        "or one fluorophore whose dark-state kinetics change on binding.  "
+        "Setting T1 = T2 and α1·τD1 = α2·τD2 recovers the shared-triplet "
+        "model; setting f1 = 1 recovers the augmented single-component model.\n\n"
+        "As in the other triplet models, G0 is the DIFFUSION amplitude: above "
+        "both blinking timescales X1, X2 → 1 and G → G0·[f1·D1 + (1−f1)·D2], so "
+        "N = 1/G0 keeps its usual meaning.  The zero-lag value is larger, by "
+        "the f1-weighted dark-state factor written above."
+    ),
+    formula=("G0·[f1·(1+T1/(1−T1)e^(−τ/(α1τD1)))·D1(τ)"
+             " + (1−f1)·(1+T2/(1−T2)e^(−τ/(α2τD2)))·D2(τ)] + offset"),
+    params=[
+        Param("G0",     1.0,   0.0,    np.inf, "",  "diffusion amplitude ≈ 1/N (total); see description for G(0)"),
+        Param("f1",     0.5,   0.0,    1.0,    "",  "fraction of species 1  (f2 = 1−f1)"),
+        Param("tau_D1", 3e-4,  1e-9,   1e2,    "s", "diffusion time of species 1  (fast)"),
+        Param("tau_D2", 5e-3,  1e-9,   1e2,    "s", "diffusion time of species 2  (slow)"),
+        Param("kappa",  5.0,   1.0,    50.0,   "",  "structure parameter z0/w0",
+              link_default=True),
+        Param("alpha1", 2e-3,  1e-9,   1.0,    "",  "triplet/diffusion time ratio of species 1  τT1 = α1·τD1",
+              link_default=True),
+        Param("T1",     0.10,  0.0,    0.9999, "",  "triplet fraction of species 1"),
+        Param("alpha2", 2e-3,  1e-9,   1.0,    "",  "triplet/diffusion time ratio of species 2  τT2 = α2·τD2",
+              link_default=True),
+        Param("T2",     0.10,  0.0,    0.9999, "",  "triplet fraction of species 2"),
+        Param("offset", 0.0,  -np.inf, np.inf, "",  "baseline offset",
+              link_default=True),
+    ],
+    func=_g_diffusion_3d_2c_triplet_aug,
+)
+
+
 MODELS: Dict[str, FCSModel] = {
     _DIFFUSION_3D_1C.key:          _DIFFUSION_3D_1C,
     _DIFFUSION_3D_2C.key:          _DIFFUSION_3D_2C,
     _DIFFUSION_3D_1C_TRIPLET.key:  _DIFFUSION_3D_1C_TRIPLET,
     _DIFFUSION_3D_2C_TRIPLET.key:  _DIFFUSION_3D_2C_TRIPLET,
     _DIFFUSION_3D_2C_REACTION.key: _DIFFUSION_3D_2C_REACTION,
+    _DIFFUSION_3D_1C_AUG.key:      _DIFFUSION_3D_1C_AUG,
+    _DIFFUSION_3D_2C_AUG.key:      _DIFFUSION_3D_2C_AUG,
 }
 
 

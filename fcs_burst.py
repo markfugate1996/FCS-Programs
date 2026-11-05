@@ -830,53 +830,171 @@ def _burst_meta(result: BurstResult) -> dict:
 
 # ── Plot: intensity with bursts marked ────────────────────────────────────────
 
+def bins_in_burst(edges_s, bin_width_s: float, spans) -> np.ndarray:
+    """Which display bins contain burst time: bool, one per bin.
+
+    A bin counts when a burst OVERLAPS it at all, not when a burst covers
+    its centre.  Overlap is the question the picture is answering -- "is
+    there burst time in this bin?" -- and it is also what makes the live
+    figure and a reopened one agree exactly, since the reopened one has
+    only this flag to work from.
+
+    *edges_s* are the bins' left edges, as FCSData.bin_intensity returns
+    them.  *spans* must be merged and ascending, which
+    :func:`merge_intervals` guarantees; the search then has a single
+    candidate span per bin rather than needing a scan.
+    """
+    e = np.asarray(edges_s, dtype=np.float64)
+    iv = merge_intervals(spans)
+    if e.size == 0 or iv.shape[0] == 0:
+        return np.zeros(e.size, dtype=bool)
+    # First span ending strictly AFTER this bin's left edge; being disjoint
+    # and sorted, no earlier span can reach the bin and no later one can
+    # start before this one does.  Strictly after, not at: a burst that
+    # ends exactly on a bin edge belongs to the bin before it, and "at or
+    # after" would hand it to both -- which makes the operation
+    # non-idempotent, so re-snapping an already-snapped span (as happens
+    # when a figure is rebuilt from the exported bin flags) grows it by a
+    # bin every time.
+    idx = np.searchsorted(iv[:, 1], e, side="right")
+    ok = idx < iv.shape[0]
+    cand = iv[np.clip(idx, 0, iv.shape[0] - 1), 0]
+    # A bin's right edge is the NEXT bin's left edge, taken from the grid
+    # rather than computed as e + bin_width: the two differ in the last bit
+    # (0.1 + 3.4 is not 3.5), which is enough for a span starting exactly on
+    # a boundary to register against the bin before it.  Only the final bin,
+    # which has no successor, has to compute its edge.
+    right = np.empty_like(e)
+    right[:-1] = e[1:]
+    right[-1] = e[-1] + float(bin_width_s)
+    return ok & (cand < right)
+
+
+def _blocks_from_bins(edges_s, bin_width_s: float,
+                      flag: np.ndarray) -> np.ndarray:
+    """Contiguous runs of flagged bins -> (n, 2) spans on the bin grid."""
+    f = np.asarray(flag, dtype=bool)
+    if not f.any():
+        return np.empty((0, 2), dtype=np.float64)
+    e = np.asarray(edges_s, dtype=np.float64)
+    d = np.diff(f.astype(np.int8))
+    starts = np.flatnonzero(d == 1) + 1
+    ends = np.flatnonzero(d == -1)
+    if f[0]:
+        starts = np.concatenate(([0], starts))
+    if f[-1]:
+        ends = np.concatenate((ends, [f.size - 1]))
+    # Take a block's right edge from the NEXT bin's left edge rather than
+    # computing e[end] + bin_width.  The two differ in the last bit, and
+    # that is enough to push the edge a hair past the grid, so re-snapping
+    # the block would pick up the following bin -- which is exactly what
+    # happens when a figure is rebuilt from the exported bin flags.
+    bw = float(bin_width_s)
+    last = e[-1] + bw if e.size else bw
+    right = np.where(ends + 1 < e.size, e[np.minimum(ends + 1, e.size - 1)],
+                     last)
+    return np.column_stack((e[starts], right))
+
+
+def _median_width(spans) -> float:
+    """Median width of an (n, 2) interval array; 0.0 when empty."""
+    iv = np.asarray(spans, dtype=np.float64).reshape(-1, 2)
+    return float(np.median(iv[:, 1] - iv[:, 0])) if iv.shape[0] else 0.0
+
+
 def _draw_intensity_bursts(time_s, I1_cps, I2_cps, spans, bin_width_s,
-                           title, solo=None):
-    """Draw the intensity trace with burst spans shaded.
+                           title, solo=None, n_bursts=None):
+    """Draw the intensity trace with burst spans shaded at their TRUE width.
 
-    Shared by the live plot and by :func:`rebuild_plot`, so a reopened
-    figure is drawn by the same code that drew the original rather than by
-    a second renderer that can drift away from it.
+    Shared by the live plot and :func:`rebuild_plot`, so a reopened figure
+    is drawn by the same code that drew the original rather than by a
+    second renderer that can drift away from it.
 
-    *spans* is an (n, 2) array of burst intervals; *solo* maps a channel
-    number to the midpoints of its rejected single-channel detections, and
-    is absent on a reopen because the CSV records only what survived.
+    Shading is quantised to the DISPLAY BIN: a bin is shaded whenever any
+    burst overlaps it.  Bursts are found at photon-time resolution and are
+    routinely much shorter than one bin, so shading them at true width
+    draws structure the trace above cannot resolve -- one smooth hump over
+    several slabs separated by slivers of white, with nothing to tell a
+    reader which of the two is the real picture.  At the bin grid the two
+    always agree, and the quantisation is stated in the legend rather than
+    left to be discovered.
+
+    An earlier version instead padded every span to a fixed minimum width
+    of duration/2000, which is a different thing and simply wrong: it made
+    a 0.06 ms burst and a 17 ms burst look identical, and it pushed
+    disjoint bursts into each other so they appeared as overlapping blocks
+    of stacked alpha that the merged burst list flatly contradicted.
+
+    True widths are not lost.  The rug of ticks along the bottom marks
+    every burst at its real centre, and the legend and title quote the
+    median and maximum width, which stay exact at any bin size.
+
+    *time_s* is the LEFT EDGE of each bin, as FCSData.bin_intensity and the
+    exported CSV both give it.  The trace is drawn at bin CENTRES instead,
+    because a bin labelled 218.5 holds the photons of [218.5, 218.6) and
+    plotting its value at 218.5 puts the apex of a spike up to a whole bin
+    to the left of the photons that caused it.  On a plain intensity plot
+    that shift is invisible -- the whole trace moves together -- but here
+    it misregisters the trace against burst spans, which are in true photon
+    time, and makes correct shading look displaced.
+
+    *spans* is an (n, 2) array of burst intervals, already merged and so
+    non-overlapping; *solo* maps a channel number to the midpoints of its
+    rejected single-channel detections, and is absent on a reopen because
+    the CSV records only what survived.
     """
     import matplotlib.pyplot as plt
     import matplotlib.ticker as ticker
+    from matplotlib.transforms import blended_transform_factory
 
     time_s = np.asarray(time_s, dtype=np.float64)
+    centre_s = time_s + 0.5 * float(bin_width_s)
     fig, ax = plt.subplots(figsize=(11, 5))
     for arr, colour, label in ((I1_cps, "steelblue", "Ch1"),
                                (I2_cps, "tomato", "Ch2")):
         if arr is None or not np.isfinite(np.asarray(arr)).any():
             continue
-        ax.plot(time_s, arr, color=colour, linewidth=0.8, label=label,
+        ax.plot(centre_s, arr, color=colour, linewidth=0.8, label=label,
                 alpha=0.9)
 
-    # At typical burst widths a span is far narrower than one pixel, so a
-    # minimum visual width is enforced -- the alternative is a figure that
-    # truthfully shows nothing at all.
-    spans = np.asarray(spans, dtype=np.float64).reshape(-1, 2)
-    if time_s.size:
-        min_vis = max(bin_width_s, (time_s[-1] - time_s[0]) / 2000.0)
-    else:
-        min_vis = bin_width_s
-    for k, (lo, hi) in enumerate(spans):
-        pad = max(0.0, (min_vis - (hi - lo)) / 2.0)
-        ax.axvspan(lo - pad, hi + pad, color="goldenrod", alpha=0.35,
-                   linewidth=0,
-                   label="coincident burst" if k == 0 else None)
+    # y in axes fraction, x in data: rug marks stay put when the y axis is
+    # rescaled from the plot-controls panel.
+    trans = blended_transform_factory(ax.transData, ax.transAxes)
 
-    # Rejected single-channel detections as a rug tick: the reader needs to
-    # see how many there were to judge whether the coincidence requirement
-    # is doing real work.  At permissive (M, F) there can be thousands, so
-    # these arrive pre-computed by one vectorised test, not a loop.
-    for ch, colour in ((1, "navy"), (2, "darkred")):
+    spans = np.asarray(spans, dtype=np.float64).reshape(-1, 2)
+    if spans.shape[0]:
+        widths = spans[:, 1] - spans[:, 0]
+        # Shade whole bins.  Bursts are found at photon-time resolution and
+        # are routinely far shorter than one display bin, so drawing them at
+        # true width puts structure on the figure that the trace above it
+        # cannot possibly show: one smooth hump over a handful of slabs and
+        # slivers, with no way to tell which is the real picture.  Snapping
+        # to the bin grid keeps the two at the same resolution, and the true
+        # widths are reported in the legend where a number stays exact.
+        blocks = _blocks_from_bins(
+            time_s, bin_width_s,
+            bins_in_burst(time_s, bin_width_s, spans))
+        for lo, hi in blocks:
+            ax.axvspan(lo, hi, color="goldenrod", alpha=0.35, linewidth=0)
+        centres = 0.5 * (spans[:, 0] + spans[:, 1])
+        count = (f"{n_bursts:,} bursts" if n_bursts is not None
+                 else f"{spans.shape[0]:,} burst regions")
+        ax.plot(centres, np.full(centres.size, 0.012), transform=trans,
+                linestyle="none", marker="|", markersize=8,
+                color="darkgoldenrod", alpha=0.9,
+                label=(f"burst ({count}, median {_fmt_ms(np.median(widths))}, "
+                       f"max {_fmt_ms(widths.max())}; shaded to the "
+                       f"{_fmt_ms(bin_width_s)} bin)"))
+
+    # Rejected single-channel detections, so the reader can see how much
+    # work the coincidence requirement is doing.  At permissive (M, F)
+    # there can be thousands, so these arrive pre-computed by one
+    # vectorised test rather than a per-interval loop.
+    for ch, colour, y in ((1, "navy", 0.985), (2, "darkred", 0.955)):
         xs = np.asarray((solo or {}).get(ch, ()), dtype=np.float64)
         if xs.size == 0:
             continue
-        ax.plot(xs, np.full(xs.size, ax.get_ylim()[1]), linestyle="none",
+        ax.plot(xs, np.full(xs.size, y), transform=trans, linestyle="none",
                 marker="|", markersize=5, color=colour, alpha=0.5,
                 label=f"Ch{ch} only, rejected ({xs.size:,})")
 
@@ -889,13 +1007,25 @@ def _draw_intensity_bursts(time_s, I1_cps, I2_cps, spans, bin_width_s,
         combined = np.concatenate(finite)
         ax.set_ylim(0, max(np.nanpercentile(combined, 99.9) * 1.25, 1.0))
     if time_s.size:
-        ax.set_xlim(time_s[0], time_s[-1])
+        # Edge to edge of the binned record, not centre to centre: the last
+        # bin's photons run to its right edge.
+        ax.set_xlim(time_s[0], time_s[-1] + float(bin_width_s))
     ax.yaxis.set_major_formatter(
         ticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
     ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
     ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
     fig.tight_layout()
     return fig, ax
+
+
+def _fmt_ms(seconds: float) -> str:
+    """A duration in the unit that reads naturally at its size."""
+    s = float(seconds)
+    if s < 1e-3:
+        return f"{s * 1e6:.3g} \u00b5s"
+    if s < 1.0:
+        return f"{s * 1e3:.3g} ms"
+    return f"{s:.3g} s"
 
 
 def plot_intensity_bursts(
@@ -939,15 +1069,17 @@ def plot_intensity_bursts(
         title=(f"Intensity with burst detection — {d.filepath.name}\n"
                f"bin {fcs_plot._format_bin_width(bin_width_s)}  ·  "
                f"M = {result.M}, F = {result.F:g}  ·  "
-               f"{result.n_coincident:,} coincident bursts"),
-        solo=solo)
+               f"{result.n_coincident:,} coincident bursts"
+               + (f", {_fmt_ms(_median_width(result.coincident))} median"
+                  if result.n_coincident else "")),
+        solo=solo, n_bursts=result.n_coincident)
 
     if export:
-        in_burst_bin = np.zeros(time_s.size, dtype=np.float64)
-        if result.coincident.size:
-            centres = time_s + 0.5 * bin_width_s
-            in_burst_bin = photons_in_intervals(
-                centres, result.coincident).astype(np.float64)
+        # The same overlap rule the figure shades with, so a reopened plot
+        # is identical to the live one.  A centre-based test would differ
+        # by up to a bin on every burst.
+        in_burst_bin = bins_in_burst(
+            time_s, bin_width_s, result.coincident).astype(np.float64)
         meta = dict(_burst_meta(result))
         meta["bin_width_s"] = f"{bin_width_s:.6g}"
         # The keys fcs_plot's intensity rebuilder reads, so this file is

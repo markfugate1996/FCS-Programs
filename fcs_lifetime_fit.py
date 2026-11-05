@@ -1347,7 +1347,6 @@ def _lifetime_window_dialog(parent, datasets: list, on_done, on_back=None,
 
     win = tk.Toplevel(parent)
     win.title("Lifetime global fit — fit window")
-    win.geometry("980x680")
     win.minsize(760, 560)
     win.grab_set()
 
@@ -1519,7 +1518,15 @@ def _lifetime_window_dialog(parent, datasets: list, on_done, on_back=None,
              justify="left").pack(fill="x", padx=16)
 
     btns = tk.Frame(win)
-    btns.pack(pady=8)
+    btns.pack(side="bottom", pady=8)
+    # [button-strip] Claim the bottom slot before anything that can grow.
+    # pack() hands out space in packing order, so a frame packed last is
+    # the one squeezed out when the content outgrows the window -- which
+    # is how action buttons end up below the bottom edge.  Re-ordering
+    # here rather than moving the code keeps the build order intact.
+    _above = [_w for _w in win.pack_slaves() if _w is not btns]
+    if _above:
+        btns.pack_configure(before=_above[0])
 
     def _next():
         try:
@@ -1571,6 +1578,15 @@ def _lifetime_window_dialog(parent, datasets: list, on_done, on_back=None,
               pady=4).pack(side="left", padx=6)
     tk.Button(btns, text="Cancel", width=10, command=_cancel,
               pady=4).pack(side="left", padx=6)
+    # [size-to-content] Size to what the dialog actually needs instead of a
+    # fixed height: a hard-coded height is what pushed the buttons off
+    # the bottom when the content grew.  Never smaller than the original
+    # 980x680, so a dialog deliberately given room keeps it, and never
+    # larger than the screen.
+    win.update_idletasks()
+    win.geometry("%dx%d" % (
+        min(max(980, win.winfo_reqwidth()),  win.winfo_screenwidth() - 80),
+        min(max(680, win.winfo_reqheight()), win.winfo_screenheight() - 120)))
     win.wait_window()
 
 
@@ -2359,7 +2375,6 @@ def _lifetime_csv_dialog(parent, fcs_data, on_done):
 
     win = tk.Toplevel(parent)
     win.title("Lifetime fit — saved decay")
-    win.geometry("620x430")
     win.minsize(520, 360)
     win.grab_set()
 
@@ -2483,7 +2498,15 @@ def _lifetime_csv_dialog(parent, fcs_data, on_done):
               pady=3).pack(side="left", padx=6)
 
     btns = tk.Frame(win)
-    btns.pack(pady=8)
+    btns.pack(side="bottom", pady=8)
+    # [button-strip] Claim the bottom slot before anything that can grow.
+    # pack() hands out space in packing order, so a frame packed last is
+    # the one squeezed out when the content outgrows the window -- which
+    # is how action buttons end up below the bottom edge.  Re-ordering
+    # here rather than moving the code keeps the build order intact.
+    _above = [_w for _w in win.pack_slaves() if _w is not btns]
+    if _above:
+        btns.pack_configure(before=_above[0])
 
     def _next():
         d = _current()
@@ -2507,6 +2530,15 @@ def _lifetime_csv_dialog(parent, fcs_data, on_done):
               pady=4).pack(side="left", padx=6)
 
     _populate()
+    # [size-to-content] Size to what the dialog actually needs instead of a
+    # fixed height: a hard-coded height is what pushed the buttons off
+    # the bottom when the content grew.  Never smaller than the original
+    # 620x430, so a dialog deliberately given room keeps it, and never
+    # larger than the screen.
+    win.update_idletasks()
+    win.geometry("%dx%d" % (
+        min(max(620, win.winfo_reqwidth()),  win.winfo_screenwidth() - 80),
+        min(max(430, win.winfo_reqheight()), win.winfo_screenheight() - 120)))
     win.wait_window()
 
 def _photon_dataset(f, channel: int, n_bins: int) -> dict:
@@ -2866,7 +2898,6 @@ def _select_lifetime_model_dialog(parent, on_choose, on_back=None,
 
     win = tk.Toplevel(parent)
     win.title("Lifetime fit — select model")
-    win.geometry("525x380")
     win.minsize(440, 340)
     win.resizable(True, True)
     win.grab_set()
@@ -2900,7 +2931,15 @@ def _select_lifetime_model_dialog(parent, on_choose, on_back=None,
     _refresh_desc()
 
     btns = tk.Frame(win)
-    btns.pack(pady=8)
+    btns.pack(side="bottom", pady=8)
+    # [button-strip] Claim the bottom slot before anything that can grow.
+    # pack() hands out space in packing order, so a frame packed last is
+    # the one squeezed out when the content outgrows the window -- which
+    # is how action buttons end up below the bottom edge.  Re-ordering
+    # here rather than moving the code keeps the build order intact.
+    _above = [_w for _w in win.pack_slaves() if _w is not btns]
+    if _above:
+        btns.pack_configure(before=_above[0])
 
     def _next():
         m = fcs_models.get_lifetime_model(key_var.get())
@@ -2914,6 +2953,15 @@ def _select_lifetime_model_dialog(parent, on_choose, on_back=None,
     tk.Button(btns, text="Next →", width=12, command=_next, pady=4).pack(side="left", padx=6)
     tk.Button(btns, text="Cancel", width=10, command=win.destroy, pady=4).pack(side="left", padx=6)
 
+    # [size-to-content] Size to what the dialog actually needs instead of a
+    # fixed height: a hard-coded height is what pushed the buttons off
+    # the bottom when the content grew.  Never smaller than the original
+    # 525x380, so a dialog deliberately given room keeps it, and never
+    # larger than the screen.
+    win.update_idletasks()
+    win.geometry("%dx%d" % (
+        min(max(525, win.winfo_reqwidth()),  win.winfo_screenwidth() - 80),
+        min(max(380, win.winfo_reqheight()), win.winfo_screenheight() - 120)))
     win.wait_window()
 
 
