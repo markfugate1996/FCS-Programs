@@ -271,7 +271,8 @@ def ws_on_select(event=None):
             f"{len(keys)} files selected for batch:\n"
             f"{'─' * 44}\n"
             f"{listed}\n\n"
-            f"Click 'Compute Correlation' to run each in turn."
+            f"Click a batch-capable task — Intensity, Lifetime, "
+            f"Correlation, PCH or Burst Detection — to run each in turn."
         )
         return
 
@@ -427,6 +428,18 @@ _burst_defaults: dict = {
     "M":      5,
     "F":      5.0,
     "n_bins": 4096,
+    # Batch choices, remembered like the rest.  The defaults make a batch
+    # produce exactly ONE figure: with the intensity and lifetime views on,
+    # twenty files would open sixty windows, each its own Tk interpreter
+    # under the TkAgg backend, which is how a batch stops being usable
+    # rather than merely slow.  Nothing is lost by leaving them off -- the
+    # per-file CSVs are still written, and any file can be plotted on its
+    # own afterwards.
+    "do_intensity":   False,
+    "do_lifetime":    False,
+    "do_correlation": True,
+    "show_per_file":  False,
+    "overlay":        True,
 }
 
 
@@ -1104,7 +1117,7 @@ def task_open_plot():
     fcs_plotopen.run_open_dialog(parent=root, initialdir=init_dir)
 
 
-def _ask_burst(d):
+def _ask_burst(d, n_files: int = 1):
     """Collect every burst-analysis parameter in one dialog.
 
     One dialog rather than four: detection has to run before the intensity,
@@ -1112,18 +1125,29 @@ def _ask_burst(d):
     would mean re-detecting three times over with no way to guarantee the
     three answers came from the same detection.
 
-    Returns a params dict, or None if cancelled.
+    With *n_files* >= 2 the same dialog also chooses which outputs the batch
+    produces and which figures it opens, and *d* is the first file of the
+    selection -- used only to populate the readouts, since one set of
+    settings is applied to every file.
+
+    Returns a params dict, or None if cancelled.  The dict always carries the
+    batch keys; a single-file run gets the values that reproduce its old
+    behaviour (all three outputs, each shown, no overlay).
     """
+    batch = n_files >= 2
     dialog = tk.Toplevel(root)
     dialog.title("Burst detection & excision — options")
     dialog.resizable(False, False)
     dialog.grab_set()
-    tk.Label(dialog, text="Burst detection & excision",
+    tk.Label(dialog, text="Burst detection & excision"
+                          + (f" — {n_files} files" if batch else ""),
              font=("Helvetica", 12, "bold"), pady=8).pack()
     tk.Label(dialog,
-             text="Correlation settings are asked next, in the usual "
-                  "correlation dialog.",
-             font=("Helvetica", 9), fg="grey").pack()
+             text=(("Settings are applied to every file.  " if batch else "")
+                   + "Correlation settings are asked next, in the usual "
+                     "correlation dialog."),
+             font=("Helvetica", 9), fg="grey", wraplength=340,
+             justify="center").pack()
 
     # ── Detection ────────────────────────────────────────────────────────
     det = tk.LabelFrame(dialog, text="Detection", padx=10, pady=6)
@@ -1170,7 +1194,8 @@ def _ask_burst(d):
         n_fp = fcs_burst.expected_false_windows(n_max, M, F)
         det_info.set(
             f"  On pure Poisson background this flags {p:.2e} of windows\n"
-            f"  — about {n_fp:,.0f} false windows in this file's "
+            f"  — about {n_fp:,.0f} false windows in "
+            f"{'the first file' if batch else 'this file'}'s "
             f"{n_max:,} photons.\n"
             f"  Raising M buys discrimination faster than raising F."
         )
@@ -1192,6 +1217,41 @@ def _ask_burst(d):
     row.pack(fill="x")
     tk.Label(row, text="Bins:", width=10, anchor="w").pack(side="left")
     tk.OptionMenu(row, bins_var, *fcs_lifetime._VALID_N_BINS).pack(side="left")
+
+    # ── What a batch produces ────────────────────────────────────────────
+    flag_vars: dict = {}
+    if batch:
+        outs = tk.LabelFrame(dialog, text="Outputs per file", padx=10, pady=6)
+        outs.pack(fill="x", padx=12, pady=6)
+        for key, text in (
+                ("do_intensity",   "Intensity trace with bursts marked"),
+                ("do_lifetime",    "Lifetime decays, burst vs. burst-free"),
+                ("do_correlation", "Burst-free Ch1 × Ch2 correlation"),
+        ):
+            flag_vars[key] = tk.BooleanVar(value=_burst_defaults[key])
+            tk.Checkbutton(outs, text=text, variable=flag_vars[key],
+                           anchor="w").pack(fill="x")
+        tk.Label(outs,
+                 text="An unticked output is not computed at all; detection "
+                      "itself runs once either way.",
+                 font=("Helvetica", 9), fg="grey", anchor="w",
+                 justify="left", wraplength=330).pack(fill="x", pady=(2, 0))
+
+        figs = tk.LabelFrame(dialog, text="Figures", padx=10, pady=6)
+        figs.pack(fill="x", padx=12, pady=6)
+        for key, text in (
+                ("show_per_file", "Open each file's own figures"),
+                ("overlay",       "Overlay the burst-free curves on one figure"),
+        ):
+            flag_vars[key] = tk.BooleanVar(value=_burst_defaults[key])
+            tk.Checkbutton(figs, text=text, variable=flag_vars[key],
+                           anchor="w").pack(fill="x")
+        tk.Label(figs,
+                 text=("Per-file CSVs are written either way, so a file left "
+                       "unplotted can still be reopened later.  With both "
+                       "unticked the batch opens no window at all."),
+                 font=("Helvetica", 9), fg="grey", anchor="w",
+                 justify="left", wraplength=330).pack(fill="x", pady=(2, 0))
 
     result = {"val": None}
 
@@ -1219,15 +1279,456 @@ def _ask_burst(d):
         if bw is None:
             return
 
+        out = {"M": M, "F": F, "bin_width_s": bw,
+               "n_bins": bins_var.get(),
+               # A single-file run behaves exactly as it always has: all
+               # three outputs, each shown, no overlay to make.
+               "do_intensity":   True,
+               "do_lifetime":    True,
+               "do_correlation": True,
+               "show_per_file":  True,
+               "overlay":        False}
+        if batch:
+            out.update({k: bool(v.get()) for k, v in flag_vars.items()})
+            if not (out["do_intensity"] or out["do_lifetime"]
+                    or out["do_correlation"]):
+                messagebox.showerror(
+                    "Burst options",
+                    "Nothing to produce: tick at least one output.",
+                    parent=dialog)
+                return
+            if (out["do_correlation"] and not out["overlay"]
+                    and not out["show_per_file"]):
+                # Legitimate -- the curves are still exported -- but it is
+                # also what two accidentally-cleared boxes look like, and a
+                # batch that opens no window cannot be told from one that
+                # quietly failed.  Same reasoning as _confirm_batch_export.
+                if not messagebox.askokcancel(
+                        "No correlation figures",
+                        "The burst-free curves will be computed and "
+                        "exported, but no figure will be opened for them.\n\n"
+                        "Continue?", parent=dialog):
+                    return
+            _burst_defaults.update({k: out[k] for k in flag_vars})
         _burst_defaults.update({"M": M, "F": F, "n_bins": bins_var.get()})
         _batch_defaults["burst_bw_label"] = bw_var.get()
-        result["val"] = {"M": M, "F": F, "bin_width_s": bw,
-                         "n_bins": bins_var.get()}
+        result["val"] = out
         dialog.destroy()
 
-    _add_ok_cancel(dialog, _ok, ok_text="Run")
+    _add_ok_cancel(dialog, _ok, ok_text="Run batch" if batch else "Run")
+    # The batch frames push this dialog past the height of a laptop screen on
+    # the smaller displays, which would put the Run button out of reach.
+    try:
+        import fcs_fitcommon
+        fcs_fitcommon.fit_dialog_to_screen(dialog)
+    except Exception:       # noqa: BLE001 - sizing must never block the run
+        pass
     dialog.wait_window()
     return result["val"]
+
+
+def _burst_batch_header() -> list:
+    """Column titles for the batch summary, in write order."""
+    return [
+        "file", "duration_s", "M", "F",
+        "n_photons_ch1", "n_photons_ch2",
+        "threshold_ch1_hz", "threshold_ch2_hz",
+        "n_bursts_ch1", "n_bursts_ch2", "n_coincident",
+        "excised_time_ms", "excised_fraction_pct",
+        "photons_removed_ch1", "photons_removed_ch2",
+        "n_clean_regions", "clean_time_s",
+        "n_segs", "segment_duration_s", "n_regions_used",
+        "n_regions_dropped", "T_used_s",
+        "photons_used_ch1", "photons_used_ch2",
+        "used_fraction_ch1_pct", "used_fraction_ch2_pct",
+        "status",
+    ]
+
+
+def _plot_unseen(make, show: bool):
+    """
+    Run one plot call inside a batch and leave no unseen figure behind.
+
+    With ``show=False`` the burst plotters return their figure WITHOUT
+    closing it: under the TkAgg backend each one is a live canvas with its
+    own Tk interpreter, so a forty-file sweep would leave forty of them for
+    the garbage collector to find whenever it got round to it.
+
+    Figures are closed by NUMBER, by difference, rather than through the
+    returned handle -- that way a plotter which raised half-way through
+    still has its part-built figure cleaned up, which is exactly the case a
+    long batch can least afford to leak.  Nothing is closed when the figures
+    were asked for.
+    """
+    import matplotlib.pyplot as plt
+    before = set(plt.get_fignums())
+    try:
+        return make()
+    finally:
+        if not show:
+            for num in set(plt.get_fignums()) - before:
+                plt.close(num)
+
+
+def _burst_batch_row(d, params: dict, result, corr, status: str) -> list:
+    """
+    One summary row: detection on the left, correlation on the right.
+
+    *result* is None when detection itself failed and *corr* is None whenever
+    no curve was produced -- correlation switched off, skipped, cancelled or
+    failed.  Those cells are NaN, which params_cell writes as BLANK, so
+    scanning a column shows at a glance which files produced what while
+    `status` carries the reason.  Zero would have been a lie: no file has
+    "0 segments", it has none.
+    """
+    nan = float("nan")
+
+    def _cb(cb, attr):
+        """One channel's detection statistic, NaN for an absent channel."""
+        return getattr(cb, attr) if cb is not None else nan
+
+    row = [d.filepath.name, float(getattr(d, "duration_s", nan)),
+           params["M"], params["F"]]
+
+    if result is None:
+        row += [nan] * 13
+    else:
+        excised = result.burst_time_s
+        row += [
+            _cb(result.ch1, "n_photons"), _cb(result.ch2, "n_photons"),
+            _cb(result.ch1, "threshold_hz"), _cb(result.ch2, "threshold_hz"),
+            _cb(result.ch1, "n_bursts"), _cb(result.ch2, "n_bursts"),
+            result.n_coincident,
+            excised * 1e3,
+            (100.0 * excised / result.duration_s) if result.duration_s else nan,
+            int(result.ch1_excised.sum()) if result.ch1_excised.size else 0,
+            int(result.ch2_excised.sum()) if result.ch2_excised.size else 0,
+            len(result.clean), result.clean_time_s,
+        ]
+
+    if corr is None:
+        row += [nan] * 9
+    else:
+        used1, used2 = corr.get("n_used_ch1", nan), corr.get("n_used_ch2", nan)
+        tot1, tot2 = corr.get("n_ch1_total"), corr.get("n_ch2_total")
+        row += [
+            corr["n_segs"], corr["seg_duration_s"],
+            corr["n_regions_used"], corr["n_regions_dropped"],
+            corr["T_used"], used1, used2,
+            (100.0 * used1 / tot1) if tot1 else nan,
+            (100.0 * used2 / tot2) if tot2 else nan,
+        ]
+
+    row.append(status)
+    return row
+
+
+def _write_burst_batch_summary(datasets, params: dict, corr_params, rows):
+    """
+    Write the batch summary as a CSV plus an .xlsx mirror.
+
+    One row per SELECTED file, including the ones that produced nothing, so
+    the table accounts for the whole run rather than only its successes.  It
+    goes beside the first file of the batch; the per-file exports stay in
+    each file's own analysis folder, as they do in a single-file run.  The
+    name carries a timestamp because a sweep is usually run more than once
+    while settings are being tuned, and silently overwriting the previous
+    answer is how a comparison gets lost.
+    """
+    from datetime import datetime
+    import fcs_export
+    import fcs_fitcommon
+
+    header = _burst_batch_header()
+    for r in rows:                      # cheap guard against column drift
+        if len(r) != len(header):
+            raise ValueError(f"summary row has {len(r)} cells, "
+                             f"header has {len(header)}")
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    csv_path = (fcs_export.analysis_dir(datasets[0])
+                / f"burst_batch_summary_{stamp}.csv")
+
+    comments = [
+        "analysis : burst batch summary",
+        f"generated : {stamp}",
+        f"n_files : {len(rows)}",
+        f"burst_M_photons : {params['M']}",
+        f"burst_F_multiplier : {params['F']}",
+    ]
+    if corr_params is not None:
+        comments += [
+            f"correlation_method : {corr_params.get('method')}",
+            f"tau_min_ms : {corr_params.get('tau_min_ms')}",
+            f"tau_max_ms : {corr_params.get('tau_max_ms')}",
+            "correlation_type : cross (Ch1 x Ch2, forced by burst excision)",
+            f"segment_duration_requested_s : "
+            f"{corr_params.get('seg_duration_s')}",
+        ]
+    else:
+        comments.append("correlation : not run in this batch")
+    comments += [
+        "note_location : written beside the first file of the batch; each "
+        "file's own curves and burst list stay in its own analysis folder",
+        "note_excised : excised_* and photons_removed_* describe the "
+        "COINCIDENT bursts actually removed, not every single-channel "
+        "detection",
+        "note_used : photons_used_* are the photons that reached the "
+        "correlation; the shortfall from n_photons_* is excision plus clean "
+        "stretches too short to hold one segment",
+        "note_blank : a blank cell means the quantity was never produced for "
+        "that file -- status says why",
+    ]
+    return fcs_fitcommon.write_params_table(
+        csv_path, comments, header, rows,
+        log_tag="burst batch", sheet_title="burst batch summary")
+
+
+def _burst_batch_correlate(d, result, corr_params: dict, show: bool,
+                           export: bool, i: int, total: int):
+    """
+    One file's burst-free correlation inside a batch.
+
+    Mirrors the single-file path exactly -- same channel check, same segment
+    floor, same progress window with a Cancel button -- but reports a problem
+    by RETURNING a note for the summary instead of raising a message box, so
+    a long run is never left waiting on a click.  Cancel is the one
+    exception: it came from the user, who is therefore present, so it may ask
+    whether to stop the rest of the batch.
+
+    Returns ``(corr or None, note or None, stop)``.
+    """
+    try:
+        fcs_corr.require_usable_channels(d, "cross")
+    except ValueError as e:
+        return None, f"correlation skipped: {e}", False
+
+    # The floor correlate_clean will enforce, applied here too so the bar
+    # counts the segments that will actually be computed.
+    seg = fcs_burst.required_segment_s(float(corr_params["tau_max_ms"]) * 1e-3,
+                                       float(corr_params["seg_duration_s"]))
+    total_steps = sum(
+        len(fcs_corr.segment_bounds(float(lo), float(hi), seg))
+        for lo, hi in result.clean if (hi - lo) >= seg)
+    if total_steps == 0:
+        return None, (f"nothing left to correlate: no burst-free stretch as "
+                      f"long as one {seg:g} s segment"), False
+
+    pw = fcs_corr._ProgressWindow(
+        root, total_steps,
+        title=f"Correlating burst-free data — file {i} of {total}…")
+    cancelled = False
+
+    def _progress(completed, label):
+        nonlocal cancelled
+        if pw.cancelled():
+            cancelled = True
+            raise KeyboardInterrupt("User cancelled")
+        pw.step(completed, label)
+
+    try:
+        corr = fcs_burst.correlate_clean(d, result, corr_params,
+                                         progress_cb=_progress)
+    except KeyboardInterrupt:
+        corr = None
+    except Exception as e:
+        return None, f"correlation failed: {e}", False
+    finally:
+        pw.close()
+
+    if cancelled or corr is None:
+        stop = bool(messagebox.askyesno(
+            "Burst batch",
+            f"Correlation cancelled for {d.filepath.name}.\n\n"
+            f"Stop the whole batch?\n\n"
+            f"Yes\t— stop now and write the summary\n"
+            f"No\t— skip this file and carry on",
+            parent=root))
+        return None, "correlation cancelled", stop
+
+    try:
+        _plot_unseen(lambda: fcs_burst.plot_burst_correlation(
+            d, result, corr, show=show, export=export), show)
+    except Exception as e:
+        # The curve itself is good -- it still belongs in the overlay and the
+        # summary -- so report the drawing failure and keep it.
+        return corr, f"correlation plot failed: {e}", False
+
+    return corr, None, False
+
+
+def _task_burst_batch(datasets):
+    """
+    Burst detection, excision and correlation across a selection of files.
+
+    Settings are collected ONCE -- detection in :func:`_ask_burst`,
+    correlation in the correlation dialog itself -- and applied unchanged to
+    every file, which is what makes the curves comparable and lets the run
+    proceed unattended.
+
+    Nothing blocks mid-run.  A file with no coincident burst, no clean stretch
+    long enough to segment, or an outright failure contributes a row to the
+    summary with the reason in its ``status`` column, and the batch moves on;
+    the single-file task's message boxes would otherwise need dismissing once
+    per file, which is the one-by-one work this exists to remove.
+    """
+    usable, rows = [], []
+    for d in datasets:
+        if getattr(d, "kind", None) == "lifetime_decay":
+            # An .ifx decay has no arrival times to detect bursts in.  It is
+            # recorded as a row rather than dropped, so the summary accounts
+            # for every file that was selected.
+            rows.append([d.filepath.name] + [float("nan")] * 25
+                        + ["skipped: already-binned lifetime decay, "
+                           "no photon arrival times"])
+        else:
+            usable.append(d)
+
+    if not usable:
+        messagebox.showinfo(
+            "Not photon records",
+            "Burst analysis needs photon arrival times, and every selected "
+            "file is an already-binned .ifx lifetime decay.")
+        return
+
+    params = _ask_burst(usable[0], n_files=len(usable))
+    if params is None:
+        return
+    if not _confirm_batch_export(len(usable), "burst analysis"):
+        status_refresh()
+        return
+    export = export_var.get()
+
+    # Correlation parameters come from the correlation dialog itself, asked
+    # once.  fcs_burst._FORCED disables exactly the controls excision cannot
+    # vary, at exactly the values it needs, so the dialog shows what will
+    # actually happen for every file in the batch.
+    corr_params = None
+    if params["do_correlation"]:
+        corr_params = fcs_corr.run_correlation_dialog(
+            usable[0], collect_only=True, force=dict(fcs_burst._FORCED))
+        if corr_params is None:
+            if not (params["do_intensity"] or params["do_lifetime"]):
+                status_refresh()       # correlation was the only output
+                return
+            params = {**params, "do_correlation": False, "overlay": False}
+
+    total = len(usable)
+    overlay_results, failures = [], []
+    show = params["show_per_file"]
+    stopped_at = None
+
+    for i, d in enumerate(usable, 1):
+        if stopped_at is not None:
+            rows.append(_burst_batch_row(d, params, None, None,
+                                         "not run: batch stopped"))
+            continue
+
+        status_set(f"Burst batch — file {i} of {total}:\n{d.filepath.name}")
+        root.update_idletasks()
+
+        try:
+            result = fcs_burst.analyse(d, M=params["M"], F=params["F"])
+        except Exception as e:
+            failures.append(f"{d.filepath.name}: detection failed — {e}")
+            rows.append(_burst_batch_row(d, params, None, None,
+                                         f"error: detection failed: {e}"))
+            continue
+
+        notes = []
+        if result.n_coincident == 0:
+            # Worth recording per file: with nothing excised the "burst-free"
+            # correlation is simply the correlation of the whole record.
+            notes.append("no coincident bursts (nothing excised)")
+
+        if params["do_intensity"]:
+            try:
+                _plot_unseen(lambda: fcs_burst.plot_intensity_bursts(
+                    d, result, bin_width_s=params["bin_width_s"],
+                    show=show, export=export), show)
+            except Exception as e:
+                failures.append(f"{d.filepath.name}: intensity — {e}")
+                notes.append(f"intensity failed: {e}")
+
+        if params["do_lifetime"]:
+            try:
+                _plot_unseen(lambda: fcs_burst.plot_burst_lifetimes(
+                    d, result, n_bins=params["n_bins"],
+                    show=show, export=export), show)
+            except Exception as e:
+                failures.append(f"{d.filepath.name}: lifetime — {e}")
+                notes.append(f"lifetime failed: {e}")
+
+        corr = None
+        if params["do_correlation"]:
+            corr, note, stop = _burst_batch_correlate(
+                d, result, corr_params, show, export, i, total)
+            if note:
+                notes.append(note)
+                if note.startswith(("correlation failed",
+                                    "correlation plot failed")):
+                    failures.append(f"{d.filepath.name}: {note}")
+            if corr is not None and params["overlay"]:
+                overlay_results.append((d, corr))
+            if stop:
+                stopped_at = i
+
+        rows.append(_burst_batch_row(d, params, result, corr,
+                                     "; ".join(notes) if notes else "ok"))
+
+    # ── One overlay for the whole batch ──────────────────────────────────
+    if params["overlay"] and overlay_results:
+        try:
+            fcs_corr.plot_correlation_overlay(
+                overlay_results, corr_type="cross",
+                method=corr_params["method"],
+                tau_min_s=float(corr_params["tau_min_ms"]) * 1e-3,
+                tau_max_s=float(corr_params["tau_max_ms"]) * 1e-3,
+                show=True,
+                # Not export=True: every curve here has already been written
+                # by plot_burst_correlation, carrying the detection settings
+                # that make it meaningful.  The overlay's own exporter would
+                # write a second copy under the plain correlation name with
+                # no record of the excision behind it.
+                export=False,
+                title_note="burst-excised")
+        except Exception as e:
+            messagebox.showerror("Overlay failed", str(e))
+
+    # ── Summary table ────────────────────────────────────────────────────
+    summary = None
+    if rows:
+        try:
+            summary = _write_burst_batch_summary(usable, params,
+                                                 corr_params, rows)
+        except Exception as e:
+            messagebox.showerror("Summary not written",
+                                 f"The batch finished, but its summary table "
+                                 f"could not be written:\n{e}")
+
+    # ── Report ───────────────────────────────────────────────────────────
+    lines = [f"Burst batch — {len(rows)} files, M = {params['M']}, "
+             f"F = {params['F']:g}"]
+    lines.append("─" * 44)
+    if params["do_correlation"]:
+        lines.append(f"  Burst-free curves: {len(overlay_results)} of {total}")
+    if stopped_at is not None:
+        lines.append(f"  Stopped at file {stopped_at} of {total}")
+    if summary and summary[0]:
+        lines.append(f"  Summary: {Path(summary[0]).name}"
+                     + (" (+ .xlsx)" if summary[1] else ""))
+    for f in failures[:8]:
+        lines.append(f"  ! {f}")
+    if len(failures) > 8:
+        lines.append(f"  ! … {len(failures) - 8} more (see the summary table)")
+    status_set("\n".join(lines))
+
+    if params["do_correlation"] and not overlay_results:
+        messagebox.showwarning(
+            "No curves produced",
+            f"No burst-free correlation could be computed for any of the "
+            f"{total} files.  The summary table's status column says why for "
+            f"each one.")
 
 
 def task_burst():
@@ -1236,10 +1737,18 @@ def task_burst():
     in sequence: intensity with bursts marked, lifetime decays split burst
     vs. burst-free, and the Ch1 × Ch2 correlation of what is left.
 
-    Active file only.  Each output is attempted independently: a failure in
-    one is reported and the remaining ones still run, because the detection
-    behind all of them is the expensive part and is already done by then.
+    With two or more files selected (ctrl/shift-click) the work is handed to
+    :func:`_task_burst_batch`, which asks for one set of settings and applies
+    it to every file.  Otherwise the active ► file is used, as before, and
+    each output is attempted independently: a failure in one is reported and
+    the remaining ones still run, because the detection behind all of them is
+    the expensive part and is already done by then.
     """
+    datasets = _selected_datasets()
+    if len(datasets) >= 2:
+        _task_burst_batch(datasets)
+        return
+
     d = _active_data()
     if d is None:
         _no_active_file_warning()
@@ -1361,7 +1870,7 @@ def task_burst():
 
     extra = [
         "",
-        f"  Correlation: {corr['method']}, {corr['n_segments']:,} segments "
+        f"  Correlation: {corr['method']}, {corr['n_segs']:,} segments "
         f"of {corr['seg_duration_s']:g} s from "
         f"{corr['n_regions_used']:,} burst-free regions "
         f"({corr['T_used']:.2f} s)",

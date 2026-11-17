@@ -2433,6 +2433,7 @@ def plot_correlation_overlay(
     tau_max_s: float,
     show: bool = True,
     export: bool = False,
+    title_note: Optional[str] = None,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """
     Overlay G(tau) curves from several files on one semilog-x axes.
@@ -2447,6 +2448,10 @@ def plot_correlation_overlay(
         result_dict as returned by :func:`compute_correlation_for`.
     corr_type, method : shared correlation type / backend (for the title).
     tau_min_s, tau_max_s : shared lag range in seconds (for the x-limits).
+    title_note : optional
+        Short phrase added to the title, for an overlay whose curves are not
+        plain correlations -- "burst-excised", say.  Without it such a figure
+        is indistinguishable from an ordinary overlay once saved.
 
     Returns
     -------
@@ -2504,7 +2509,8 @@ def plot_correlation_overlay(
     ax.set_xlabel("Lag time τ (ms)", fontsize=12)
     ax.set_ylabel("G(τ)", fontsize=12)
     ax.set_title(
-        f"Correlation overlay — {len(results)} files\n"
+        f"Correlation overlay — {len(results)} files"
+        + (f"  ·  {title_note}" if title_note else "") + "\n"
         f"{label}  ·  τ: {tau_min_s*1e3:.3g}–{tau_max_s*1e3:.3g} ms  ·  "
         f"{_METHOD_LABEL.get(method, method)}",
         fontsize=10,

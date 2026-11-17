@@ -1,0 +1,160 @@
+diff --git a/fcs_burst.py b/fcs_burst.py
+index 274019f..8e32f11 100644
+--- a/fcs_burst.py
++++ b/fcs_burst.py
+@@ -743,15 +743,26 @@ def correlate_clean(fcs_data, result: BurstResult, params: Optional[dict] = None
+     n1_clean = n1_tot - int(np.asarray(result.ch1_excised, bool).sum())
+     n2_clean = n2_tot - int(np.asarray(result.ch2_excised, bool).sum())
+ 
++    # Keys follow fcs_corr.compute_correlation_for's schema, not a spelling of
++    # their own: both functions return "a correlation of this file", and when
++    # the two dicts disagreed on G_mean/G, n_segs/n_segments, n_used_chN/n_chN
++    # and mt_*/bare, every consumer that wanted to treat them alike had to
++    # translate at the boundary -- which plot_burst_correlation did by hand,
++    # and which stopped fcs_corr.plot_correlation_overlay from accepting a
++    # burst result at all.  gate_* and full_trace_G are deliberately absent:
++    # _FORCED rules both out, and inventing a value to fill a schema slot
++    # would claim something the computation never did.  The burst-only extras
++    # below (regions, excision bookkeeping, notes) are additions to that
++    # schema, not departures from it.
+     return {
+         "tau":                tau_ref,
+-        "G":                  G_mean,
++        "G_mean":             G_mean,
+         "G_std":              G_std,
+-        "n_segments":         int(stack.shape[0]),
++        "n_segs":             int(stack.shape[0]),
+         "method":             method,
+-        "m":                  m,
+-        "coarsen":            coarsen if method == "multitau" else None,
+-        "compress":           compress if method == "multitau_pkg" else None,
++        "mt_channels":        m,
++        "mt_coarsen":         coarsen if method == "multitau" else None,
++        "mt_compress":        compress if method == "multitau_pkg" else None,
+         "tau_min_s":          tau_min_s,
+         "tau_max_s":          tau_max_s,
+         "segment_bounds":     np.asarray(kept, dtype=np.float64),
+@@ -762,8 +773,8 @@ def correlate_clean(fcs_data, result: BurstResult, params: Optional[dict] = None
+         "T_dropped_fragments": T_dropped,
+         "n_segments_skipped": int(n_skipped),
+         "T_used":             float(T_used),
+-        "n_ch1":              int(n1_used),
+-        "n_ch2":              int(n2_used),
++        "n_used_ch1":         int(n1_used),
++        "n_used_ch2":         int(n2_used),
+         "n_ch1_total":        n1_tot,
+         "n_ch2_total":        n2_tot,
+         "n_ch1_clean":        int(n1_clean),
+@@ -788,7 +799,7 @@ def retention_summary(corr: dict) -> str:
+         if not tot:
+             continue
+         clean = corr.get(f"n_ch{ch}_clean", 0)
+-        used = corr.get(f"n_ch{ch}", 0)
++        used = corr.get(f"n_used_ch{ch}", 0)
+         lines.append(
+             f"  Ch{ch}: of {tot:,} photons, "
+             f"{100.0 * clean / tot:.2f} % remain after burst excision, "
+@@ -1305,17 +1316,17 @@ def plot_burst_correlation(
+     # rewritten underneath the user.
+     tau = corr["tau"]
+     fig, ax = fcs_corr.plot_correlation(
+-        tau, corr["G"], corr["G_std"], "cross", fcs_data,
++        tau, corr["G_mean"], corr["G_std"], "cross", fcs_data,
+         corr.get("tau_min_s", float(tau.min())),
+         corr.get("tau_max_s", float(tau.max())),
+-        corr["n_segments"],
++        corr["n_segs"],
+         method=corr["method"],
+         show=False, export=False,
+-        n_used_ch1=corr["n_ch1"], n_used_ch2=corr["n_ch2"],
++        n_used_ch1=corr["n_used_ch1"], n_used_ch2=corr["n_used_ch2"],
+         T_used=corr["T_used"],
+         seg_duration_s=corr.get("seg_duration_s"),
+         full_trace_G=False,
+-        mt_channels=corr["m"], mt_coarsen=corr.get("coarsen"),
++        mt_channels=corr["mt_channels"], mt_coarsen=corr.get("mt_coarsen"),
+         source_name=f"{fcs_data.filepath.name} (bursts excised)",
+         std_is_sem=True,
+     )
+@@ -1323,7 +1334,7 @@ def plot_burst_correlation(
+         f"Ch1 × Ch2, bursts excised — {fcs_data.filepath.name}\n"
+         f"M = {result.M}, F = {result.F:g}  ·  "
+         f"{result.n_coincident:,} bursts removed  ·  "
+-        f"{corr['n_segments']:,} segments of "
++        f"{corr['n_segs']:,} segments of "
+         f"{corr['seg_duration_s']:g} s from "
+         f"{corr['n_regions_used']:,} regions, {corr['T_used']:.2f} s used",
+         fontsize=11,
+@@ -1335,13 +1346,13 @@ def plot_burst_correlation(
+             "type": "cross",
+             "method": corr["method"],
+             "method_label": fcs_corr._method_annotation(
+-                corr["method"], corr["m"], corr.get("coarsen"),
+-                corr.get("compress")),
++                corr["method"], corr["mt_channels"],
++                corr.get("mt_coarsen"), corr.get("mt_compress")),
+             "tau_min_s": f"{corr['tau_min_s']:.6g}",
+             "tau_max_s": f"{corr['tau_max_s']:.6g}",
+             "symmetrized":
+                 "yes: G = 0.5*(G_Ch1Ch2 + G_Ch2Ch1), per segment",
+-            "n_segments": corr["n_segments"],
++            "n_segments": corr["n_segs"],
+             "segment_duration_s": f"{corr['seg_duration_s']:.6g}",
+             "n_burst_free_regions_used": corr["n_regions_used"],
+             "n_regions_dropped_shorter_than_one_segment":
+@@ -1350,8 +1361,8 @@ def plot_burst_correlation(
+                 f"{corr['T_dropped_fragments']:.6g}",
+             "n_segments_skipped_too_few_photons": corr["n_segments_skipped"],
+             "acquisition_time_s": f"{corr['T_used']:.6g}",
+-            "n_photons_ch1": corr["n_ch1"],
+-            "n_photons_ch2": corr["n_ch2"],
++            "n_photons_ch1": corr["n_used_ch1"],
++            "n_photons_ch2": corr["n_used_ch2"],
+             "segment_source": (
+                 "burst-free regions segmented at the fixed segment length; "
+                 "segments pooled across regions and NOT concatenated"
+@@ -1362,7 +1373,7 @@ def plot_burst_correlation(
+                 "standard error of the mean: "
+                 "std(G_segments, ddof=1) / sqrt(n_segments)"
+             ),
+-            "mt_channels_per_octave": corr["m"],
++            "mt_channels_per_octave": corr["mt_channels"],
+             "segment_duration_requested_s":
+                 f"{corr['seg_duration_requested_s']:.6g}",
+             "n_photons_ch1_total": corr["n_ch1_total"],
+@@ -1375,17 +1386,17 @@ def plot_burst_correlation(
+                 "the range"
+             ),
+         })
+-        if corr.get("coarsen") is not None:
+-            meta["mt_coarsen_factor"] = corr["coarsen"]
+-        if corr.get("compress") is not None:
+-            meta["mt_compress"] = corr["compress"]
++        if corr.get("mt_coarsen") is not None:
++            meta["mt_coarsen_factor"] = corr["mt_coarsen"]
++        if corr.get("mt_compress") is not None:
++            meta["mt_compress"] = corr["mt_compress"]
+         for _i, _n in enumerate(corr.get("notes", ()), 1):
+             meta[f"burst_correlation_note_{_i}"] = _n
+         # Same column set as fcs_corr's own correlation export, tau_ms
+         # included: these files are read by the other analysis programs, and
+         # a column that is present in one correlation CSV and absent from
+         # another is a trap for anything reading them in bulk.
+-        cols = {"tau_s": tau, "tau_ms": tau * 1e3, "G": corr["G"]}
++        cols = {"tau_s": tau, "tau_ms": tau * 1e3, "G": corr["G_mean"]}
+         if bool(np.isfinite(corr["G_std"]).any()):
+             cols["G_std"] = corr["G_std"]
+         fcs_export.safe_export(
+diff --git a/fcs_main.py b/fcs_main.py
+index 40b2b4e..ab9fed4 100644
+--- a/fcs_main.py
++++ b/fcs_main.py
+@@ -1361,7 +1870,7 @@ def task_burst():
+ 
+     extra = [
+         "",
+-        f"  Correlation: {corr['method']}, {corr['n_segments']:,} segments "
++        f"  Correlation: {corr['method']}, {corr['n_segs']:,} segments "
+         f"of {corr['seg_duration_s']:g} s from "
+         f"{corr['n_regions_used']:,} burst-free regions "
+         f"({corr['T_used']:.2f} s)",

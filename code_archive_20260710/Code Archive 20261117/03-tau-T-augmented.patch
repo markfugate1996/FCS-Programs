@@ -1,0 +1,150 @@
+diff --git a/fcs_fit.py b/fcs_fit.py
+index e740279..472c821 100644
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -298,9 +298,43 @@ _DERIVED_KEYS = (
+     "N_corr", "N_corr_err",
+     "N1_corr", "N1_corr_err", "N2_corr", "N2_corr_err",
+     "cpsm_corr", "cpsm_corr_err",
++    "tau_T", "tau_T_err", "tau_T1", "tau_T1_err", "tau_T2", "tau_T2_err",
+ )
+ 
+ 
++#: Models that tie a triplet lifetime to a diffusion time rather than fitting
++#: it directly: (alpha, tau_D, derived name).  The augmented models fit the
++#: RATIO alpha = tau_T/tau_D -- which is the point of them, since alpha can be
++#: held across a series where tau_D moves -- so the lifetime itself has to be
++#: multiplied back out.  It is reported under the name the non-augmented
++#: triplet models FIT, tau_T, so that the two models' tables line up column
++#: for column with nothing to map between them -- which is the whole reason
++#: for deriving it.  Both are listed for the two-component augmented model,
++#: where each species carries its own alpha and its own diffusion time.
++_TRIPLET_TIE = (
++    ("alpha",  "tau_D",  "tau_T"),
++    ("alpha1", "tau_D1", "tau_T1"),
++    ("alpha2", "tau_D2", "tau_T2"),
++)
++
++
++def _triplet_tie_pairs(result: dict) -> list:
++    """
++    The (alpha, tau_D, name) triples this model actually carries.
++
++    A pair is skipped when the model already FITS a parameter of that name.
++    Sharing tau_T with the plain triplet models is deliberate, but a model
++    fitting both alpha and tau_T directly would otherwise produce two columns
++    called tau_T -- one fitted, one derived -- and the second would quietly
++    win in any reader that builds a dict from the header row.  No model in
++    the registry does that today; this keeps it from becoming a puzzle if one
++    ever does.
++    """
++    names = result.get("names") or []
++    return [t for t in _TRIPLET_TIE
++            if t[0] in names and t[1] in names and t[2] not in names]
++
++
+ def _is_two_species(result: dict) -> bool:
+     """
+     Does this model fit a mixture as (total amplitude, number fraction)?
+@@ -381,6 +415,22 @@ def _derived_quantities(result: dict, ds: dict) -> dict:
+     the models say so in their descriptions, and no arithmetic here can
+     recover what the fit did not separate.
+ 
++    Triplet lifetime, for the augmented models that fit alpha = tau_T/tau_D
++    in place of the lifetime itself
++
++        tau_T = alpha . tau_D
++        var = tau_D^2.var(alpha) + alpha^2.var(tau_D)
++              + 2.alpha.tau_D.cov(alpha, tau_D)
++
++    With alpha free the augmented form is an exact reparameterisation of the
++    plain triplet model, so this value and its error should reproduce that
++    model's FITTED tau_T and sigma_tau_T on the same data -- in test, to
++    0.004 % and 0.2 % respectively.  It carries that model's name for exactly
++    that reason: the two tables can then be read side by side.  What
++    distinguishes the derived column from the fitted one is that only a
++    fitted parameter has a *_role column beside it.  The two-component
++    augmented model gives tau_T1 and tau_T2, one per species.
++
+     Brightness
+         CPS/<N> = CPS_fit . G0
+ 
+@@ -476,6 +526,28 @@ def _derived_quantities(result: dict, ds: dict) -> dict:
+             out["N1_err"] = float(np.sqrt(max(v1, 0.0)))
+             out["N2_err"] = float(np.sqrt(max(v2, 0.0)))
+ 
++    # ── Triplet lifetime, where the model fits it as a ratio ────────────────
++    for a_name, t_name, out_name in _triplet_tie_pairs(result):
++        try:
++            a = float(values[a_name])
++            t = float(values[t_name])
++        except (KeyError, TypeError, ValueError):
++            continue
++        if not (np.isfinite(a) and np.isfinite(t)):
++            continue
++        out[out_name] = a * t
++        s_a, s_t = _sig(a_name), _sig(t_name)
++        if not (_held(a_name) and _held(t_name)):
++            # var(a.t) = t^2.var(a) + a^2.var(t) + 2.a.t.cov(a,t); the cross
++            # term is POSITIVE here, unlike the quotients above.  It matters:
++            # with alpha free these models are exact reparameterisations of
++            # the plain triplet form, so this error is what has to agree with
++            # that fit's sigma_tau_T -- and it cannot, if a strongly
++            # correlated pair is treated as independent.
++            cov_at = _cov_entry(result, ds, a_name, t_name)
++            var = (t * s_a) ** 2 + (a * s_t) ** 2 + 2.0 * a * t * cov_at
++            out[f"{out_name}_err"] = float(np.sqrt(max(var, 0.0)))
++
+     # ── Brightness ──────────────────────────────────────────────────────────
+     cps = _cps_from_meta(ds.get("meta")) or {}
+     R = cps.get("cps_fit")
+@@ -581,6 +653,11 @@ def _derived_report_lines(result: dict, ds: dict, indent: str = "    ") -> list:
+         L.append(f"{pad}{'N1':<12} = {_fmt_der(d['N1'], d['N1_err'])}")
+         L.append(f"{pad}{'N2':<12} = {_fmt_der(d['N2'], d['N2_err'])}"
+                  f"   (Ni = fi.<N>; errors carry cov(G0,f1))")
++    for a_name, t_name, out_name in _triplet_tie_pairs(result):
++        if np.isfinite(d[out_name]):
++            L.append(f"{pad}{out_name:<12} = "
++                     f"{_fmt_der(d[out_name], d[f'{out_name}_err'])}"
++                     f"   s  (= {a_name} x {t_name})")
+     if np.isfinite(d["cpsm"]):
+         L.append(f"{pad}{'CPS/<N>':<12} = {_fmt_der(d['cpsm'], d['cpsm_err'])}"
+                  f"   Hz per molecule (= CPS x G0)")
+@@ -1538,6 +1615,11 @@ def export_global_fit(result: dict, out_source: str | Path,
+         # calculated columns this table used to leave to a spreadsheet.
+         p_header += ["f2", "f2_err",
+                      "N1", "N1_err", "N2", "N2_err"]
++    tie_pairs = _triplet_tie_pairs(result)
++    for _a, _t, _name in tie_pairs:
++        # The triplet lifetime this model fits as a ratio, multiplied back
++        # out so it sits in the same column as a plain triplet fit's tau_T.
++        p_header += [_name, f"{_name}_err"]
+     
+     has_bg = has_N and any(_bg_corr_from_meta(ds.get("meta")) is not None
+                            for ds in result["datasets"])
+@@ -1589,6 +1671,8 @@ def export_global_fit(result: dict, out_source: str | Path,
+         if has_species:
+             row += [d["f2"], d["f2_err"],
+                     d["N1"], d["N1_err"], d["N2"], d["N2_err"]]
++        for _a, _t, _name in tie_pairs:
++            row += [d[_name], d[f"{_name}_err"]]
+         if has_bg:
+             row += [d["bg_factor"], d["bg_factor_err"],
+                     d["G0_corr"], d["G0_corr_err"],
+@@ -1648,6 +1732,16 @@ def export_global_fit(result: dict, out_source: str | Path,
+                         "unequal brightnesses f1 is a brightness-weighted "
+                         "amplitude fraction and these are not molecule counts")
+ 
++    if tie_pairs:
++        for _a, _t, _name in tie_pairs:
++            comments.append(
++                f"note_{_name} : {_name} = {_a} * {_t} (s) -- DERIVED here, "
++                f"not fitted (hence no {_name}_role column), because this "
++                f"model fits the ratio {_a} = {_name}/{_t} instead; error "
++                f"propagated with cov({_a}, {_t}).  The same quantity as the "
++                f"FITTED {_name} of the non-augmented triplet models, which "
++                f"it reproduces when {_a} is free")
++
+     if has_bg:
+         comments.append("note : G0_corr = G0 * bg_correction_factor "
+                         "(Koppel amplitude correction, from the correlation CSV)")
