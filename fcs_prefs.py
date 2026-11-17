@@ -522,10 +522,19 @@ def run_preferences_dialog(parent=None) -> None:
         apply(new_values)
         dialog.destroy()
 
-    # Packed to the BOTTOM so the notebook above takes the slack when the
-    # window is resized and these stay put.
+    # [button-strip] Claim the bottom slot before anything that can grow.
+    # side="bottom" decides where the strip is DRAWN, not what survives when
+    # space runs short: pack() hands out space in packing order, so this
+    # frame -- packed after the notebook, which expands -- is the first thing
+    # squeezed when fit_dialog_to_screen caps the window below the content's
+    # height, and OK/Cancel end up below the bottom edge.  Re-ordering here
+    # rather than moving the code keeps the build order intact, and matches
+    # the idiom the fit and PCH dialogs already use.
     btns = tk.Frame(dialog)
     btns.pack(side="bottom", pady=10)
+    _above = [_w for _w in dialog.pack_slaves() if _w is not btns]
+    if _above:
+        btns.pack_configure(before=_above[0])
     tk.Button(btns, text="OK", width=10, command=_ok,
               pady=3).pack(side="left", padx=5)
     tk.Button(btns, text="Cancel", width=10, command=dialog.destroy,

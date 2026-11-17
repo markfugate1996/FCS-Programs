@@ -1,0 +1,278 @@
+--- a/fcs_plottools.py
++++ b/fcs_plottools.py
+@@ -15,6 +15,8 @@
+   * **Axis limits** — manually set X/Y bounds, or reset to auto.
+   * **Legend position** — dropdown to move the legend.
+   * **Label editor** — edit title, X label, and Y label.
++  * **Figure size** — set width/height in inches, with the size the next
++    save would actually write.
+   * **Export** — save figure as PNG, PDF, or SVG.
+ 
+ Multi-axes figures (e.g. the two-panel fit plot with G(τ) + residuals)
+@@ -252,7 +254,8 @@
+     _legend_cb["fn"] = _build_legend_section(body, fig, axes_list)
+     _build_annotation_section(body, fig, axes_list)
+     _build_label_section(body, fig, axes_list)
+-    _build_save_section(body, fig)
++    _save_tight = _build_size_section(body, fig)
++    _build_save_section(body, fig, tight_var=_save_tight)
+ 
+     # ── Size to content, clamped to the screen ───────────────────────────────
+     panel.update_idletasks()
+@@ -2554,12 +2557,219 @@
+              font=("Helvetica", 8), fg="grey").pack()
+ 
+ 
+-def _build_save_section(panel, fig: plt.Figure) -> None:
++_MM_PER_INCH = 25.4
++
++# Sanity bounds for a hand-typed figure dimension, in inches.  The lower
++# bound stops a mistyped "0.05" collapsing the canvas; the upper one is well
++# past any journal page, and past what a screen can show at 1:1.
++_SIZE_MIN_IN = 0.5
++_SIZE_MAX_IN = 60.0
++
++
++def _parse_size_in(text, fallback: float) -> float:
++    """Parse a typed dimension in inches; out-of-range or junk -> *fallback*."""
++    try:
++        value = float(str(text).strip())
++    except (TypeError, ValueError):
++        return float(fallback)
++    if not (_SIZE_MIN_IN <= value <= _SIZE_MAX_IN):
++        return float(fallback)
++    return value
++
++
++def saved_size_inches(fig, tight: bool = True):
++    """
++    (width, height) in inches of the file ``save_figure`` would write now.
++
++    With *tight* the saved size is NOT the figure size: matplotlib crops to
++    the drawn artists and then adds ``savefig.pad_inches`` on every side, so
++    the result moves with tick-label lengths, title line count and legend.
++    A 9x4 in figure with a two-line title writes 7.80 x 4.19 in.
++
++    Returns None if the crop cannot be measured (no renderer yet), which the
++    caller shows as "unknown" rather than guessing.
++    """
++    w, h = (float(v) for v in fig.get_size_inches())
++    if not tight:
++        return w, h
++    try:
++        import matplotlib as _mpl
++        bb = fig.get_tightbbox(fig.canvas.get_renderer())
++        pad = float(_mpl.rcParams.get("savefig.pad_inches", 0.1))
++        return float(bb.width) + 2 * pad, float(bb.height) + 2 * pad
++    except Exception:
++        return None
++
++
++def _relayout_after_resize(fig) -> None:
++    """
++    Restore sane margins after the figure size changes.
++
++    Three cases, distinguishable at runtime:
++
++      * ``ConstrainedLayoutEngine`` — re-solves itself on every draw, so
++        there is nothing to do here;
++      * ``PlaceHolderLayoutEngine`` — the producer called ``tight_layout()``
++        once at creation, which computed margins for the old size only; they
++        are stale the moment the size changes, so re-run it;
++      * no engine — the figure was laid out by hand (``subplots_adjust`` or
++        explicit axes rects) and re-running anything would undo that.
++
++    Older matplotlib without ``get_layout_engine`` falls through untouched.
++    """
++    try:
++        engine = fig.get_layout_engine()
++    except Exception:
++        return
++    if type(engine).__name__ != "PlaceHolderLayoutEngine":
++        return
++    try:
++        fig.tight_layout()
++    except Exception as exc:
++        print(f"[plot] could not re-run tight_layout after resize ({exc})")
++
++
++def _build_size_section(panel, fig: plt.Figure):
++    """
++    Add the "Figure size" LabelFrame to *panel*.
++
++    Width and height are in inches (matplotlib's own unit), with a live mm
++    readout beside them because journals specify columns in mm.  A second
++    readout gives the size the next save would write, which differs from the
++    figure size whenever the tight crop is on.
++
++    Returns the BooleanVar holding the crop setting, for the Export section
++    to attach its checkbox to.
++    """
++    import tkinter as tk
++
++    sz = tk.LabelFrame(panel, text="Figure size", padx=10, pady=6)
++    sz.pack(fill="x", padx=10, pady=4)
++
++    cur_w, cur_h = (float(v) for v in fig.get_size_inches())
++    w_var = tk.StringVar(master=panel, value=f"{cur_w:.2f}")
++    h_var = tk.StringVar(master=panel, value=f"{cur_h:.2f}")
++    tight_var = tk.BooleanVar(master=panel, value=True)
++
++    row = tk.Frame(sz)
++    row.pack(fill="x", pady=(2, 0))
++    tk.Label(row, text="W:", width=2, anchor="e",
++             font=("Helvetica", 9)).pack(side="left")
++    w_entry = tk.Entry(row, textvariable=w_var, width=7,
++                       font=("Helvetica", 9), justify="right")
++    w_entry.pack(side="left", padx=2)
++    tk.Label(row, text="H:", width=2, anchor="e",
++             font=("Helvetica", 9)).pack(side="left", padx=(6, 0))
++    h_entry = tk.Entry(row, textvariable=h_var, width=7,
++                       font=("Helvetica", 9), justify="right")
++    h_entry.pack(side="left", padx=2)
++    tk.Label(row, text="in", font=("Helvetica", 9)).pack(side="left")
++
++    mm_lbl = tk.Label(sz, text="", font=("Helvetica", 8), fg="grey",
++                      anchor="w", justify="left")
++    mm_lbl.pack(fill="x")
++    saved_lbl = tk.Label(sz, text="", font=("Helvetica", 8), fg="grey",
++                         anchor="w", justify="left")
++    saved_lbl.pack(fill="x", pady=(2, 0))
++    warn_lbl = tk.Label(sz, text="", font=("Helvetica", 8), fg="#a04000",
++                        anchor="w", justify="left", wraplength=240)
++    warn_lbl.pack(fill="x")
++
++    def _update_mm(*_a):
++        """Live mm echo of whatever is in the boxes, valid or not."""
++        bits = []
++        for var in (w_var, h_var):
++            try:
++                bits.append(f"{float(str(var.get()).strip()) * _MM_PER_INCH:.1f}")
++            except (TypeError, ValueError):
++                bits.append("?")
++        mm_lbl.config(text=f"      = {bits[0]} × {bits[1]} mm")
++
++    def _update_saved(*_a):
++        """What the next save would actually write, crop included."""
++        size = saved_size_inches(fig, bool(tight_var.get()))
++        if size is None:
++            saved_lbl.config(text="      saves: crop not measurable yet")
++            return
++        w, h = size
++        note = "after tight crop" if tight_var.get() else "exact"
++        saved_lbl.config(
++            text=f"      saves: {w:.2f} × {h:.2f} in  ·  "
++                 f"{w * _MM_PER_INCH:.1f} × {h * _MM_PER_INCH:.1f} mm "
++                 f"({note})")
++
++    def _sync(requested=None):
++        """Put the figure's real size in the boxes and refresh the readouts."""
++        got_w, got_h = (float(v) for v in fig.get_size_inches())
++        w_var.set(f"{got_w:.2f}")
++        h_var.set(f"{got_h:.2f}")
++        _update_mm()
++        _update_saved()
++        if requested is None:
++            warn_lbl.config(text="")
++            return
++        req_w, req_h = requested
++        if abs(got_w - req_w) > 0.01 or abs(got_h - req_h) > 0.01:
++            # The Tk window could not take the requested canvas -- usually the
++            # figure is wider or taller than the screen -- and the window
++            # manager clamped it.  Say so: a box that kept showing the number
++            # asked for would be reporting a size the figure does not have.
++            warn_lbl.config(
++                text=f"      window clamped to {got_w:.2f} × {got_h:.2f} in "
++                     f"(screen limit) — the figure is this size, not "
++                     f"{req_w:.2f} × {req_h:.2f}")
++        else:
++            warn_lbl.config(text="")
++
++    def _apply_size(_event=None):
++        cur = (float(v) for v in fig.get_size_inches())
++        cw, ch = cur
++        w = _parse_size_in(w_var.get(), cw)
++        h = _parse_size_in(h_var.get(), ch)
++        try:
++            fig.set_size_inches(w, h, forward=True)
++        except Exception as exc:
++            print(f"[plot] could not resize figure ({exc})")
++            _sync()
++            return
++        _relayout_after_resize(fig)
++        try:
++            # Synchronous, not draw_idle: the readouts measure the result.
++            fig.canvas.draw()
++        except Exception:
++            pass
++        _sync(requested=(w, h))
++
++    w_var.trace_add("write", _update_mm)
++    h_var.trace_add("write", _update_mm)
++    tight_var.trace_add("write", _update_saved)
++
++    btn_row = tk.Frame(sz)
++    btn_row.pack(fill="x", pady=(6, 2))
++    tk.Button(btn_row, text="Apply size", command=_apply_size,
++              width=12, pady=3).pack(side="left", padx=(0, 6))
++    tk.Button(btn_row, text="Refresh", command=lambda: _sync(),
++              width=8, pady=3).pack(side="left")
++    tk.Label(sz, text="      Return in either box also applies",
++             font=("Helvetica", 8), fg="grey").pack(fill="x")
++
++    w_entry.bind("<Return>", _apply_size)
++    h_entry.bind("<Return>", _apply_size)
++
++    _sync()
++    return tight_var
++
++
++def _build_save_section(panel, fig: plt.Figure, tight_var=None) -> None:
+     """
+     Add a "Save figure…" button that opens a file-save dialog.
+ 
+     Defaults to SVG (see _FIGURE_FORMAT); PNG and PDF remain available from
+     the file-type list.
++
++    *tight_var* is the crop setting owned by the Figure size section.  When
++    it is None (no size section built) the historical behaviour applies:
++    always crop.
+     """
+     import tkinter as tk
+     from tkinter import filedialog
+@@ -2567,6 +2777,14 @@
+     sf = tk.LabelFrame(panel, text="Export", padx=10, pady=4)
+     sf.pack(fill="x", padx=10, pady=(4, 10))
+ 
++    def _tight() -> bool:
++        if tight_var is None:
++            return True
++        try:
++            return bool(tight_var.get())
++        except Exception:
++            return True
++
+     def _save():
+         path = filedialog.asksaveasfilename(
+             title="Save figure",
+@@ -2580,7 +2798,7 @@
+         )
+         if not path:
+             return
+-        if save_figure(fig, path) is None:
++        if save_figure(fig, path, tight=_tight()) is None:
+             from tkinter import messagebox
+             messagebox.showerror(
+                 "Save failed",
+@@ -2589,3 +2807,11 @@
+ 
+     tk.Button(sf, text="Save figure\u2026", command=_save,
+               width=14, pady=3).pack()
++
++    if tight_var is not None:
++        tk.Checkbutton(sf, variable=tight_var, text="Crop to content (tight)",
++                       font=("Helvetica", 9)).pack(anchor="w", pady=(4, 0))
++        tk.Label(sf, text="      off: the file is exactly the figure size,\n"
++                          "      for a column width you have to hit",
++                 font=("Helvetica", 8), fg="grey", anchor="w",
++                 justify="left").pack(fill="x")
