@@ -1,0 +1,95 @@
+--- a/fcs_plottools.py
++++ b/fcs_plottools.py
+@@ -409,6 +409,70 @@
+ _SCREEN_MARGIN = 8
+ 
+ 
++def resize_figure_window(fig, w_in: float, h_in: float) -> tuple:
++    """
++    Resize *fig* to *w_in* x *h_in* inches AND the window that displays it.
++
++    ``set_size_inches(..., forward=True)`` is not enough on TkAgg.  The whole
++    of its forward path is ``FigureManagerTk.resize``, which configures the
++    canvas WIDGET's requested size; the Toplevel keeps the geometry it was
++    given, so the widget never actually changes size.  No <Configure> event
++    follows -- and that event is what rebuilds the backend's PhotoImage.  The
++    next draw then blits the new, smaller figure into the corner of the old
++    photo, which is the "new plot drawn on top of the old one" artefact.
++
++    So the window is resized here too.  Clearing the geometry string lets Tk
++    shrink-wrap the Toplevel around its children (canvas plus whatever
++    toolbar it carries) rather than hold a stale explicit geometry; the
++    <Configure> that follows re-derives the figure size from the canvas's
++    real pixel size.
++
++    Returns the (width, height) in inches the figure actually ended up with.
++    It is read back, not assumed: pixels are whole, so a requested size is
++    quantised to 1/dpi, and a window manager may refuse a window bigger than
++    the screen.
++    """
++    fig.set_size_inches(float(w_in), float(h_in), forward=False)
++
++    dpi = float(getattr(fig, "dpi", 0) or 100.0)
++    cw = max(1, int(round(float(w_in) * dpi)))
++    ch = max(1, int(round(float(h_in) * dpi)))
++
++    canvas = getattr(fig, "canvas", None)
++    widget = None
++    if canvas is not None and hasattr(canvas, "get_tk_widget"):
++        try:
++            widget = canvas.get_tk_widget()
++        except Exception:
++            widget = None
++
++    if widget is None:
++        # Non-Tk backend: a batch export on Agg, or a headless test.  There is
++        # no window, and set_size_inches above was the whole job.
++        try:
++            canvas.draw()
++        except Exception:
++            pass
++        return tuple(float(v) for v in fig.get_size_inches())
++
++    try:
++        widget.configure(width=cw, height=ch)
++        win = canvas.manager.window
++        win.geometry("")             # shrink-wrap to the new requested size
++        win.update_idletasks()       # let the <Configure> land before measuring
++    except Exception as exc:
++        # Not fatal: the figure is the requested size even if its window is
++        # not, and the caller reports the discrepancy.  Silence would leave a
++        # window that disagrees with its own size box and no clue why.
++        print(f"[plot] could not resize the figure window ({exc})")
++
++    try:
++        canvas.draw()
++    except Exception:
++        pass
++    return tuple(float(v) for v in fig.get_size_inches())
++
++
+ def place_window(win, x=None, y=None, w=None, h=None) -> tuple:
+     """
+     Position *win* so that all of it is on screen.
+@@ -2830,7 +2894,11 @@
+             warn_lbl.config(text="")
+             return
+         req_w, req_h = requested
+-        if abs(got_w - req_w) > 0.01 or abs(got_h - req_h) > 0.01:
++        # A canvas is a whole number of pixels, so an achievable size is
++        # quantised to 1/dpi inch; warning about that rounding would cry wolf
++        # on every apply.  Anything beyond a pixel or so is a real refusal.
++        tol = max(0.02, 1.5 / float(getattr(fig, "dpi", 100) or 100))
++        if abs(got_w - req_w) > tol or abs(got_h - req_h) > tol:
+             # The Tk window could not take the requested canvas -- usually the
+             # figure is wider or taller than the screen -- and the window
+             # manager clamped it.  Say so: a box that kept showing the number
+@@ -2848,7 +2916,7 @@
+         w = _parse_size_in(w_var.get(), cw)
+         h = _parse_size_in(h_var.get(), ch)
+         try:
+-            fig.set_size_inches(w, h, forward=True)
++            resize_figure_window(fig, w, h)
+         except Exception as exc:
+             print(f"[plot] could not resize figure ({exc})")
+             _sync()
