@@ -1619,6 +1619,15 @@ def _cps_meta(n1: int, n2: int, T: float, channels=(1, 2)) -> dict:
         "cps_ch2": cps2,
     }
 
+# Public because fcs_burst reaches for it: a burst-excised correlation
+# reports the rate of the trace that survived excision, and the
+# blank-not-zero convention for a channel that was never recorded has to be
+# the same in both exports.  The private alias keeps every existing call
+# site in this module unchanged -- the same pattern fcs_fitcommon documents
+# for its own cross-module helpers.
+cps_meta = _cps_meta
+
+
 # ── Background (Koppel) amplitude correction ──────────────────────────────────
 # Uncorrelated background dilutes the measured amplitude as
 #   G(0)_meas = (1 - B/F)^2 * G(0)_true,

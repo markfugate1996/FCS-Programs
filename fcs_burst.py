@@ -1289,6 +1289,49 @@ def plot_burst_lifetimes(
     return fig, ax
 
 
+def _retained_cps_meta(fcs_data, corr: dict) -> dict:
+    """
+    CPS metadata for a burst-excised correlation: counts over the time that
+    survived excision.
+
+    Burst excision removes photons AND the time they arrived in, so neither
+    the whole-acquisition rate nor the retained counts over the full
+    duration is the rate of the curve being fitted.  What the fit sees is
+    the burst-free segments that were actually correlated, so the rate is
+    their photons over their total duration -- ``n_used_ch*`` over
+    ``T_used``, both already recorded in this export.  Segments dropped for
+    being shorter than one segment length, or skipped for having too few
+    photons, are excluded from both, which is what keeps the ratio honest.
+
+    Delegated to fcs_corr.cps_meta so an absent channel is written blank
+    rather than zero here too: a zero rate reads back as a real measurement
+    of no light, which is what a dead detector looks like.
+
+    Returns the acquisition_time_s / n_photons / cps block.  If the rates
+    cannot be formed (no retained time, or no photons at all) the raw
+    figures are still returned, so the file records what happened rather
+    than losing the fields it used to carry.
+    """
+    import fcs_corr
+
+    T = float(corr.get("T_used") or 0.0)
+    n1 = int(corr.get("n_used_ch1") or 0)
+    n2 = int(corr.get("n_used_ch2") or 0)
+    channels = tuple(getattr(fcs_data, "channels", (1, 2)) or (1, 2))
+
+    meta = dict(fcs_corr.cps_meta(n1, n2, T, channels=channels))
+    if not meta:
+        return {"acquisition_time_s": f"{T:.6g}",
+                "n_photons_ch1": n1, "n_photons_ch2": n2}
+    # Say what the rate is OF.  Read next to n_photons_ch1_total, an
+    # unqualified cps_ch1 could be taken for the rate of the whole
+    # acquisition, which is the one number it is not.
+    meta["cps_basis"] = ("photons and duration of the burst-free segments "
+                         "actually correlated, so these rates describe the "
+                         "trace after excision, not the acquisition")
+    return meta
+
+
 # ── Plot: correlation of the clean intervals ──────────────────────────────────
 
 def plot_burst_correlation(
@@ -1360,9 +1403,9 @@ def plot_burst_correlation(
             "burst_free_time_lost_to_fragmentation_s":
                 f"{corr['T_dropped_fragments']:.6g}",
             "n_segments_skipped_too_few_photons": corr["n_segments_skipped"],
-            "acquisition_time_s": f"{corr['T_used']:.6g}",
-            "n_photons_ch1": corr["n_used_ch1"],
-            "n_photons_ch2": corr["n_used_ch2"],
+            # acquisition_time_s, n_photons_ch* and now cps_ch* -- the rate
+            # fields a fit needs for its CPS block and for CPS/molecule.
+            **_retained_cps_meta(fcs_data, corr),
             "segment_source": (
                 "burst-free regions segmented at the fixed segment length; "
                 "segments pooled across regions and NOT concatenated"
