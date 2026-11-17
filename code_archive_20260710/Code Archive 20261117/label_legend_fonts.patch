@@ -1,0 +1,126 @@
+--- a/fcs_plottools.py
++++ b/fcs_plottools.py
+@@ -2042,7 +2042,10 @@
+         _vis = True
+     show_var = tk.BooleanVar(master=panel, value=_vis)
+     loc_var  = tk.StringVar(master=panel, value=current_loc)
+-    size_var = tk.IntVar(master=panel, value=current_size)
++    # Text, not an int var: the box is typed into, and a stray keystroke
++    # should fall back rather than raise out of IntVar.get().
++    size_var = tk.StringVar(master=panel, value=_fmt_fontsize(current_size))
++    _legend_fs_last = {"v": float(current_size)}
+ 
+     lf = tk.LabelFrame(panel, text="Legend", padx=10, pady=6)
+     lf.pack(fill="x", padx=10, pady=4)
+@@ -2119,6 +2122,18 @@
+         if fn is not None:
+             fn()
+ 
++    def _legend_fontsize() -> float:
++        """
++        The size in the box, falling back to the last one that took.
++
++        Falling back to *current_size* instead would throw away a size the
++        user had already applied the moment they fat-fingered the next one.
++        """
++        fs = _parse_fontsize(size_var.get(), _legend_fs_last["v"])
++        _legend_fs_last["v"] = fs
++        size_var.set(_fmt_fontsize(fs))
++        return fs
++
+     def _apply_legend(*_):
+         _refresh_entries_list()
+         live_h, live_l = _live_entries()
+@@ -2133,12 +2148,13 @@
+             except Exception:
+                 pass
+             return
++        _fs = _legend_fontsize()
+         new = ax.legend(
+             live_h, live_l,
+             loc=loc_var.get(),
+-            fontsize=size_var.get(),
++            fontsize=_fs,
+             title=title_text,
+-            title_fontsize=size_var.get(),
++            title_fontsize=_fs,
+             framealpha=framealpha,
+             ncol=_ncol,
+         )
+@@ -2178,11 +2194,20 @@
+     size_row.pack(fill="x", pady=(4, 0))
+     tk.Label(size_row, text="Text size:", width=9, anchor="e",
+              font=("Helvetica", 9)).pack(side="left")
+-    tk.Scale(
+-        size_row, from_=4, to=20, orient="horizontal",
+-        variable=size_var, command=_apply_legend,
+-        showvalue=True, length=130, font=("Helvetica", 8),
+-    ).pack(side="left", padx=4, fill="x", expand=True)
++    # A spin box, matching the title and axis-label size controls in the
++    # Labels section: one idiom for every font size in the panel.
++    size_box = tk.Spinbox(
++        size_row, textvariable=size_var, from_=4, to=48, increment=1,
++        width=5, font=("Helvetica", 9), justify="right",
++        command=_apply_legend,
++    )
++    size_box.pack(side="left", padx=4)
++    tk.Label(size_row, text="pt", font=("Helvetica", 9)).pack(side="left")
++    # The arrows apply through command=; typing applies on Return or on
++    # leaving the box.  Deliberately NOT a trace on the variable: that fires
++    # per keystroke, so typing "14" would rebuild the legend at size 1 first.
++    size_box.bind("<Return>", _apply_legend)
++    size_box.bind("<FocusOut>", _apply_legend)
+ 
+     # ── Entries ───────────────────────────────────────────────────────────────
+     # Layout mirrors the Traces section: a selector plus ONE control block
+@@ -2715,21 +2740,46 @@
+     xlabel_var = tk.StringVar(master=panel, value=ax_bottom.get_xlabel())
+     ylabel_var = tk.StringVar(master=panel, value=ax_main.get_ylabel())
+ 
+-    for label_text, var in [("X label:", xlabel_var), ("Y label:", ylabel_var)]:
++    # Each axis label carries its own size, independent of the title and of
++    # each other: a y label that has to fit a tall panel is not the same
++    # problem as an x label under a wide one.  Seeded from what the figure
++    # actually uses rather than from a constant, so a producer that chose
++    # its own size keeps it until the box is changed.
++    xlabel_fs_var = tk.StringVar(
++        master=panel, value=_fmt_fontsize(ax_bottom.xaxis.label.get_fontsize()))
++    ylabel_fs_var = tk.StringVar(
++        master=panel, value=_fmt_fontsize(ax_main.yaxis.label.get_fontsize()))
++
++    for label_text, var, fs_var in [("X label:", xlabel_var, xlabel_fs_var),
++                                    ("Y label:", ylabel_var, ylabel_fs_var)]:
+         row = tk.Frame(lf)
+         row.pack(fill="x", pady=2)
+         tk.Label(row, text=label_text, width=9, anchor="e",
+                  font=("Helvetica", 9)).pack(side="left")
+-        tk.Entry(row, textvariable=var, width=20,
++        tk.Entry(row, textvariable=var, width=16,
+                  font=("Helvetica", 9)).pack(side="left", padx=4)
++        tk.Label(row, text="Size:", anchor="e",
++                 font=("Helvetica", 9)).pack(side="left", padx=(4, 2))
++        tk.Spinbox(row, textvariable=fs_var, from_=4, to=48, increment=1,
++                   width=5, font=("Helvetica", 9),
++                   justify="right").pack(side="left")
+ 
+     def _apply_labels(_event=None):
+         new_title = title_box.get("1.0", "end-1c")
+         fs = _parse_fontsize(title_fs_var.get(), ax_main.title.get_fontsize())
+         title_fs_var.set(_fmt_fontsize(fs))
+         ax_main.set_title(new_title, fontsize=fs)
+-        ax_bottom.set_xlabel(xlabel_var.get(), fontsize=12)
+-        ax_main.set_ylabel(ylabel_var.get(), fontsize=12)
++        # Previously both were forced to 12 on every apply, which silently
++        # restyled a figure whose producer had chosen otherwise.  They now
++        # fall back to the size the axis already has.
++        xfs = _parse_fontsize(xlabel_fs_var.get(),
++                              ax_bottom.xaxis.label.get_fontsize())
++        yfs = _parse_fontsize(ylabel_fs_var.get(),
++                              ax_main.yaxis.label.get_fontsize())
++        xlabel_fs_var.set(_fmt_fontsize(xfs))
++        ylabel_fs_var.set(_fmt_fontsize(yfs))
++        ax_bottom.set_xlabel(xlabel_var.get(), fontsize=xfs)
++        ax_main.set_ylabel(ylabel_var.get(), fontsize=yfs)
+         try:
+             fig.canvas.draw_idle()
+         except Exception:
