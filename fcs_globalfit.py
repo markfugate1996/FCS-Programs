@@ -664,6 +664,15 @@ def fit_linked(
             # blanks an error cell has to know which.
             "fixed": {p: resolved[p][di][0] == FIX for p in names},
             "linked": {p: resolved[p][di][0] == LINK for p in names},
+            # Which free-parameter slot each parameter used for THIS dataset,
+            # None where it was held.  The covariance returned below is
+            # indexed by those slots, and only this layout knows which row and
+            # column a (parameter, dataset) pair owns -- so a caller deriving
+            # a quantity from two fitted parameters cannot reach their
+            # covariance without it.  Propagating such an error from the
+            # diagonal alone is wrong whenever the two trade against each
+            # other, which in a two-component fit they always do.
+            "free_slots": {p: slot_of(p, di) for p in names},
         })
         per_dataset.append(entry)
 

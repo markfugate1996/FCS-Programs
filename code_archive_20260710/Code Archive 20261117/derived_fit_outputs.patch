@@ -1,0 +1,499 @@
+diff --git a/fcs_fit.py b/fcs_fit.py
+index 5bb562c..e740279 100644
+--- a/fcs_fit.py
++++ b/fcs_fit.py
+@@ -284,6 +284,323 @@ def _bg_corr_from_meta(meta: Optional[dict]) -> Optional[Tuple[float, float]]:
+     return kappa, kappa_err
+ 
+ 
++# ── Derived quantities ────────────────────────────────────────────────────────
++
++# Every key _derived_quantities returns, so the parameter table can lay out a
++# fixed schema and the report can ask for anything without a KeyError.  A
++# quantity that cannot be derived is NaN, which params_cell renders as a blank
++# cell -- absence, not zero.
++_DERIVED_KEYS = (
++    "N", "N_err",
++    "f2", "f2_err", "N1", "N1_err", "N2", "N2_err",
++    "cpsm", "cpsm_err",
++    "bg_factor", "bg_factor_err", "G0_corr", "G0_corr_err",
++    "N_corr", "N_corr_err",
++    "N1_corr", "N1_corr_err", "N2_corr", "N2_corr_err",
++    "cpsm_corr", "cpsm_corr_err",
++)
++
++
++def _is_two_species(result: dict) -> bool:
++    """
++    Does this model fit a mixture as (total amplitude, number fraction)?
++
++    True for the f1-bearing correlation models, where G0 is the TOTAL
++    amplitude and f1 the number fraction of species 1, so the second fraction
++    and both species occupancies are derivable.  The ``"f2" not in names``
++    guard keeps this false for any future model that fits both fractions
++    itself -- a derived f2 must never collide with a fitted one.
++
++    A triplet fraction T is not a species: it is the same molecules blinking,
++    which is why only f1 counts here.
++    """
++    names = result.get("names", [])
++    return ("G0" in names) and ("f1" in names) and ("f2" not in names)
++
++
++def _cov_entry(result: dict, ds: dict, p: str, q: str) -> float:
++    """
++    cov(p, q) for one dataset from the fit covariance, 0.0 when unavailable.
++
++    Zero is the right answer for a parameter held on this dataset: holding one
++    asserts it is exactly known, so it carries neither variance nor
++    covariance.  Zero is also the safe fallback when the covariance could not
++    be formed (a singular Jacobian), where the alternative is no error at all.
++    """
++    cov = result.get("cov")
++    slots = ds.get("free_slots") or {}
++    i, j = slots.get(p), slots.get(q)
++    if cov is None or i is None or j is None:
++        return 0.0
++    try:
++        v = float(np.asarray(cov)[i, j])
++    except Exception:      # noqa: BLE001 - a bad index must not kill a report
++        return 0.0
++    return v if np.isfinite(v) else 0.0
++
++
++def _derived_quantities(result: dict, ds: dict) -> dict:
++    """
++    Quantities computed FROM one dataset's fitted parameters, with propagated
++    errors.  One definition, read by both the report and the parameter table.
++
++    Occupancy
++        <N> = 1/G0                        sigma_N = sigma_G0 / G0^2
++
++    Species occupancies, for the models that fit a total amplitude and a
++    number fraction (f2 = 1 - f1, exactly, so sigma_f2 = sigma_f1)
++
++        N1 = f1/G0            N2 = (1-f1)/G0
++
++    propagated WITH the fit covariance:
++
++        var(N1) = (f1/G0^2)^2.var(G0) + (1/G0)^2.var(f1)
++                  - 2.(f1/G0^3).cov(G0,f1)
++        var(N2) = ((1-f1)/G0^2)^2.var(G0) + (1/G0)^2.var(f1)
++                  + 2.((1-f1)/G0^3).cov(G0,f1)
++
++    G0 and f1 trade against each other along a shallow valley in a
++    two-component fit, so the cross term is not optional bookkeeping.  Write
++    A = (f1/G0^2).sigma_G0, A' = ((1-f1)/G0^2).sigma_G0 and B = sigma_f1/G0:
++
++        var(N1) = A^2  + B^2 - 2.rho.A.B
++        var(N2) = A'^2 + B^2 + 2.rho.A'.B
++
++    Dropping it costs little when one contribution dominates the other (a
++    couple of percent on a well-separated pair, where sigma_f1 dominates) and
++    costs |rho| when the two are comparable -- in test, at rho = -0.8 with
++    A = B, independent errors understated sigma_N1 by 26% and overstated
++    sigma_N2 by 95%.  Note the opposite signs: the two species' errors are
++    always mis-stated in opposite directions, so the cheap approximation
++    cannot even be called conservative.  N1 + N2 = <N> holds exactly, and with
++    the cross term kept the three errors are mutually consistent.
++
++    These are number fractions only under the model's own assumption of equal
++    molecular brightness.  With unequal brightnesses f1 is a
++    brightness-weighted amplitude fraction and N1, N2 are not occupancies --
++    the models say so in their descriptions, and no arithmetic here can
++    recover what the fit did not separate.
++
++    Brightness
++        CPS/<N> = CPS_fit . G0
++
++    CPS_fit comes from the correlation header and follows the correlation type
++    (see :func:`_cps_from_meta`); its error is the Poisson floor, taken as
++    independent of the fit.  This is the volume-averaged brightness gamma2.eta,
++    not the peak brightness a PCH fit reports.  It is a brightness per
++    molecule of the whole ensemble: with two species of equal brightness that
++    is each species' brightness, and CPS/N1 would not be species 1's
++    brightness, so no per-species form is reported.
++
++    Background correction (Koppel amplitude factor kappa = (F/S)^2, read from
++    the correlation CSV)
++
++        G0_corr = G0.kappa      N_corr = <N>/kappa
++        N1_corr = N1/kappa      N2_corr = N2/kappa
++        CPS/<N>_corr = (CPS/sqrt(kappa)) / N_corr = CPS.sqrt(kappa).G0
++
++    The corrected brightness pairs a background-FREE rate with a
++    background-free occupancy; dividing the raw rate by N_corr would correct
++    the denominator and leave the numerator carrying background photons.
++    sqrt(kappa) carries half kappa's relative error.
++
++    Errors
++    ------
++    An error is NaN -- a blank cell -- when nothing is left to estimate it
++    from: every parameter it depends on was held, and no measured input
++    (kappa, the count rate) carries an uncertainty either.  A parameter held
++    for THIS dataset contributes nothing, which is what holding it asserts;
++    the other inputs still do, so a fit with G0 held still reports sigma_N1
++    from sigma_f1 alone rather than throwing the row away.
++    """
++    out = {k: float("nan") for k in _DERIVED_KEYS}
++
++    values = ds.get("values", {}) or {}
++    errors = ds.get("errors", {}) or {}
++
++    def _held(name: str) -> bool:
++        return bool(ds.get("fixed", {}).get(
++            name, (result.get("fixed", {}) or {}).get(name, False)))
++
++    def _sig(name: str) -> float:
++        """1-sigma on a fitted parameter; 0.0 for a held one (see above)."""
++        if name not in values or _held(name):
++            return 0.0
++        try:
++            e = float(errors.get(name))
++        except (TypeError, ValueError):
++            return 0.0
++        return e if np.isfinite(e) else 0.0
++
++    try:
++        g0 = float(values.get("G0"))
++    except (TypeError, ValueError):
++        return out
++    if not np.isfinite(g0) or g0 <= 0:
++        # N = 1/G0 is meaningless for a non-positive amplitude, and so is
++        # everything built on it.  The caller gets blanks, not a crash.
++        return out
++
++    s_g0 = _sig("G0")
++    g0_free = not _held("G0")
++
++    N = 1.0 / g0
++    out["N"] = N
++    if g0_free:
++        out["N_err"] = s_g0 / (g0 * g0)
++
++    # ── Species fractions and occupancies ───────────────────────────────────
++    two = _is_two_species(result) and "f1" in values
++    if two:
++        try:
++            f1 = float(values["f1"])
++        except (TypeError, ValueError):
++            f1 = float("nan")
++    if two and np.isfinite(f1):
++        s_f1 = _sig("f1")
++        f1_free = not _held("f1")
++        out["f2"] = 1.0 - f1
++        if f1_free:
++            out["f2_err"] = s_f1          # f2 = 1 - f1 is exact
++        out["N1"] = f1 / g0
++        out["N2"] = (1.0 - f1) / g0
++        if g0_free or f1_free:
++            cov = _cov_entry(result, ds, "G0", "f1")
++            v1 = ((f1 / g0 ** 2) * s_g0) ** 2 + (s_f1 / g0) ** 2 \
++                - 2.0 * (f1 / g0 ** 3) * cov
++            v2 = (((1.0 - f1) / g0 ** 2) * s_g0) ** 2 + (s_f1 / g0) ** 2 \
++                + 2.0 * ((1.0 - f1) / g0 ** 3) * cov
++            # A pinv covariance can return a cross term slightly too large for
++            # the diagonal it came with; clipping at zero keeps a rounding
++            # artefact from becoming a NaN in the table.
++            out["N1_err"] = float(np.sqrt(max(v1, 0.0)))
++            out["N2_err"] = float(np.sqrt(max(v2, 0.0)))
++
++    # ── Brightness ──────────────────────────────────────────────────────────
++    cps = _cps_from_meta(ds.get("meta")) or {}
++    R = cps.get("cps_fit")
++    R_err = cps.get("cps_fit_err")
++    r_rel2 = 0.0
++    r_has = False
++    if R is not None and np.isfinite(R):
++        out["cpsm"] = R * g0
++        if R_err is not None and np.isfinite(R_err) and R_err > 0 and R > 0:
++            r_rel2 = (R_err / R) ** 2
++            r_has = True
++        rel2, has = r_rel2, r_has
++        if g0_free:
++            rel2 += (s_g0 / g0) ** 2
++            has = True
++        if has:
++            out["cpsm_err"] = abs(out["cpsm"]) * float(np.sqrt(rel2))
++
++    # ── Background-corrected twins ──────────────────────────────────────────
++    corr = _bg_corr_from_meta(ds.get("meta"))
++    if corr is None:
++        return out
++    # Named bg_* rather than kappa_*: the models already have a parameter
++    # called kappa -- the structure parameter z0/w0 -- and a dict carrying
++    # both under one name is a bug waiting for a reader in a hurry.
++    bg, bg_err = corr
++    out["bg_factor"], out["bg_factor_err"] = float(bg), float(bg_err)
++    k_rel = (bg_err / bg) if (bg > 0 and np.isfinite(bg_err)) else 0.0
++
++    # G0_corr and N_corr keep the combination this table has always written:
++    # fit and factor relative errors in quadrature.
++    rel2, has = 0.0, False
++    if g0_free:
++        rel2 += (s_g0 / g0) ** 2
++        has = True
++    if k_rel > 0:
++        rel2 += k_rel ** 2
++        has = True
++    rel = float(np.sqrt(rel2))
++    out["G0_corr"] = g0 * bg
++    out["N_corr"] = N / bg
++    if has:
++        out["G0_corr_err"] = out["G0_corr"] * rel
++        out["N_corr_err"] = out["N_corr"] * rel
++
++    if two and np.isfinite(out["N1"]):
++        for base in ("N1", "N2"):
++            val = out[base]
++            out[f"{base}_corr"] = val / bg
++            e = out[f"{base}_err"]
++            if np.isfinite(e) or k_rel > 0:
++                # Absolute rather than relative form, so a species driven to
++                # N = 0 (f1 pinned at a bound) still gets its error instead of
++                # a division by zero.
++                var = 0.0
++                if np.isfinite(e):
++                    var += (e / bg) ** 2
++                if k_rel > 0:
++                    var += (val * bg_err / (bg * bg)) ** 2
++                out[f"{base}_corr_err"] = float(np.sqrt(var))
++
++    if np.isfinite(out["cpsm"]):
++        out["cpsm_corr"] = float(R * np.sqrt(bg) * g0)
++        rel2, has = r_rel2, r_has
++        if g0_free:
++            rel2 += (s_g0 / g0) ** 2
++            has = True
++        if k_rel > 0:
++            rel2 += (0.5 * k_rel) ** 2      # sqrt(kappa): half the rel. error
++            has = True
++        if has:
++            out["cpsm_corr_err"] = abs(out["cpsm_corr"]) * float(np.sqrt(rel2))
++
++    return out
++
++
++def _fmt_der(v: Optional[float], e: Optional[float] = None) -> str:
++    """One derived value for the report: ``1.234  ± 0.056``, or ``n/a``."""
++    if v is None or not np.isfinite(v):
++        return "n/a"
++    s = f"{v:.6g}"
++    if e is None or not np.isfinite(e):
++        return s
++    return f"{s}  ± {e:.6g}"
++
++
++def _derived_report_lines(result: dict, ds: dict, indent: str = "    ") -> list:
++    """
++    The per-dataset "derived" block of a fit report.
++
++    Empty when nothing could be derived, so a model without an amplitude adds
++    no heading to the report.
++    """
++    d = _derived_quantities(result, ds)
++    if not np.isfinite(d["N"]):
++        return []
++    L = [f"{indent}derived:"]
++    pad = indent + "  "
++    L.append(f"{pad}{'<N>':<12} = {_fmt_der(d['N'], d['N_err'])}")
++    if np.isfinite(d["f2"]):
++        L.append(f"{pad}{'f2':<12} = {_fmt_der(d['f2'], d['f2_err'])}"
++                 f"   (= 1 - f1)")
++        L.append(f"{pad}{'N1':<12} = {_fmt_der(d['N1'], d['N1_err'])}")
++        L.append(f"{pad}{'N2':<12} = {_fmt_der(d['N2'], d['N2_err'])}"
++                 f"   (Ni = fi.<N>; errors carry cov(G0,f1))")
++    if np.isfinite(d["cpsm"]):
++        L.append(f"{pad}{'CPS/<N>':<12} = {_fmt_der(d['cpsm'], d['cpsm_err'])}"
++                 f"   Hz per molecule (= CPS x G0)")
++    if np.isfinite(d["bg_factor"]):
++        L.append(f"{pad}background-corrected (Koppel factor "
++                 f"{_fmt_der(d['bg_factor'], d['bg_factor_err'] or None)}):")
++        pad2 = pad + "  "
++        L.append(f"{pad2}{'N_corr':<10} = {_fmt_der(d['N_corr'], d['N_corr_err'])}")
++        if np.isfinite(d["N1_corr"]):
++            L.append(f"{pad2}{'N1_corr':<10} = "
++                     f"{_fmt_der(d['N1_corr'], d['N1_corr_err'])}")
++            L.append(f"{pad2}{'N2_corr':<10} = "
++                     f"{_fmt_der(d['N2_corr'], d['N2_corr_err'])}")
++        if np.isfinite(d["cpsm_corr"]):
++            L.append(f"{pad2}{'CPS/<N>':<10} = "
++                     f"{_fmt_der(d['cpsm_corr'], d['cpsm_corr_err'])}"
++                     f"   = (CPS/sqrt(kappa))/N_corr")
++    return L
++
++
+ # ── Initial-guess heuristics ──────────────────────────────────────────────────
+ 
+ # Pair-starved cutoff.
+@@ -515,6 +832,9 @@ def fit_global(
+             # tell a fitted value from a shared or held one row by row.
+             "fixed": entry.get("fixed", {}),
+             "linked": entry.get("linked", {}),
++            # Free-parameter slots, so _derived_quantities can read
++            # cov(G0, f1) out of result["cov"] for this dataset.
++            "free_slots": entry.get("free_slots", {}),
+         })
+ 
+     result = dict(out)
+@@ -1091,6 +1411,9 @@ def export_global_fit(result: dict, out_source: str | Path,
+                 err = f"{ds['errors'][n]:.6g}"
+             L.append(f"    {n:<8} = {ds['values'][n]:.6g}  ± {err}  "
+                      f"{unit}{tag}".rstrip())
++        # Occupancies, the second fraction and the brightness, so the report
++        # carries what used to be worked out by hand from G0 and f1.
++        L.extend(_derived_report_lines(result, ds))
+         L.append("")
+     
+     corr = [(ds["name"], _bg_corr_from_meta(ds.get("meta")))
+@@ -1209,12 +1532,21 @@ def export_global_fit(result: dict, out_source: str | Path,
+     has_N = "G0" in result["names"]
+     if has_N:
+         p_header += ["N", "N_err"]                 # <N> = 1/G0, propagated error
++    has_species = has_N and _is_two_species(result)
++    if has_species:
++        # The second fraction and both species occupancies -- the
++        # calculated columns this table used to leave to a spreadsheet.
++        p_header += ["f2", "f2_err",
++                     "N1", "N1_err", "N2", "N2_err"]
+     
+     has_bg = has_N and any(_bg_corr_from_meta(ds.get("meta")) is not None
+                            for ds in result["datasets"])
+     if has_bg:
+         p_header += ["bg_correction_factor", "bg_correction_factor_err",
+                      "G0_corr", "G0_corr_err", "N_corr", "N_corr_err"]
++        if has_species:
++            p_header += ["N1_corr", "N1_corr_err",
++                         "N2_corr", "N2_corr_err"]
+                      
+     has_cps = any(_cps_from_meta(ds.get("meta")) is not None
+                   for ds in result["datasets"])
+@@ -1222,6 +1554,12 @@ def export_global_fit(result: dict, out_source: str | Path,
+         p_header += ["cps_ch1", "cps_ch1_err",
+                      "cps_ch2", "cps_ch2_err",
+                      "cps_fit", "cps_fit_err", "acq_time_s"]
++        if has_N:
++            # CPS/<N>: the brightness per molecule, reported wherever a
++            # count rate is.
++            p_header += ["cpsm", "cpsm_err"]
++            if has_bg:
++                p_header += ["cpsm_corr", "cpsm_corr_err"]
+     p_header += ["r2", "n_points"]
+ 
+     # Build native-typed rows ONCE, then render to both .csv and .xlsx.
+@@ -1241,29 +1579,23 @@ def export_global_fit(result: dict, out_source: str | Path,
+             row.append(float("nan") if role == "held"
+                        else float(ds["errors"][n]))
+             row.append(role)
+-        N = N_err = float("nan")
++        # One definition of every derived quantity, shared with the
++        # report above (see _derived_quantities).  N_err is now blank
++        # rather than 0.0 when G0 was held: a held parameter has no
++        # fitted error, and 0.0 read as perfect precision.
++        d = _derived_quantities(result, ds)
+         if has_N:
+-            g0  = ds["values"]["G0"]
+-            g0e = ds["errors"]["G0"]
+-            if g0 > 0:
+-                N     = 1.0 / g0
+-                N_err = g0e / (g0 * g0)             # σ_N = σ_G0 / G0²
+-            row.append(float(N))
+-            row.append(float(N_err))
+-        
++            row += [d["N"], d["N_err"]]
++        if has_species:
++            row += [d["f2"], d["f2_err"],
++                    d["N1"], d["N1_err"], d["N2"], d["N2_err"]]
+         if has_bg:
+-            corr = _bg_corr_from_meta(ds.get("meta"))
+-            if corr is not None and g0 > 0:
+-                kappa, kappa_err = corr
+-                rel = float(np.sqrt((g0e / g0) ** 2 + (kappa_err / kappa) ** 2))
+-                g0_corr = g0 * kappa
+-                N_corr  = N / kappa
+-                row += [float(kappa), float(kappa_err),
+-                        float(g0_corr), float(g0_corr * rel),
+-                        float(N_corr),  float(N_corr * rel)]
+-            else:
+-                row += [float("nan")] * 6
+-                
++            row += [d["bg_factor"], d["bg_factor_err"],
++                    d["G0_corr"], d["G0_corr_err"],
++                    d["N_corr"], d["N_corr_err"]]
++            if has_species:
++                row += [d["N1_corr"], d["N1_corr_err"],
++                        d["N2_corr"], d["N2_corr_err"]]
+         if has_cps:
+             cps = _cps_from_meta(ds.get("meta")) or {}
+             for key in ("cps_ch1", "cps_ch1_err",
+@@ -1271,6 +1603,10 @@ def export_global_fit(result: dict, out_source: str | Path,
+                         "cps_fit", "cps_fit_err", "acq_time_s"):
+                 v = cps.get(key)
+                 row.append(float(v) if v is not None else float("nan"))
++            if has_N:
++                row += [d["cpsm"], d["cpsm_err"]]
++                if has_bg:
++                    row += [d["cpsm_corr"], d["cpsm_corr_err"]]
+         row.append(float(ds["r2"]))
+         row.append(int(ds["n_points"]))
+         data_rows.append(row)
+@@ -1300,16 +1636,39 @@ def export_global_fit(result: dict, out_source: str | Path,
+     comments.append("units : tau_D in seconds")
+     if has_N:
+         comments.append("note : N = 1/G0 (geometric factor 1); N_err = G0_err / G0^2")
++        comments.append("note_derived_err : a derived error is blank when every "
++                        "parameter it depends on was held fixed")
++    if has_species:
++        comments.append("note_species : f2 = 1 - f1 exactly, so f2_err = f1_err ; "
++                        "N1 = f1/G0 and N2 = (1-f1)/G0, with errors propagated "
++                        "using cov(G0,f1) from the fit covariance (the two are "
++                        "anticorrelated, so independent errors would be wrong)")
++        comments.append("note_species_scope : N1 and N2 are occupancies only "
++                        "under the model's equal-brightness assumption; with "
++                        "unequal brightnesses f1 is a brightness-weighted "
++                        "amplitude fraction and these are not molecule counts")
+ 
+     if has_bg:
+         comments.append("note : G0_corr = G0 * bg_correction_factor "
+                         "(Koppel amplitude correction, from the correlation CSV)")
+         comments.append("note : N_corr = N / bg_correction_factor ; "
+                         "*_corr_err combine fit and factor errors in quadrature")
++        if has_species:
++            comments.append("note_species_corr : N1_corr = N1 / "
++                            "bg_correction_factor, N2_corr likewise")
+ 
+     if has_cps:
+         comments.append("note : cps_* are mean count rates (Hz) from the correlation "
+                         "headers; cps_fit = that channel (auto) or the Ch1/Ch2 average (cross)")
++        if has_N:
++            comments.append("note_cpsm : cpsm = cps_fit/N = cps_fit * G0 (Hz per "
++                            "molecule); this is the volume-averaged brightness "
++                            "gamma2*eta, not the peak brightness a PCH fit reports")
++            if has_bg:
++                comments.append("note_cpsm_corr : cpsm_corr = "
++                                "(cps_fit/sqrt(kappa))/N_corr = "
++                                "cps_fit*sqrt(kappa)*G0 - a background-free rate "
++                                "over a background-free occupancy")
+ 
+     # One writer for the .csv and its .xlsx mirror, shared with the lifetime
+     # and reconvolution fitters.  Note this changes how a non-finite cell is
+diff --git a/fcs_globalfit.py b/fcs_globalfit.py
+index 3dd96dd..16efa24 100644
+--- a/fcs_globalfit.py
++++ b/fcs_globalfit.py
+@@ -664,6 +664,15 @@ def fit_linked(
+             # blanks an error cell has to know which.
+             "fixed": {p: resolved[p][di][0] == FIX for p in names},
+             "linked": {p: resolved[p][di][0] == LINK for p in names},
++            # Which free-parameter slot each parameter used for THIS dataset,
++            # None where it was held.  The covariance returned below is
++            # indexed by those slots, and only this layout knows which row and
++            # column a (parameter, dataset) pair owns -- so a caller deriving
++            # a quantity from two fitted parameters cannot reach their
++            # covariance without it.  Propagating such an error from the
++            # diagonal alone is wrong whenever the two trade against each
++            # other, which in a two-component fit they always do.
++            "free_slots": {p: slot_of(p, di) for p in names},
+         })
+         per_dataset.append(entry)
+ 
