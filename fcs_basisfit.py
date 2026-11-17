@@ -535,7 +535,8 @@ def plot_basis_fit(fit, show=True):
 
     res = fit["residual_weighted"] if fit["weighted"] else fit["residual"]
     axr.axhline(0.0, color="grey", linewidth=0.8, label="_zero")
-    axr.plot(tau_ms, res, "o", ms=2.5, color="#2c6fbb", label="_residuals")
+    axr.plot(tau_ms, res, color="#2c6fbb", label="_residuals",
+             **fcs_plottools.residual_style(marker="o", markersize=2.5))
     axr.set_xscale("log")
     axr.set_xlabel("Lag time τ (ms)", fontsize=12)
     axr.set_ylabel("resid/σ" if fit["weighted"] else "resid", fontsize=10)

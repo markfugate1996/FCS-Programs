@@ -203,6 +203,80 @@ PREFS: list = [
              "dataset, largest first.",
     ),
     Pref(
+        key="resid_style",
+        label="Residual trace style",
+        section="Plot defaults",
+        kind="choice",
+        default="line",
+        target=("fcs_plottools", "_RESID_STYLE"),
+        choices=("points", "line", "line+points"),
+        help="A thin line shows a trend in the residuals that a cloud of "
+             "dots hides. Applies to FCS, lifetime, PCH and matrix/basis "
+             "fit panels; the Traces section still overrides one figure.",
+    ),
+    Pref(
+        key="resid_linewidth",
+        label="Residual line width",
+        section="Plot defaults",
+        kind="float",
+        default=0.8,
+        target=("fcs_plottools", "_RESID_LINEWIDTH"),
+        lo=0.1, hi=5.0,
+        help="Points, not pixels. Ignored when the style above is points.",
+    ),
+    Pref(
+        key="save_tight",
+        label="Crop saved figures to content",
+        section="Plot defaults",
+        kind="bool",
+        default=True,
+        target=("fcs_plottools", "_SAVE_TIGHT"),
+        help="On, the file is cropped to the drawn artists and is NOT the "
+             "figure size. Off, it is exactly the size set in the controls "
+             "panel -- what a journal column width needs.",
+    ),
+    Pref(
+        key="svg_editable_text",
+        label="Keep SVG text editable",
+        section="Plot defaults",
+        kind="bool",
+        default=True,
+        target=("fcs_plottools", "_SVG_EDITABLE_TEXT"),
+        help="On, labels stay as text for Illustrator/Inkscape. Off, every "
+             "glyph becomes a path: renders anywhere, editable nowhere.",
+    ),
+    Pref(
+        key="grid_default",
+        label="Gridlines on new figures",
+        section="Plot defaults",
+        kind="choice",
+        default="as drawn",
+        target=("fcs_plottools", "_GRID_DEFAULT"),
+        choices=("as drawn", "on", "off"),
+        help="'as drawn' keeps each plot's own choice. The others override "
+             "every axis when the figure is shown; the Grid section still "
+             "toggles one figure.",
+    ),
+    Pref(
+        key="grid_show_minor",
+        label="Include minor gridlines",
+        section="Plot defaults",
+        kind="bool",
+        default=True,
+        target=("fcs_plottools", "_GRID_SHOW_MINOR"),
+        help="Only consulted when the setting above is 'on'.",
+    ),
+    Pref(
+        key="grid_major_linestyle",
+        label="Major gridline style",
+        section="Plot defaults",
+        kind="choice",
+        default="--",
+        target=("fcs_plottools", "_GRID_MAJOR_LINESTYLE"),
+        choices=("--", ":", "-.", "-"),
+        help="Also used by the Grid section when it switches gridlines on.",
+    ),
+    Pref(
         key="linsolve_cd_target_chi2_red",
         label="Stop at chi2/dof",
         section="Matrix method stopping",

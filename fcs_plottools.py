@@ -148,6 +148,10 @@ def show_figure(
         plt.show()
         return
 
+    # Gridlines before the panel is built, so the Grid checkboxes open
+    # showing what is actually on screen.
+    apply_grid_default(axes_list)
+
     # Try to get the Tk window that backs this figure
     try:
         tk_win = fig.canvas.manager.window
@@ -334,6 +338,13 @@ _FIGURE_FORMAT = "svg"
 # Raster resolution.  Ignored for svg/pdf, which have no pixel grid.
 _FIGURE_DPI = 150
 
+# Crop saved figures to the drawn artists (plus savefig.pad_inches) rather
+# than writing them at the figure's own size.  Convenient for a figure that
+# will be dropped into a document, wrong when the file has to hit a column
+# width exactly -- see the Figure size section of the controls panel, whose
+# checkbox starts from this value.
+_SAVE_TIGHT = True
+
 # Keep SVG text as real <text> elements rather than converting it to outlines.
 #
 # Matplotlib defaults to svg.fonttype='path', which traces every glyph as a
@@ -348,7 +359,7 @@ _RASTER_FORMATS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 
 def save_figure(fig, path, *, fmt: str = None, dpi: int = None,
-                tight: bool = True):
+                tight: bool = None):
     """
     Save *fig*, defaulting to vector SVG.
 
@@ -368,7 +379,7 @@ def save_figure(fig, path, *, fmt: str = None, dpi: int = None,
     p = p.with_suffix(ext)
 
     kw = {}
-    if tight:
+    if _SAVE_TIGHT if tight is None else tight:
         kw["bbox_inches"] = "tight"
     if ext.lower() in _RASTER_FORMATS:
         kw["dpi"] = dpi if dpi is not None else _FIGURE_DPI
@@ -1561,6 +1572,50 @@ def _build_limits_section(
               width=8, pady=2).pack(side="left")
 
 
+# ── Residual traces ───────────────────────────────────────────────────────────
+
+# How residual panels are drawn by default, suite-wide.  A thin line makes a
+# trend in the residuals legible: a systematic wander that reads as a vague
+# thickening in a cloud of dots is obvious as a curve.  Points remain the
+# honest choice when the residuals are genuinely independent samples and a
+# connecting line would imply continuity that is not there, so this is a
+# preference rather than a fixed change.
+#
+# "points" | "line" | "line+points"
+_RESID_STYLE = "line"
+_RESID_LINEWIDTH = 0.8
+
+_RESID_STYLES = ("points", "line", "line+points")
+
+
+def residual_style(marker: str = ".", markersize: float = 2.5,
+                   **overrides) -> dict:
+    """
+    Matplotlib keyword arguments for one residual trace.
+
+    Call sites pass the marker and size they would otherwise have hard-coded
+    (so switching back to "points" reproduces the figure exactly as it was
+    drawn before) and keep passing their own colour, alpha and label::
+
+        axr.plot(x, res, color=c, alpha=0.8, label="_resid",
+                 **fcs_plottools.residual_style(markersize=2.5))
+
+    *overrides* win over everything, for a call site with a real reason to
+    differ.  An unrecognised _RESID_STYLE falls back to points rather than
+    raising: a bad preference value must not take down a fit plot.
+    """
+    style = _RESID_STYLE if _RESID_STYLE in _RESID_STYLES else "points"
+    if style == "points":
+        kw = {"linestyle": "none", "marker": marker, "markersize": markersize}
+    elif style == "line":
+        kw = {"linestyle": "-", "linewidth": _RESID_LINEWIDTH, "marker": "None"}
+    else:
+        kw = {"linestyle": "-", "linewidth": _RESID_LINEWIDTH,
+              "marker": marker, "markersize": markersize}
+    kw.update(overrides)
+    return kw
+
+
 # ── Gridlines ─────────────────────────────────────────────────────────────────
 
 # Style applied when gridlines are switched ON from the controls panel.  The
@@ -1569,11 +1624,77 @@ def _build_limits_section(
 # it was drawn rather than to the matplotlib default.  Module-level so the
 # preferences system can retarget them at runtime, the same pattern
 # _FIGURE_FORMAT and _NORMALIZE_K follow; both are re-read on every toggle.
-_GRID_MAJOR_KW = {"linestyle": "--", "linewidth": 0.4, "alpha": 0.5}
+# Scalars rather than one dict because a preference targets a module
+# attribute: a dict would have to be replaced wholesale to change one value.
+_GRID_MAJOR_LINESTYLE = "--"
+_GRID_MAJOR_LINEWIDTH = 0.4
+_GRID_MAJOR_ALPHA = 0.5
 # Minor lines are deliberately lighter.  A semilog correlation axis carries
 # eight minor lines per decade, and at major weight they read as a hatch over
 # the data rather than as a reference to measure against.
-_GRID_MINOR_KW = {"linestyle": ":", "linewidth": 0.3, "alpha": 0.3}
+_GRID_MINOR_LINESTYLE = ":"
+_GRID_MINOR_LINEWIDTH = 0.3
+_GRID_MINOR_ALPHA = 0.3
+
+# Gridlines on a freshly drawn figure: "as drawn" leaves each plotter's own
+# choice alone, which is the shipped behaviour; "on" and "off" override every
+# axis at display time.
+_GRID_DEFAULT = "as drawn"
+_GRID_DEFAULTS = ("as drawn", "on", "off")
+
+# Whether "on" brings minor gridlines with it.
+_GRID_SHOW_MINOR = True
+
+
+def grid_major_kw() -> dict:
+    """Style for major gridlines, read fresh so preferences take effect."""
+    return {"linestyle": _GRID_MAJOR_LINESTYLE,
+            "linewidth": _GRID_MAJOR_LINEWIDTH,
+            "alpha": _GRID_MAJOR_ALPHA}
+
+
+def grid_minor_kw() -> dict:
+    """Style for minor gridlines, read fresh so preferences take effect."""
+    return {"linestyle": _GRID_MINOR_LINESTYLE,
+            "linewidth": _GRID_MINOR_LINEWIDTH,
+            "alpha": _GRID_MINOR_ALPHA}
+
+
+def apply_grid_default(axes_list) -> None:
+    """
+    Impose the _GRID_DEFAULT preference on freshly drawn axes.
+
+    Called from show_figure, after the plotter has drawn and before the
+    controls panel is built, so the Grid checkboxes reflect what is on
+    screen.  "as drawn" returns immediately, which is why a plotter that
+    deliberately draws no grid keeps its appearance unless the user asks
+    otherwise.
+
+    Note that "on" calls minorticks_on() where minor gridlines are wanted
+    but no minor ticks exist: gridlines are drawn at ticks, so without them
+    ax.grid(which="minor") silently draws nothing.
+    """
+    if _GRID_DEFAULT not in _GRID_DEFAULTS or _GRID_DEFAULT == "as drawn":
+        return
+    want = _GRID_DEFAULT == "on"
+    for ax in axes_list:
+        try:
+            if want:
+                ax.grid(True, which="major", **grid_major_kw())
+            else:
+                ax.grid(False, which="major")
+        except Exception:
+            pass
+        try:
+            if want and _GRID_SHOW_MINOR:
+                if not (len(ax.xaxis.get_minorticklocs()) or
+                        len(ax.yaxis.get_minorticklocs())):
+                    ax.minorticks_on()
+                ax.grid(True, which="minor", **grid_minor_kw())
+            else:
+                ax.grid(False, which="minor")
+        except Exception:
+            pass
 
 
 def _grid_is_on(ax, which: str) -> bool:
@@ -1658,14 +1779,14 @@ def _build_grid_section(
                     pass
             try:
                 if want_major:
-                    ax.grid(True, which="major", **dict(_GRID_MAJOR_KW))
+                    ax.grid(True, which="major", **grid_major_kw())
                 else:
                     ax.grid(False, which="major")
             except Exception:
                 pass
             try:
                 if want_minor:
-                    ax.grid(True, which="minor", **dict(_GRID_MINOR_KW))
+                    ax.grid(True, which="minor", **grid_minor_kw())
                 else:
                     ax.grid(False, which="minor")
             except Exception:
@@ -2649,7 +2770,7 @@ def _build_size_section(panel, fig: plt.Figure):
     cur_w, cur_h = (float(v) for v in fig.get_size_inches())
     w_var = tk.StringVar(master=panel, value=f"{cur_w:.2f}")
     h_var = tk.StringVar(master=panel, value=f"{cur_h:.2f}")
-    tight_var = tk.BooleanVar(master=panel, value=True)
+    tight_var = tk.BooleanVar(master=panel, value=bool(_SAVE_TIGHT))
 
     row = tk.Frame(sz)
     row.pack(fill="x", pady=(2, 0))

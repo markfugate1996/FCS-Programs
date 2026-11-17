@@ -552,8 +552,8 @@ def plot_lifetime_fit(
     ax.set_title(f"{title}\n{subtitle}", fontsize=10)
 
     # Weighted residuals
-    axr.plot(t, result["wresid"], linestyle="none", marker=".",
-             markersize=2.5, color="steelblue")
+    axr.plot(t, result["wresid"], color="steelblue",
+             **fcs_plottools.residual_style(markersize=2.5))
     axr.axhline(0, color="grey", linewidth=0.8)
     axr.set_ylabel("resid/σ", fontsize=10)
     axr.set_xlabel("Time (ns)", fontsize=12)

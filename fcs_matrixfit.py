@@ -474,7 +474,8 @@ def plot_matrix_curve(fit, show=True):
     # "unnamed" or to a description that can be actively wrong (an unlabelled
     # near-zero residual series gets described as a reference line).
     axr.axhline(0.0, color="grey", linewidth=0.8, label="_zero")
-    axr.plot(tau_ms, res, "o", ms=2.5, color="#2c6fbb", label="_residuals")
+    axr.plot(tau_ms, res, color="#2c6fbb", label="_residuals",
+             **fcs_plottools.residual_style(marker="o", markersize=2.5))
     axr.set_xscale("log")
     axr.set_xlabel("Lag time τ (ms)", fontsize=12)
     axr.set_ylabel("resid/σ" if fit["weighted"] else "resid", fontsize=10)
@@ -551,8 +552,9 @@ def plot_matrix_curve_overlay(fits, show=True):
         ln_data._norm_ref = ln_fit
 
         res = f["residual_weighted"] if f["weighted"] else f["residual"]
-        axr.plot(tau_ms, res, linestyle="none", marker=".", ms=2.5,
-                 color=c, alpha=0.8, label="_%s  (residual)" % f["name"])
+        axr.plot(tau_ms, res, color=c, alpha=0.8,
+                 label="_%s  (residual)" % f["name"],
+                 **fcs_plottools.residual_style(markersize=2.5))
 
     ax.set_xscale("log")
     ax.set_ylabel("G(τ)", fontsize=12)

@@ -611,7 +611,8 @@ def plot_pch_fit(result: dict, source_name: str, show: bool = True
         axr.set_ylabel("resid/σ", fontsize=10)
     else:
         axr.set_ylabel("resid", fontsize=10)
-    axr.plot(k, res, linestyle="none", marker="o", markersize=4, color="steelblue")
+    axr.plot(k, res, color="steelblue",
+             **fcs_plottools.residual_style(marker="o", markersize=4))
     axr.axhline(0, color="grey", linewidth=0.8)
     axr.set_xlabel("Photons per bin  k", fontsize=12)
     axr.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.5)
@@ -1294,8 +1295,8 @@ def plot_pch_global_fit(result: dict, show: bool = True):
         # fit's leading-point reference, never separately from their fit.
         ln_data._norm_ref = ln_fit
         sig = ds["sigma"] if ds.get("sigma") is not None else 1.0
-        axr.plot(ds["x"], ds["resid"] / sig, marker="o", markersize=3,
-                 linestyle="none", color=colour)
+        axr.plot(ds["x"], ds["resid"] / sig, color=colour,
+                 **fcs_plottools.residual_style(marker="o", markersize=3))
 
     ax.set_yscale("log")
     ax.set_ylabel("Probability  p(k)", fontsize=12)

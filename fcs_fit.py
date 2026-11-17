@@ -960,9 +960,9 @@ def plot_global_fit(result: dict, show: bool = True):
         # separately from the curve they were fitted with.
         ln_data._norm_ref = ln_fit
         res = ds["resid"] / ds["sigma"] if result["weighted"] else ds["resid"]
-        axr.semilogx(tau_ms, res, linestyle="none", marker=".",
-                     markersize=2.5, color=c, alpha=0.8,
-                     label=f"_{ds['name']}  (residual)")
+        axr.semilogx(tau_ms, res, color=c, alpha=0.8,
+                     label=f"_{ds['name']}  (residual)",
+                     **fcs_plottools.residual_style(markersize=2.5))
 
     ax.axhline(0, color="grey", linewidth=0.6, linestyle="--")
     ax.set_ylabel("G(τ)", fontsize=12)
