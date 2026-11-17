@@ -1,0 +1,363 @@
+"""
+Edit table for the correlation fit-range feature (fcs_fit.py).
+Imported by patch_fit_range.py.  LF newlines; the patcher re-encodes.
+"""
+
+EDITS = [
+    # ── fit_global: accept a lag window ───────────────────────────────────
+    ("fit_global signature",
+'''    drop_pair_starved: bool = True,
+    pair_starved_cutoff: float = _PAIR_STARVED_CUTOFF,
+    plans: Optional[Dict[str, tuple]] = None,
+) -> dict:
+''',
+'''    drop_pair_starved: bool = True,
+    pair_starved_cutoff: float = _PAIR_STARVED_CUTOFF,
+    plans: Optional[Dict[str, tuple]] = None,
+    tau_min: Optional[float] = None,
+    tau_max: Optional[float] = None,
+) -> dict:
+'''),
+
+    ("fit_global docstring: the lag window",
+'''    Returns a result dict with global goodness-of-fit plus a per-dataset
+    breakdown (values, 1σ errors, fit curve, residuals, R²).
+''',
+'''    *tau_min* and *tau_max* restrict the fit to a lag window, IN SECONDS to
+    match ``ds["tau"]`` (the dialog takes ms and converts).  Either may be
+    None for an open end.  Lags outside the window are dropped before
+    fitting exactly as pair-starved channels are, and the count per dataset
+    is returned as ``n_range_excluded``; the window itself is returned as
+    ``tau_min``/``tau_max`` so the report can state what was fitted.  This
+    restricts the FIT only -- it does not touch the correlation, so trying a
+    different window costs nothing but a refit.
+
+    Returns a result dict with global goodness-of-fit plus a per-dataset
+    breakdown (values, 1σ errors, fit curve, residuals, R²).
+'''),
+
+    ("_keep applies the lag window",
+'''    starved_counts: Dict[str, int] = {}
+
+    def _keep(ds, tau, G, mask):
+        keep = tau > 0
+        n_starved = 0
+        if drop_pair_starved:
+            starved = mask & keep & (G <= pair_starved_cutoff)
+            n_starved = int(np.count_nonzero(starved))
+            keep = keep & ~starved
+        starved_counts[ds["name"]] = n_starved
+        return keep
+''',
+'''    starved_counts: Dict[str, int] = {}
+    range_counts: Dict[str, int] = {}
+
+    def _keep(ds, tau, G, mask):
+        keep = tau > 0
+        n_starved = 0
+        if drop_pair_starved:
+            starved = mask & keep & (G <= pair_starved_cutoff)
+            n_starved = int(np.count_nonzero(starved))
+            keep = keep & ~starved
+        # The lag window, counted the same way: against points that were
+        # otherwise usable, so a channel already censored as pair-starved is
+        # not reported twice.
+        n_out = 0
+        if tau_min is not None or tau_max is not None:
+            inside = np.ones(np.shape(tau), dtype=bool)
+            if tau_min is not None:
+                inside &= tau >= tau_min
+            if tau_max is not None:
+                inside &= tau <= tau_max
+            n_out = int(np.count_nonzero(mask & keep & ~inside))
+            keep = keep & inside
+        starved_counts[ds["name"]] = n_starved
+        range_counts[ds["name"]] = n_out
+        return keep
+'''),
+
+    ("too-few-points message names the window",
+'''    for pp in prepped:
+        n_starved = starved_counts.get(pp["name"], 0)
+        pp["n_pair_starved"] = n_starved
+        if len(pp["x"]) < 2:
+            if n_starved:
+''',
+'''    for pp in prepped:
+        n_starved = starved_counts.get(pp["name"], 0)
+        n_out_of_range = range_counts.get(pp["name"], 0)
+        pp["n_pair_starved"] = n_starved
+        pp["n_range_excluded"] = n_out_of_range
+        if len(pp["x"]) < 2:
+            if n_out_of_range:
+                # Say which setting emptied the dataset.  The window is the
+                # one the user just typed, so it is the first thing to check.
+                _lo = "open" if tau_min is None else f"{tau_min * 1e3:g} ms"
+                _hi = "open" if tau_max is None else f"{tau_max * 1e3:g} ms"
+                raise ValueError(
+                    f"Dataset '{pp['name']}' has too few points left to fit: "
+                    f"{n_out_of_range} lag channel"
+                    f"{'s' if n_out_of_range != 1 else ''} fell outside the "
+                    f"fit range ({_lo} to {_hi}) and fewer than two remain.\\n\\n"
+                    f"Widen the range, or check that it matches the lag axis "
+                    f"of this dataset."
+                )
+            if n_starved:
+'''),
+
+    ("per-dataset result carries the count",
+'''            "n_pair_starved": entry.get("n_pair_starved", 0),
+''',
+'''            "n_pair_starved": entry.get("n_pair_starved", 0),
+            "n_range_excluded": entry.get("n_range_excluded", 0),
+'''),
+
+    ("result records the window",
+'''    result["drop_pair_starved"] = bool(drop_pair_starved)
+    result["pair_starved_cutoff"] = float(pair_starved_cutoff)
+    return result
+''',
+'''    result["drop_pair_starved"] = bool(drop_pair_starved)
+    result["pair_starved_cutoff"] = float(pair_starved_cutoff)
+    result["tau_min"] = None if tau_min is None else float(tau_min)
+    result["tau_max"] = None if tau_max is None else float(tau_max)
+    return result
+'''),
+
+    # ── report ────────────────────────────────────────────────────────────
+    ("report states the fit range",
+'''    _starved = sum(d.get("n_pair_starved", 0) for d in result["datasets"])
+''',
+'''    # Provenance: a fit over part of the curve must say so, and a fit over
+    # all of it must say that too -- otherwise a report with no range line is
+    # ambiguous between "full range" and "written before ranges existed".
+    _lo, _hi = result.get("tau_min"), result.get("tau_max")
+    if _lo is not None or _hi is not None:
+        _excl = sum(d.get("n_range_excluded", 0) for d in result["datasets"])
+        _lo_s = "open" if _lo is None else f"{_lo * 1e3:g}"
+        _hi_s = "open" if _hi is None else f"{_hi * 1e3:g}"
+        L.append(f"fit range  : {_lo_s} to {_hi_s} ms   "
+                 f"({_excl} lag channel{'s' if _excl != 1 else ''} outside "
+                 f"the range excluded)")
+    else:
+        L.append("fit range  : full measured range")
+
+    _starved = sum(d.get("n_pair_starved", 0) for d in result["datasets"])
+'''),
+
+    ("per-dataset report line",
+'''        _ns = ds.get("n_pair_starved", 0)
+        _drop = f"   pair-starved dropped: {_ns}" if _ns else ""
+        L.append(f"[{ds['name']}]   points: {ds['n_points']}   "
+                 f"R² = {ds['r2']:.5f}{_drop}")
+''',
+'''        _ns = ds.get("n_pair_starved", 0)
+        _drop = f"   pair-starved dropped: {_ns}" if _ns else ""
+        _nr = ds.get("n_range_excluded", 0)
+        if _nr:
+            _drop += f"   outside fit range: {_nr}"
+        L.append(f"[{ds['name']}]   points: {ds['n_points']}   "
+                 f"R² = {ds['r2']:.5f}{_drop}")
+'''),
+
+    ("curves CSV header records the range",
+'''        fh.write(f"# weighted   : {'yes' if weighted else 'no'}\\n")
+''',
+'''        fh.write(f"# weighted   : {'yes' if weighted else 'no'}\\n")
+        # Not recoverable from the numbers: lags outside the window are
+        # simply absent from the rows, so without this line a restricted fit
+        # reopens looking like a full fit of a shorter correlation.
+        _rlo, _rhi = result.get("tau_min"), result.get("tau_max")
+        if _rlo is not None or _rhi is not None:
+            fh.write("# fit_range  : "
+                     f"{'open' if _rlo is None else format(_rlo * 1e3, 'g')}"
+                     f" to "
+                     f"{'open' if _rhi is None else format(_rhi * 1e3, 'g')}"
+                     " ms\\n")
+        else:
+            fh.write("# fit_range  : full measured range\\n")
+'''),
+
+    # ── dialog: the range row ─────────────────────────────────────────────
+    ("fit range row in the setup dialog",
+'''    # Optional label folded into the output filenames, so a set of fits can
+    # be told apart in a file listing (and in Excel's window list) without
+    # opening them.
+    name_row = tk.Frame(win)
+''',
+'''    # ── Fit range ─────────────────────────────────────────────────────────
+    # Restricting the fit is otherwise a matter of recomputing the
+    # correlation over a shorter lag axis: slow, and it leaves a second set
+    # of files behind for what is a fitting decision, not a measurement one.
+    # The boxes are in ms because that is the unit on the plot's lag axis;
+    # fit_global takes seconds.
+    _tau_lo_s = min(float(np.min(ds["tau"][ds["tau"] > 0])) for ds in datasets)
+    _tau_hi_s = max(float(np.max(ds["tau"])) for ds in datasets)
+    _full_lo_ms, _full_hi_ms = _tau_lo_s * 1e3, _tau_hi_s * 1e3
+
+    range_row = tk.Frame(win)
+    range_row.pack(fill="x", padx=12, pady=(8, 0))
+    tk.Label(range_row, text="Fit range (ms):", anchor="w",
+             font=("Helvetica", 9)).pack(side="left")
+    rmin_var = tk.StringVar(value=f"{_full_lo_ms:g}")
+    rmax_var = tk.StringVar(value=f"{_full_hi_ms:g}")
+    tk.Entry(range_row, textvariable=rmin_var, width=10, justify="right",
+             font=("Helvetica", 9)).pack(side="left", padx=(4, 2))
+    tk.Label(range_row, text="to", font=("Helvetica", 9)).pack(side="left")
+    tk.Entry(range_row, textvariable=rmax_var, width=10, justify="right",
+             font=("Helvetica", 9)).pack(side="left", padx=2)
+
+    def _reset_range():
+        rmin_var.set(f"{_full_lo_ms:g}")
+        rmax_var.set(f"{_full_hi_ms:g}")
+
+    tk.Button(range_row, text="Full range", command=_reset_range,
+              font=("Helvetica", 8), pady=0).pack(side="left", padx=(6, 0))
+
+    range_note = tk.Label(win, text="", font=("Helvetica", 8), fg="grey",
+                          anchor="w", justify="left")
+    range_note.pack(fill="x", padx=12)
+
+    def _read_range_ms():
+        """(lo, hi) in ms; None for an open end.  Raises ValueError on junk."""
+        out = []
+        for var, label in ((rmin_var, "minimum"), (rmax_var, "maximum")):
+            text = var.get().strip()
+            if not text:
+                out.append(None)
+                continue
+            try:
+                value = float(text)
+            except ValueError:
+                raise ValueError(f"Fit range {label} is not a number: "
+                                 f"{text!r}")
+            if value <= 0:
+                raise ValueError(f"Fit range {label} must be positive "
+                                 f"(lag times are logarithmic).")
+            out.append(value)
+        lo, hi = out
+        if lo is not None and hi is not None and lo >= hi:
+            raise ValueError(f"Fit range minimum ({lo:g} ms) must be below "
+                             f"the maximum ({hi:g} ms).")
+        return lo, hi
+
+    def _update_range_note(*_a):
+        """Say how many points survive, before the fit rather than after."""
+        try:
+            lo, hi = _read_range_ms()
+        except ValueError as exc:
+            range_note.config(text=f"      {exc}", fg="#a04000")
+            return
+        lo_s = None if lo is None else lo * 1e-3
+        hi_s = None if hi is None else hi * 1e-3
+        kept = total = 0
+        for ds in datasets:
+            tau = np.asarray(ds["tau"], dtype=float)
+            usable = np.isfinite(tau) & (tau > 0)
+            inside = usable.copy()
+            if lo_s is not None:
+                inside &= tau >= lo_s
+            if hi_s is not None:
+                inside &= tau <= hi_s
+            total += int(np.count_nonzero(usable))
+            kept += int(np.count_nonzero(inside))
+        full = (lo_s is None or lo_s <= _tau_lo_s) and \\
+               (hi_s is None or hi_s >= _tau_hi_s)
+        tail = "full measured range" if full else "restricted"
+        range_note.config(
+            text=(f"      measured {_full_lo_ms:g}–{_full_hi_ms:g} ms  ·  "
+                  f"{kept} of {total} lag channels  ·  {tail}"),
+            fg="grey" if kept >= 2 else "#a04000")
+
+    rmin_var.trace_add("write", _update_range_note)
+    rmax_var.trace_add("write", _update_range_note)
+    _update_range_note()
+
+    # Optional label folded into the output filenames, so a set of fits can
+    # be told apart in a file listing (and in Excel's window list) without
+    # opening them.
+    name_row = tk.Frame(win)
+'''),
+
+    ("the fit uses the range",
+'''        weighted = all_have_sigma and weight_var.get()
+
+        try:
+            result = fit_global(model, datasets, setup["linked"],
+                                setup["guesses"], setup["lowers"],
+                                setup["uppers"], setup["fixed"],
+                                weighted=weighted,
+                                drop_pair_starved=starved_var.get(),
+                                plans=setup["plans"])
+''',
+'''        weighted = all_have_sigma and weight_var.get()
+
+        try:
+            _lo_ms, _hi_ms = _read_range_ms()
+        except ValueError as e:
+            messagebox.showerror("Invalid fit range", str(e), parent=win)
+            return
+        # A window that covers everything is passed as no window at all, so
+        # the report says "full measured range" rather than quoting limits
+        # that excluded nothing.
+        _lo_s = None if _lo_ms is None else _lo_ms * 1e-3
+        _hi_s = None if _hi_ms is None else _hi_ms * 1e-3
+        if _lo_s is not None and _lo_s <= _tau_lo_s:
+            _lo_s = None
+        if _hi_s is not None and _hi_s >= _tau_hi_s:
+            _hi_s = None
+
+        try:
+            result = fit_global(model, datasets, setup["linked"],
+                                setup["guesses"], setup["lowers"],
+                                setup["uppers"], setup["fixed"],
+                                weighted=weighted,
+                                drop_pair_starved=starved_var.get(),
+                                plans=setup["plans"],
+                                tau_min=_lo_s, tau_max=_hi_s)
+'''),
+
+    # ── dialog hardening ──────────────────────────────────────────────────
+    ("button strip claims the bottom slot",
+'''    btns = tk.Frame(win)
+    btns.pack(pady=10)
+
+    def _do_fit():
+''',
+'''    btns = tk.Frame(win)
+    btns.pack(side="bottom", pady=10)
+    # [button-strip] Claim the bottom slot before anything that can grow.
+    # pack() hands out space in packing order, so a frame packed last is the
+    # one squeezed out when the content outgrows the window -- which is how
+    # Fit and Cancel end up below the bottom edge.  With a parameter table
+    # of several parameters across several datasets this dialog is already
+    # tall; the fit-range row above makes it taller.
+    _above = [_w for _w in win.pack_slaves() if _w is not btns]
+    if _above:
+        btns.pack_configure(before=_above[0])
+
+    def _do_fit():
+'''),
+
+    ("size to content, clamped to the screen",
+'''    tk.Button(btns, text="Fit", width=12, command=_do_fit, pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy, pady=4).pack(side="left", padx=6)
+
+    win.wait_window()
+''',
+'''    tk.Button(btns, text="Fit", width=12, command=_do_fit, pady=4).pack(side="left", padx=6)
+    tk.Button(btns, text="Cancel", width=10, command=win.destroy, pady=4).pack(side="left", padx=6)
+
+    # [size-to-content] Size to what the dialog needs, never past the screen.
+    # Safe only because the button strip above was pinned first: capping the
+    # height of an unpinned dialog is what takes the buttons off the bottom.
+    # Height is resizable so a clipped dialog can still be opened out.
+    win.resizable(False, True)
+    win.update_idletasks()
+    win.geometry("%dx%d" % (
+        min(max(560, win.winfo_reqwidth()),  win.winfo_screenwidth() - 80),
+        min(win.winfo_reqheight(), win.winfo_screenheight() - 120)))
+
+    win.wait_window()
+'''),
+]
