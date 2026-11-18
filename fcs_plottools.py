@@ -2699,6 +2699,34 @@ def _parse_fontsize(text: str, fallback: float) -> float:
     return value
 
 
+def _tick_fontsize(ax) -> float:
+    """
+    The size the tick labels of *ax* are currently drawn at.
+
+    Read off a label rather than from rcParams, because the figure may
+    already have been restyled -- by an earlier visit to this panel, or by a
+    plotter with its own ideas -- and the box has to open showing what is on
+    screen.  Falls back to the rcParam, then to 10, for an axis with no tick
+    labels to ask (an empty axis, or one whose ticks are hidden).
+    """
+    for getter in (ax.get_xticklabels, ax.get_yticklabels):
+        try:
+            labels = list(getter())
+        except Exception:
+            continue
+        for lbl in labels:
+            try:
+                return float(lbl.get_fontsize())
+            except Exception:
+                continue
+    try:
+        import matplotlib as _mpl
+        # The rcParam may be a word ("medium"), which is not a size.
+        return float(_mpl.rcParams.get("xtick.labelsize", 10))
+    except (TypeError, ValueError):
+        return 10.0
+
+
 def _build_label_section(
     panel,
     fig: plt.Figure,
@@ -2764,6 +2792,24 @@ def _build_label_section(
                    width=5, font=("Helvetica", 9),
                    justify="right").pack(side="left")
 
+    # Tick labels belong to every panel, not only the one whose title is
+    # being edited: a residual strip still at 10 pt under a main panel at
+    # 7 pt reads as two figures stuck together.  One box therefore drives
+    # every axis in the figure, x and y, major and minor -- minor included
+    # because a log lag axis labels some of its minor ticks, and leaving
+    # those at the old size is a mismatch that only shows up in print.
+    tick_row = tk.Frame(lf)
+    tick_row.pack(fill="x", pady=2)
+    tk.Label(tick_row, text="Ticks:", width=9, anchor="e",
+             font=("Helvetica", 9)).pack(side="left")
+    tick_fs_var = tk.StringVar(
+        master=panel, value=_fmt_fontsize(_tick_fontsize(ax_main)))
+    tk.Spinbox(tick_row, textvariable=tick_fs_var, from_=4, to=48,
+               increment=1, width=5, font=("Helvetica", 9),
+               justify="right").pack(side="left", padx=4)
+    tk.Label(tick_row, text="all panels, x and y", font=("Helvetica", 8),
+             fg="grey").pack(side="left", padx=(4, 0))
+
     def _apply_labels(_event=None):
         new_title = title_box.get("1.0", "end-1c")
         fs = _parse_fontsize(title_fs_var.get(), ax_main.title.get_fontsize())
@@ -2780,6 +2826,24 @@ def _build_label_section(
         ylabel_fs_var.set(_fmt_fontsize(yfs))
         ax_bottom.set_xlabel(xlabel_var.get(), fontsize=xfs)
         ax_main.set_ylabel(ylabel_var.get(), fontsize=yfs)
+
+        tfs = _parse_fontsize(tick_fs_var.get(), _tick_fontsize(ax_main))
+        tick_fs_var.set(_fmt_fontsize(tfs))
+        for _ax in axes_list:
+            try:
+                _ax.tick_params(axis="both", which="both", labelsize=tfs)
+            except Exception:
+                pass
+            # The offset text is the "1e-3" or "x10^-3" matplotlib parks at
+            # the end of an axis when it factors out a common exponent.  It
+            # is not a tick label and tick_params does not reach it, so
+            # without this it stays at the default size next to ticks that
+            # have moved.
+            for _axis in (_ax.xaxis, _ax.yaxis):
+                try:
+                    _axis.get_offset_text().set_fontsize(tfs)
+                except Exception:
+                    pass
         try:
             fig.canvas.draw_idle()
         except Exception:
