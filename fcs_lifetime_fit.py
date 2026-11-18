@@ -309,10 +309,25 @@ def load_lifetime_csv(path) -> Tuple[np.ndarray, Dict[str, np.ndarray],
     if not series and "intensity" in columns and _has_data(columns["intensity"]):
         series["decay"] = np.asarray(columns["intensity"], dtype=np.float64)
 
+    # A burst-excision export holds THREE decays per channel instead of one --
+    # every photon, the burst photons alone, and what survived excision --
+    # written as chN_all / chN_burst / chN_clean.  Each is a decay in its own
+    # right (the whole point of splitting them is that the burst population
+    # need not share the bulk lifetime), so they are offered as separate
+    # series rather than collapsed into one.
+    if not series:
+        for ch in (1, 2):
+            for part, label in BURST_DECAY_PARTS:
+                col = columns.get(f"ch{ch}_{part}")
+                if col is not None and _has_data(col):
+                    series[f"Ch{ch} {label}"] = np.asarray(col,
+                                                           dtype=np.float64)
+
     if not series:
         raise ValueError(
             f"{path.name} has a time axis but no usable counts column "
-            f"(expected ch1_counts / ch2_counts, or intensity).  If this came "
+            f"(expected ch1_counts / ch2_counts, chN_all / chN_burst / "
+            f"chN_clean from a burst excision, or intensity).  If this came "
             f"from a single-channel file, the channel it did record should "
             f"still hold data."
         )
@@ -324,6 +339,30 @@ def load_lifetime_csv(path) -> Tuple[np.ndarray, Dict[str, np.ndarray],
         irf = None
 
     return t_ns, series, irf, columns, meta
+
+
+# The three decays a burst-excision export carries per channel, as
+# (column suffix, label).  Order is the order they are offered in the fit
+# screen.  "all" is every photon, so it is what an ordinary export would
+# have held; "clean" is what survived excision and is the one a burst run
+# is usually done for, which is why it is the default.
+BURST_DECAY_PARTS = (("all", "all photons"),
+                     ("burst", "bursts"),
+                     ("clean", "burst-free"))
+
+BURST_DECAY_LABELS = tuple(label for _part, label in BURST_DECAY_PARTS)
+
+_BURST_DEFAULT_COMPONENT = "burst-free"
+
+
+def _split_burst_key(key: str):
+    """('Ch1 burst-free') -> (1, 'burst-free'); None for an ordinary key."""
+    if not key.startswith("Ch") or " " not in key:
+        return None
+    head, _, label = key.partition(" ")
+    if not head[2:].isdigit() or label not in BURST_DECAY_LABELS:
+        return None
+    return int(head[2:]), label
 
 
 class LoadedDecay:
@@ -359,12 +398,97 @@ class LoadedDecay:
     def __init__(self, path, t_ns, series, irf=None, meta=None):
         self.filepath = Path(path)
         self.t_ns     = np.asarray(t_ns, dtype=np.float64)
-        self.series   = {k: np.asarray(v, dtype=np.float64)
-                         for k, v in series.items()}
         self.irf      = irf
         self.meta     = dict(meta or {})
         self.params   = dict(self.meta)
 
+        stored = {k: np.asarray(v, dtype=np.float64)
+                  for k, v in series.items()}
+
+        # A burst export carries several decays per channel.  Everything
+        # downstream of here -- gating, plotting, both fitters, the
+        # reconvolution path -- is written against a decay with ONE curve per
+        # channel, so rather than teach all of that about components, the
+        # SELECTED component is presented as Ch1/Ch2 and the rest are held
+        # aside.  Once the choice is made a burst decay is handled exactly
+        # like an ordinary one.
+        self._by_part: dict = {}
+        for key, arr in stored.items():
+            split = _split_burst_key(key)
+            if split is not None:
+                self._by_part[split] = arr
+        self.components = tuple(
+            label for label in BURST_DECAY_LABELS
+            if any(c == label for _ch, c in self._by_part))
+        self.component = None
+
+        if self.components:
+            self._stored_other = {}
+            default = (_BURST_DEFAULT_COMPONENT
+                       if _BURST_DEFAULT_COMPONENT in self.components
+                       else self.components[0])
+            self.select_component(default)
+        else:
+            self.series = stored
+            self._refresh_identity()
+
+    # ── Burst components ─────────────────────────────────────────────────────
+
+    def select_component(self, component: str) -> None:
+        """
+        Choose which of a burst export's decays this object presents as its
+        Ch1/Ch2 curves.
+
+        Raises for an unknown component rather than falling back: silently
+        fitting "all photons" when "burst-free" was asked for is a wrong
+        number with nothing on the figure to show for it.
+        """
+        if not self.components:
+            raise ValueError(f"{self.filepath.name} is not a burst decay "
+                             f"export; it has no components to choose.")
+        if component not in self.components:
+            raise ValueError(
+                f"{self.filepath.name} has no '{component}' decay; it holds "
+                f"{', '.join(self.components)}.")
+        self.component = component
+        self.series = {f"Ch{ch}": arr
+                       for (ch, comp), arr in self._by_part.items()
+                       if comp == component}
+        self._refresh_identity()
+
+    def component_channels(self, component: str) -> tuple:
+        """Channels that actually hold data for *component*."""
+        return tuple(sorted(ch for (ch, comp) in self._by_part
+                            if comp == component))
+
+    def decay_options(self) -> list:
+        """
+        Every decay this file offers, as (channel, component, label).
+
+        An ordinary export yields one entry per recorded channel and no
+        component; a burst export yields one per channel per component --
+        six for a two-channel file -- which is what the fit screen lists.
+        """
+        if not self.components:
+            if self._single:
+                return [(None, None, "decay")]
+            return [(ch, None, f"Ch{ch}") for ch in self.channels]
+        out = []
+        for ch in (1, 2):
+            for label in self.components:
+                if (ch, label) in self._by_part:
+                    out.append((ch, label, f"Ch{ch} {label}"))
+        return out
+
+    def _refresh_identity(self) -> None:
+        """
+        Re-derive what the currently presented series means.
+
+        Called again whenever a burst component is selected, because the
+        channels that hold data can differ between components: a channel
+        with no bursts detected has an empty 'bursts' decay while its
+        'all' and 'burst-free' decays are perfectly good.
+        """
         # Channel identity comes from the column names: a Ch2-only export has
         # only a ch2_counts column, so its single decay is Ch2 and must not be
         # relabelled Ch1 just because it is the only one present.
@@ -417,8 +541,13 @@ class LoadedDecay:
         if self._single:
             return "decay"
         if len(self.channels) == 1:
-            return f"Ch{self.channels[0]} only"
-        return " + ".join(f"Ch{c}" for c in self.channels)
+            base = f"Ch{self.channels[0]} only"
+        else:
+            base = " + ".join(f"Ch{c}" for c in self.channels)
+        # Which decay of a burst export is on show.  Without this the picker
+        # and the fit screen would say "Ch1 + Ch2" for three different pairs
+        # of curves and look identical for each.
+        return f"{base}, {self.component}" if self.component else base
 
     @property
     def has_ch1(self) -> bool:
@@ -1064,6 +1193,9 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
     L.append(f"fitted     : {datetime.now().isoformat(timespec='seconds')}")
     if ch is not None:
         L.append(f"channel    : Ch{ch}")
+    if result.get("decay_component"):
+        L.append(f"decay      : {result['decay_component']}  "
+                 f"(burst excision)")
     if result.get("n_bins") is not None:
         L.append(f"histogram  : {result['n_bins']} bins")
     L.append(f"fit window : {result['fit_start_ns']:.4f} – {result['fit_end_ns']:.4f} ns"
@@ -1145,6 +1277,8 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
         fh.write(f"# source : {source_path.name}\n")
         if ch is not None:
             fh.write(f"# channel : Ch{ch}\n")
+        if result.get("decay_component"):
+            fh.write(f"# decay_component : {result['decay_component']}\n")
         # Which time axis the figure was drawn on, so reopening reproduces it.
         # The reopen dialog can override this; it is a record, not a lock.
         fh.write(f"# x_axis : {resolve_x_axis(result.get('x_axis'))}\n")
@@ -1704,16 +1838,26 @@ def lifetime_dataset_source():
                 out.append(fcs_fitdialogs.DatasetEntry(
                     path=path, series="decay", label=f"{path.name}  [decay]"))
             else:
-                for ch in d.channels:
+                # decay_options() covers both shapes: one entry per channel
+                # for an ordinary export, one per channel per component for
+                # a burst one, so a burst file contributes all of its decays
+                # to a global fit instead of only the default component.
+                for _ch, _comp, _label in d.decay_options():
                     out.append(fcs_fitdialogs.DatasetEntry(
-                        path=path, series=f"Ch{ch}",
-                        label=f"{path.name}  [Ch{ch}]"))
+                        path=path, series=_label,
+                        label=f"{path.name}  [{_label}]"))
         return out
 
     def _load(entry) -> dict:
         d = load_decay_object(entry.path)
-        channel = (None if entry.series == "decay"
-                   else int(str(entry.series)[2:]))
+        if entry.series == "decay":
+            channel = None
+        else:
+            # "Ch1" or, from a burst export, "Ch1 burst-free".
+            head, _, comp = str(entry.series).partition(" ")
+            channel = int(head[2:])
+            if comp:
+                d.select_component(comp)
         t_ns, counts = d.lifetime_histogram(
             channel=channel if channel is not None else 1)
         return {
@@ -2745,6 +2889,34 @@ def _lifetime_data_dialog(parent, fcs_data, on_done, on_back=None,
         # offering Ch1/Ch2 would imply a detector identity the file never had.
         tk.Label(body, text="decay (single curve)", anchor="w").grid(
             row=0, column=1, sticky="w")
+    elif getattr(fcs_data, "components", ()):
+        # A burst-excision export: three decays per channel rather than one.
+        # They are listed individually instead of as a channel row plus a
+        # component row, so what is on offer is the same flat list of decays
+        # the file actually holds, and an absent combination simply is not
+        # there to pick.
+        tk.Label(body, text="", anchor="w").grid(row=0, column=1, sticky="w")
+        opt_frame = tk.Frame(body)
+        opt_frame.grid(row=0, column=1, sticky="w")
+        options = fcs_data.decay_options()
+        pick_var = tk.StringVar(
+            value=f"{fcs_data.channels[0]}|{fcs_data.component}")
+
+        def _pick_decay(*_a):
+            ch_text, _, comp = pick_var.get().partition("|")
+            try:
+                fcs_data.select_component(comp)
+            except ValueError:
+                return
+            ch_var.set(int(ch_text))
+
+        for _i, (_ch, _comp, _label) in enumerate(options):
+            tk.Radiobutton(opt_frame, text=_label, variable=pick_var,
+                           value=f"{_ch}|{_comp}", command=_pick_decay,
+                           anchor="w", width=16).grid(
+                row=_i // 3, column=_i % 3, sticky="w")
+        tk.Label(body, text="burst excision", font=("Helvetica", 8),
+                 fg="grey").grid(row=0, column=0, sticky="sw")
     else:
         ch_frame = tk.Frame(body)
         ch_frame.grid(row=0, column=1, sticky="w")
@@ -3114,6 +3286,9 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
         win.destroy()
 
         result["origin"] = getattr(fcs_data, "source_name", None)
+        # Which of a burst export's decays this was.  Three fits of one file
+        # differ in nothing else a reader could see.
+        result["decay_component"] = getattr(fcs_data, "component", None)
         # Set before the export: the curve CSV records this, so the figure
         # that reopens is the figure that was drawn.
         result["x_axis"] = x_axis_choice
