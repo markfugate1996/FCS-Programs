@@ -33,6 +33,13 @@ registry does not break old files).  Missing keys fall back to defaults.
 An invalid stored value is reported by name and replaced by the default
 for the session -- reported, never silently accepted.
 
+The Fit defaults tab is the one setting that is NOT a registry entry.  The
+correlation models carry 48 (model, parameter) pairs, each with bounds, a
+guess and two flags, which is a table rather than a list of scalars.  It is
+stored sparsely under the single JSON key "fit_defaults" and pushed into
+fcs_models.apply_param_overrides(), the same one-way coupling every other
+preference uses.
+
 Public interface
 ----------------
     PREFS                          -- the registry (append to extend)
@@ -449,6 +456,275 @@ def effective_value(pref: Pref, stored: dict):
     return pref.default
 
 
+FIT_DEFAULTS_KEY = "fit_defaults"
+
+
+def _apply_fit_defaults(stored: dict) -> int:
+    """
+    Push the Fit defaults table into fcs_models.
+
+    Same rules as the registry: fcs_models is touched only when it is
+    already imported, failures are reported rather than raised, and the
+    module's own built-in values are the fallback -- so an absent or empty
+    table changes nothing.
+    """
+    mod = sys.modules.get("fcs_models")
+    if mod is None or not hasattr(mod, "apply_param_overrides"):
+        return 0
+    table = stored.get(FIT_DEFAULTS_KEY) or {}
+    if not isinstance(table, dict):
+        print(f"[prefs] '{FIT_DEFAULTS_KEY}' is not an object; ignored")
+        table = {}
+    try:
+        return int(mod.apply_param_overrides(table))
+    except Exception as exc:                            # noqa: BLE001
+        print(f"[prefs] could not apply fit defaults ({exc})")
+        return 0
+
+
+def _fmt_param_value(value) -> str:
+    """Format a bound or guess for an entry box, infinities included."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if v == float("inf"):
+        return "inf"
+    if v == float("-inf"):
+        return "-inf"
+    return f"{v:.10g}"
+
+
+def _parse_param_value(text: str, label: str) -> float:
+    """Read a bound or guess back; 'inf' / '-inf' allowed."""
+    s = str(text).strip().lower()
+    if s in ("inf", "+inf", "infinity"):
+        return float("inf")
+    if s in ("-inf", "-infinity"):
+        return float("-inf")
+    if not s:
+        raise ValueError(f"{label} is empty")
+    try:
+        return float(s)
+    except ValueError:
+        raise ValueError(f"{label} is not a number: {text!r}")
+
+
+def _storable(value):
+    """JSON-safe form of a parameter value (JSON has no infinity literal)."""
+    if isinstance(value, bool):
+        return value
+    v = float(value)
+    if v == float("inf"):
+        return "inf"
+    if v == float("-inf"):
+        return "-inf"
+    return v
+
+
+def _same_value(a, b) -> bool:
+    """Whether an edited value still equals the built-in it came from."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return bool(a) == bool(b)
+    return float(a) == float(b)
+
+
+def _build_fit_defaults_tab(notebook, dialog, stored):
+    """
+    Build the "Fit defaults" tab: one model at a time, one row per
+    parameter, columns guess / min / max / fix / link.
+
+    Returns an object with ``collect()`` -- the sparse override table, or
+    ValueError with a message naming the offending cell -- and
+    ``restore()``.  Returns None when fcs_models is not imported, in which
+    case the dialog simply has one tab fewer, the same graceful degradation
+    the rest of this module follows.
+
+    Every model's widgets are built once and the selected one is packed, so
+    edits to a model survive switching away and back before OK.
+    """
+    import tkinter as tk
+
+    models_mod = sys.modules.get("fcs_models")
+    builtin = getattr(models_mod, "BUILTIN_PARAM_DEFAULTS", None)
+    if not builtin:
+        return None
+    auto = set(getattr(models_mod, "AUTO_GUESS_PARAMS", ()))
+    table = stored.get(FIT_DEFAULTS_KEY) or {}
+    if not isinstance(table, dict):
+        table = {}
+
+    tab = tk.Frame(notebook, padx=10, pady=8)
+    notebook.add(tab, text="Fit defaults")
+
+    label_of = {}
+    for key in builtin:
+        model = models_mod.MODELS.get(key)
+        label_of[key] = f"{getattr(model, 'name', key)}" if model else key
+    keys = list(builtin)
+
+    top = tk.Frame(tab)
+    top.pack(fill="x")
+    tk.Label(top, text="Model:", font=("Helvetica", 9)).pack(side="left")
+    model_var = tk.StringVar(master=dialog, value=label_of[keys[0]])
+    om = tk.OptionMenu(top, model_var, *[label_of[k] for k in keys])
+    om.config(font=("Helvetica", 9), width=34, anchor="w")
+    om["menu"].config(font=("Helvetica", 9))
+    om.pack(side="left", padx=4)
+
+    cells: dict = {}
+    frames: dict = {}
+
+    def _initial(mkey, pname, field):
+        base = builtin[mkey][pname][field]
+        over = ((table.get(mkey) or {}).get(pname) or {})
+        if field not in over:
+            return base
+        try:
+            if field in ("fixed", "link"):
+                return bool(over[field])
+            return models_mod._as_bound(over[field])
+        except (TypeError, ValueError):
+            return base
+
+    for mkey in keys:
+        frame = tk.Frame(tab)
+        frames[mkey] = frame
+
+        head = tk.Frame(frame)
+        head.pack(fill="x", pady=(6, 2))
+        for text, width in (("parameter", 11), ("guess", 11), ("min", 11),
+                            ("max", 11), ("fix", 4), ("link", 5)):
+            tk.Label(head, text=text, width=width, anchor="w",
+                     font=("Helvetica", 8, "bold")).pack(side="left")
+
+        for pname in builtin[mkey]:
+            row = tk.Frame(frame)
+            row.pack(fill="x")
+            tk.Label(row, text=pname, width=11, anchor="w",
+                     font=("Helvetica", 9)).pack(side="left")
+
+            if pname in auto:
+                # Shown, not editable: auto_guess rewrites these from the
+                # curve on every fit, so an entry box here would be a
+                # setting that silently does nothing.
+                tk.Label(row, text="auto", width=11, anchor="w", fg="grey",
+                         font=("Helvetica", 9, "italic")).pack(side="left")
+                cells[(mkey, pname, "guess")] = None
+            else:
+                gv = tk.StringVar(master=dialog,
+                                  value=_fmt_param_value(
+                                      _initial(mkey, pname, "guess")))
+                tk.Entry(row, textvariable=gv, width=10,
+                         font=("Helvetica", 9),
+                         justify="right").pack(side="left", padx=(0, 2))
+                cells[(mkey, pname, "guess")] = gv
+
+            for field in ("lower", "upper"):
+                v = tk.StringVar(master=dialog,
+                                 value=_fmt_param_value(
+                                     _initial(mkey, pname, field)))
+                tk.Entry(row, textvariable=v, width=10,
+                         font=("Helvetica", 9),
+                         justify="right").pack(side="left", padx=(0, 2))
+                cells[(mkey, pname, field)] = v
+
+            for field, width in (("fixed", 4), ("link", 5)):
+                b = tk.BooleanVar(master=dialog,
+                                  value=bool(_initial(mkey, pname, field)))
+                holder = tk.Frame(row, width=width * 8)
+                holder.pack(side="left")
+                tk.Checkbutton(holder, variable=b).pack(side="left")
+                cells[(mkey, pname, field)] = b
+
+        tk.Label(
+            frame,
+            text=("      guess, min and max accept inf and -inf · fix holds "
+                  "a parameter at its guess ·\n      link shares one value "
+                  "across datasets · these set what the fit dialog OPENS "
+                  "with,\n      and every fit can still override them"),
+            font=("Helvetica", 8), fg="grey", anchor="w",
+            justify="left").pack(fill="x", pady=(6, 0))
+
+    def _show(*_a):
+        wanted = model_var.get()
+        for mkey, frame in frames.items():
+            if label_of[mkey] == wanted:
+                frame.pack(fill="x")
+            else:
+                frame.pack_forget()
+
+    model_var.trace_add("write", _show)
+    _show()
+
+    def _restore_current():
+        wanted = model_var.get()
+        for mkey in keys:
+            if label_of[mkey] != wanted:
+                continue
+            for pname, base in builtin[mkey].items():
+                for field in ("guess", "lower", "upper"):
+                    var = cells[(mkey, pname, field)]
+                    if var is not None:
+                        var.set(_fmt_param_value(base[field]))
+                for field in ("fixed", "link"):
+                    cells[(mkey, pname, field)].set(bool(base[field]))
+
+    tk.Button(tab, text="Restore this model's defaults", pady=3,
+              command=_restore_current).pack(pady=(8, 0))
+
+    def restore():
+        for mkey in keys:
+            for pname, base in builtin[mkey].items():
+                for field in ("guess", "lower", "upper"):
+                    var = cells[(mkey, pname, field)]
+                    if var is not None:
+                        var.set(_fmt_param_value(base[field]))
+                for field in ("fixed", "link"):
+                    cells[(mkey, pname, field)].set(bool(base[field]))
+
+    def collect() -> dict:
+        out: dict = {}
+        for mkey in keys:
+            for pname, base in builtin[mkey].items():
+                where = f"{label_of[mkey]} · {pname}"
+                lo = _parse_param_value(
+                    cells[(mkey, pname, "lower")].get(), f"{where} min")
+                hi = _parse_param_value(
+                    cells[(mkey, pname, "upper")].get(), f"{where} max")
+                if not lo < hi:
+                    raise ValueError(
+                        f"{where}: minimum ({_fmt_param_value(lo)}) must be "
+                        f"below maximum ({_fmt_param_value(hi)}).")
+                gvar = cells[(mkey, pname, "guess")]
+                if gvar is None:
+                    guess = base["guess"]
+                else:
+                    guess = _parse_param_value(gvar.get(), f"{where} guess")
+                    if not lo <= guess <= hi:
+                        raise ValueError(
+                            f"{where}: guess {_fmt_param_value(guess)} lies "
+                            f"outside its own bounds "
+                            f"{_fmt_param_value(lo)} to "
+                            f"{_fmt_param_value(hi)}.")
+                values = {"guess": guess, "lower": lo, "upper": hi,
+                          "fixed": bool(cells[(mkey, pname, "fixed")].get()),
+                          "link": bool(cells[(mkey, pname, "link")].get())}
+                entry = {f: _storable(v) for f, v in values.items()
+                         if not _same_value(v, base[f])}
+                if entry:
+                    out.setdefault(mkey, {})[pname] = entry
+        return out
+
+    class _Tab:
+        pass
+
+    handle = _Tab()
+    handle.collect = collect
+    handle.restore = restore
+    return handle
+
+
 def apply(values: Optional[dict] = None) -> int:
     """
     Push every registered preference into its target module.
@@ -462,7 +738,7 @@ def apply(values: Optional[dict] = None) -> int:
     Returns the number of attributes actually set, which a caller can log.
     """
     stored = load() if values is None else values
-    n = 0
+    n = _apply_fit_defaults(stored)
     for pref in PREFS:
         mod = sys.modules.get(pref.target[0])
         if mod is None:
@@ -563,6 +839,8 @@ def run_preferences_dialog(parent=None) -> None:
             tk.Label(lf, text="      " + pref.help, font=("Helvetica", 8),
                      fg="grey", anchor="w", justify="left").pack(fill="x")
 
+    fit_defaults = _build_fit_defaults_tab(notebook, dialog, stored)
+
     tk.Label(dialog, text=f"Stored in: {prefs_path()}",
              font=("Helvetica", 8), fg="grey", anchor="w",
              justify="left").pack(side="top", fill="x", padx=12, pady=(6, 0))
@@ -575,6 +853,8 @@ def run_preferences_dialog(parent=None) -> None:
                 v.set(bool(pref.default))
             else:
                 v.set(str(pref.default))
+        if fit_defaults is not None:
+            fit_defaults.restore()
 
     def _ok():
         new_values = dict(stored)      # keep unknown keys from older files
@@ -586,6 +866,21 @@ def run_preferences_dialog(parent=None) -> None:
                 messagebox.showerror(
                     "Invalid value", f"{pref.label}: {exc}", parent=dialog)
                 return
+        if fit_defaults is not None:
+            try:
+                table = fit_defaults.collect()
+            except ValueError as exc:
+                messagebox.showerror("Invalid fit default", str(exc),
+                                     parent=dialog)
+                return
+            if table:
+                new_values[FIT_DEFAULTS_KEY] = table
+            else:
+                # Everything back at its built-in: drop the key rather than
+                # write an empty object, so the file says "nothing
+                # overridden" the same way it did before the tab existed.
+                new_values.pop(FIT_DEFAULTS_KEY, None)
+
         if save(new_values) is None:
             messagebox.showerror(
                 "Save failed",

@@ -793,6 +793,137 @@ PCH_MODELS: Dict[str, FCSModel] = {
 }
 
 
+# ── User-adjustable parameter defaults ────────────────────────────────────────
+#
+# A Param carries the state the fit dialog opens with: initial guess, bounds,
+# and the suggested "hold fixed" / "link across datasets" flags.  Those are
+# judgement calls, not physics, and they are the kind of judgement that
+# changes with experience -- so they are preferences rather than constants
+# edited in this file.  fcs_prefs pushes a stored table in through
+# apply_param_overrides(); nothing here imports fcs_prefs, so the suite runs
+# unchanged when that file is absent.
+#
+# Correlation models only (MODELS).  The PCH and lifetime registries are not
+# touched: their dialogs are separate and were not part of this.
+
+# The shipped values, captured before anything can overwrite them.  Both the
+# "restore defaults" button and the sparse-override comparison need to know
+# what the built-in value WAS, which a mutated Param can no longer say.
+BUILTIN_PARAM_DEFAULTS: Dict[str, Dict[str, dict]] = {
+    _key: {
+        _p.name: {"guess": _p.default, "lower": _p.lower, "upper": _p.upper,
+                  "fixed": _p.fixed, "link": _p.link_default}
+        for _p in _model.params
+    }
+    for _key, _model in MODELS.items()
+}
+
+PARAM_FIELDS = ("guess", "lower", "upper", "fixed", "link")
+
+# Parameters whose starting guess fcs_fit.auto_guess derives from the curve
+# itself (short-lag plateau, half-amplitude crossing) rather than reading
+# from the Param.  A stored guess for these would be overwritten on every
+# fit, so the preferences tab shows them as automatic instead of pretending
+# to set them.  Mirrors auto_guess; test_fit_defaults.py checks they agree.
+AUTO_GUESS_PARAMS = ("G0", "tau_D", "offset")
+
+
+def _as_bound(value) -> float:
+    """
+    A bound from stored JSON: a number, or "inf" / "-inf".
+
+    JSON has no infinity literal, and the suite's bounds routinely are
+    infinite, so they round-trip as those two strings rather than as
+    something non-standard that only Python would read back.
+    """
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("inf", "+inf", "infinity", "+infinity"):
+            return float(np.inf)
+        if text in ("-inf", "-infinity"):
+            return float(-np.inf)
+        return float(text)
+    return float(value)
+
+
+def apply_param_overrides(overrides: dict) -> int:
+    """
+    Reset every correlation parameter to its built-in default, then apply
+    *overrides*.
+
+    Resetting first is what makes this idempotent, and what makes REMOVING
+    an override take effect without restarting: the dialog's OK re-applies
+    the whole table, and a value no longer in it has to go back to the
+    built-in rather than linger from the last apply.
+
+    *overrides* is ``{model_key: {param: {field: value}}}`` and sparse --
+    only fields that differ from the built-in are stored, so a later change
+    to a shipped default still reaches a parameter the user never touched.
+
+    Unknown model keys, parameter names and fields are reported on the
+    console and skipped, never raised: a table written before a model was
+    renamed must not stop the suite from starting.
+
+    Returns the number of fields actually applied.
+    """
+    for _key, _model in MODELS.items():
+        base = BUILTIN_PARAM_DEFAULTS.get(_key, {})
+        for _p in _model.params:
+            b = base.get(_p.name)
+            if b is None:
+                continue
+            _p.default = b["guess"]
+            _p.lower = b["lower"]
+            _p.upper = b["upper"]
+            _p.fixed = b["fixed"]
+            _p.link_default = b["link"]
+
+    if not isinstance(overrides, dict) or not overrides:
+        return 0
+
+    n = 0
+    for mkey, params in overrides.items():
+        model = MODELS.get(mkey)
+        if model is None:
+            print(f"[models] fit default for unknown model '{mkey}' ignored")
+            continue
+        by_name = {p.name: p for p in model.params}
+        if not isinstance(params, dict):
+            print(f"[models] fit defaults for '{mkey}' are not an object; "
+                  f"ignored")
+            continue
+        for pname, fields in params.items():
+            p = by_name.get(pname)
+            if p is None:
+                print(f"[models] fit default for unknown parameter "
+                      f"'{mkey}.{pname}' ignored")
+                continue
+            if not isinstance(fields, dict):
+                print(f"[models] fit defaults for '{mkey}.{pname}' are not "
+                      f"an object; ignored")
+                continue
+            for field, value in fields.items():
+                try:
+                    if field == "guess":
+                        p.default = float(value)
+                    elif field == "lower":
+                        p.lower = _as_bound(value)
+                    elif field == "upper":
+                        p.upper = _as_bound(value)
+                    elif field == "fixed":
+                        p.fixed = bool(value)
+                    elif field == "link":
+                        p.link_default = bool(value)
+                    else:
+                        raise ValueError(f"unknown field '{field}'")
+                except (TypeError, ValueError) as exc:
+                    print(f"[models] fit default {mkey}.{pname}.{field} "
+                          f"ignored ({exc})")
+                    continue
+                n += 1
+    return n
+
+
 # ── Accessors ─────────────────────────────────────────────────────────────────
 
 def list_models() -> List[FCSModel]:
