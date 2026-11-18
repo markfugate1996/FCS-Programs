@@ -361,6 +361,79 @@ def mean_lifetime_errors(values: dict, pairs, free, pcov) -> Optional[dict]:
             "tau_mean_int_err": _sigma(g_int)}
 
 
+def intensity_fraction_errors(values: dict, pairs, free, pcov):
+    """
+    1σ uncertainties on the intensity fractions
+
+        f_i = A_i tau_i / SUM_j A_j tau_j
+
+    returned as a list in the order of *pairs*.
+
+    Through the full covariance, for the same reason as the mean lifetime: a
+    fraction is a ratio of fitted products, so an amplitude and its own
+    lifetime trade against each other directly, and an error built from the
+    diagonal alone is wrong.  Gradients, with w = SUM A_j tau_j:
+
+        df_i/dA_i   =  tau_i (w - A_i tau_i) / w^2
+        df_i/dtau_i =  A_i   (w - A_i tau_i) / w^2
+        df_i/dA_j   = -A_i tau_i tau_j / w^2        (j != i)
+        df_i/dtau_j = -A_i tau_i A_j   / w^2        (j != i)
+
+    For two components f2 = 1 - f1, so the two uncertainties come out equal.
+    That identity is left to fall out of the arithmetic rather than being
+    imposed, so an error in the gradients shows up instead of being hidden
+    by a shortcut.
+
+    *free* is the covariance's parameter order, with None in any slot that no
+    parameter of this dataset owns; *pcov* is indexed by it.  Returns None
+    when the fractions are not meaningful (fewer than two components,
+    non-positive values), and a list of NaNs when the fit returned no usable
+    covariance -- the same contract as mean_lifetime_errors.
+    """
+    import numpy as np
+
+    comps = [(float(values[a]), float(values[t]), a, t)
+             for a, t in pairs if a in values and t in values]
+    if len(comps) < 2:
+        return None
+    if any(a <= 0 or t <= 0 for a, t, _an, _tn in comps):
+        return None
+    w = float(sum(a * t for a, t, _an, _tn in comps))
+    if w <= 0:
+        return None
+
+    if pcov is None:
+        return [float("nan")] * len(comps)
+    C = np.asarray(pcov, dtype=float)
+    free = list(free)
+    if (C.ndim != 2 or C.shape[0] != C.shape[1] or C.shape[0] != len(free)
+            or not np.all(np.isfinite(C))):
+        return [float("nan")] * len(comps)
+
+    index = {name: i for i, name in enumerate(free) if name is not None}
+    out = []
+    for a_i, t_i, an_i, tn_i in comps:
+        num_i = a_i * t_i
+        g = np.zeros(len(free), dtype=float)
+        for a_j, t_j, an_j, tn_j in comps:
+            if an_j is an_i or an_j == an_i:
+                d_a = t_i * (w - num_i) / w ** 2
+                d_t = a_i * (w - num_i) / w ** 2
+            else:
+                d_a = -num_i * t_j / w ** 2
+                d_t = -num_i * a_j / w ** 2
+            if an_j in index:
+                g[index[an_j]] += d_a
+            if tn_j in index:
+                g[index[tn_j]] += d_t
+        var = float(g @ C @ g)
+        if not np.isfinite(var):
+            out.append(float("nan"))
+        else:
+            out.append(float(np.sqrt(var)) if var > 0 else 0.0)
+    return out
+
+
 # ── Dialog windows ────────────────────────────────────────────────────────────
 #
 # Every dialog in the suite should be resizable and should scroll, because

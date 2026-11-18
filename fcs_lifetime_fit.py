@@ -61,6 +61,7 @@ import fcs_export
 
 from fcs_fitcommon import (
     mean_lifetime_errors,
+    intensity_fraction_errors,
     fits_dir as _fits_dir,
     new_fit_dir as _new_fit_dir,
     fmt_bound as _fmt,
@@ -2009,18 +2010,47 @@ def fit_lifetime_global(model: FCSModel, datasets: list, windows: list,
         model.param_names(), prepped, _predict, linked, guesses, lowers,
         uppers, fixed, weighted=weighted, maxfev=maxfev, plans=plans)
 
+    # Derived quantities, with uncertainties propagated through the global
+    # covariance.  fit_linked returns one covariance for the whole fit and,
+    # per dataset, the free slot each parameter used -- which is the only
+    # thing that knows which row and column a (parameter, dataset) pair owns.
+    # Reversing that mapping per dataset gives the parameter order the
+    # covariance is indexed by, which is what the propagation helpers want.
+    _cov = out.get("cov")
+    _n_free = (len(out.get("free_labels") or ())
+               if _cov is None else len(_cov))
     for entry in out["datasets"]:
         vals = entry["values"]
         extras: Dict[str, float] = {}
         if "A1" in vals and "A2" in vals and "tau1" in vals and "tau2" in vals:
             a1, a2, t1, t2 = vals["A1"], vals["A2"], vals["tau1"], vals["tau2"]
             denom = a1 + a2
+            w = a1 * t1 + a2 * t2
             if denom > 0:
                 extras["tau_mean_amp"] = (a1 * t1 + a2 * t2) / denom
-            w = a1 * t1 + a2 * t2
             if w > 0:
+                extras["tau_mean_int"] = (a1 * t1 * t1 + a2 * t2 * t2) / w
                 extras["f1"] = a1 * t1 / w
                 extras["f2"] = a2 * t2 / w
+
+            # A held parameter owns no slot, hence None: it contributes no
+            # uncertainty, which is exactly how the helpers treat a gap.
+            _slots = entry.get("free_slots", {}) or {}
+            _order = [None] * _n_free
+            for _p, _s in _slots.items():
+                if _s is not None and 0 <= _s < _n_free:
+                    _order[_s] = _p
+            _pairs = [("A1", "tau1"), ("A2", "tau2")]
+            _tau_errs = mean_lifetime_errors(vals, _pairs, _order, _cov)
+            if _tau_errs:
+                if "tau_mean_amp" in extras:
+                    extras["tau_mean_amp_err"] = _tau_errs["tau_mean_amp_err"]
+                if "tau_mean_int" in extras:
+                    extras["tau_mean_int_err"] = _tau_errs["tau_mean_int_err"]
+            _f_errs = intensity_fraction_errors(vals, _pairs, _order, _cov)
+            if _f_errs and "f1" in extras:
+                extras["f1_err"] = _f_errs[0]
+                extras["f2_err"] = _f_errs[1]
         entry["extras"] = extras
     out["model"] = model
     return out
@@ -2119,7 +2149,11 @@ def export_lifetime_global(result: dict, source_path, name_override=None):
             err = "—" if d.get("fixed", {}).get(n) else f"{d['errors'][n]:.6g}"
             L.append(f"    {n:<10} = {d['values'][n]:.6g}  ± {err}{tag}")
         for key, val in d["extras"].items():
-            L.append(f"    {key:<20} = {val:.6g}")
+            if key.endswith("_err"):
+                continue            # printed beside the value it belongs to
+            _e = d["extras"].get(f"{key}_err", float("nan"))
+            _pm = f"  ± {_e:.6g}" if np.isfinite(_e) else ""
+            L.append(f"    {key:<20} = {val:.6g}{_pm}")
         L.append(f"    R^2 = {d['r2']:.6f}")
         L.append("")
 
@@ -2148,7 +2182,9 @@ def export_lifetime_global(result: dict, source_path, name_override=None):
     print(f"[lifetime globalfit] wrote {curves_path}")
 
     # ── Parameter table (fixed schema) ───────────────────────────────────────
-    extra_keys = ["tau_mean_amp", "f1", "f2"]
+    extra_keys = ["tau_mean_amp", "tau_mean_amp_err",
+                  "tau_mean_int", "tau_mean_int_err",
+                  "f1", "f1_err", "f2", "f2_err"]
     present = [k for k in extra_keys if any(k in d["extras"] for d in dsets)]
     p_header = ["dataset", "source", "series", "n_bins",
                 "fit_start_ns", "fit_end_ns"]
