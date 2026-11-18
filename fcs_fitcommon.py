@@ -271,6 +271,96 @@ def write_params_table(
     return csv_path, written
 
 
+# ── Derived-quantity uncertainties ────────────────────────────────────────────
+
+def mean_lifetime_errors(values: dict, pairs, free, pcov) -> Optional[dict]:
+    """
+    1σ uncertainties on the amplitude- and intensity-weighted mean lifetimes.
+
+        <tau>_amp = SUM A_i tau_i / SUM A_i
+        <tau>_int = SUM A_i tau_i^2 / SUM A_i tau_i
+
+    Propagated through the FULL covariance matrix rather than from the
+    per-parameter errors alone.  In a multi-exponential fit the amplitudes
+    and lifetimes are strongly anticorrelated -- a longer tau is bought by a
+    smaller A -- and treating them as independent overstates the uncertainty
+    on a mean that is typically far better determined than the components it
+    is made of.  That is the whole reason the mean is worth quoting on a fit
+    whose individual taus are poorly separated, so the covariance is not
+    optional here.
+
+    Gradients are analytic:
+
+        d<tau>amp/dA_i   = (tau_i - <tau>amp) / SUM A
+        d<tau>amp/dtau_i = A_i / SUM A
+        d<tau>int/dA_i   = tau_i (tau_i - <tau>int) / SUM A tau
+        d<tau>int/dtau_i = A_i (2 tau_i - <tau>int) / SUM A tau
+
+    and sigma^2 = g^T C g over the FREE parameters; a fixed parameter
+    contributes nothing, having no uncertainty to contribute.
+
+    *pairs* is [(amplitude_name, lifetime_name), ...] -- the two fitters name
+    their parameters differently, so neither naming is assumed here.
+
+    The result inherits whatever convention the fit's own covariance follows
+    (scaled by reduced chi-squared for an unweighted fit, absolute for a
+    weighted one), exactly as the per-parameter errors do.  Returns None when
+    the decomposition itself is not meaningful (fewer than two components,
+    non-positive amplitudes or lifetimes), and NaN errors when the fit
+    returned no usable covariance -- a parameter resting on a bound being the
+    common cause, where the quoted error would be meaningless anyway.
+    """
+    import numpy as np
+
+    comps = [(float(values[a]), float(values[t]), a, t)
+             for a, t in pairs if a in values and t in values]
+    if len(comps) < 2:
+        return None
+    A = np.array([c[0] for c in comps], dtype=float)
+    T = np.array([c[1] for c in comps], dtype=float)
+    if np.any(A <= 0) or np.any(T <= 0):
+        return None
+    sum_a = float(A.sum())
+    sum_at = float((A * T).sum())
+    if sum_a <= 0 or sum_at <= 0:
+        return None
+
+    nan = {"tau_mean_amp_err": float("nan"), "tau_mean_int_err": float("nan")}
+    if pcov is None:
+        return nan
+    C = np.asarray(pcov, dtype=float)
+    free = list(free)
+    if (C.ndim != 2 or C.shape[0] != C.shape[1] or C.shape[0] != len(free)
+            or not np.all(np.isfinite(C))):
+        return nan
+
+    tau_amp = sum_at / sum_a
+    tau_int = float((A * T * T).sum()) / sum_at
+
+    index = {name: i for i, name in enumerate(free)}
+    g_amp = np.zeros(len(free), dtype=float)
+    g_int = np.zeros(len(free), dtype=float)
+    for a_val, t_val, a_name, t_name in comps:
+        if a_name in index:
+            g_amp[index[a_name]] += (t_val - tau_amp) / sum_a
+            g_int[index[a_name]] += t_val * (t_val - tau_int) / sum_at
+        if t_name in index:
+            g_amp[index[t_name]] += a_val / sum_a
+            g_int[index[t_name]] += a_val * (2.0 * t_val - tau_int) / sum_at
+
+    def _sigma(g) -> float:
+        var = float(g @ C @ g)
+        # A tiny negative variance is round-off on a near-singular covariance,
+        # not a result; anything else non-finite is the fit's problem, not
+        # something to paper over with a number.
+        if not np.isfinite(var):
+            return float("nan")
+        return float(np.sqrt(var)) if var > 0 else 0.0
+
+    return {"tau_mean_amp_err": _sigma(g_amp),
+            "tau_mean_int_err": _sigma(g_int)}
+
+
 # ── Dialog windows ────────────────────────────────────────────────────────────
 #
 # Every dialog in the suite should be resizable and should scroll, because

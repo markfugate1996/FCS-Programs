@@ -60,6 +60,7 @@ import fcs_fitdialogs
 import fcs_export
 
 from fcs_fitcommon import (
+    mean_lifetime_errors,
     fits_dir as _fits_dir,
     new_fit_dir as _new_fit_dir,
     fmt_bound as _fmt,
@@ -831,6 +832,17 @@ def fit_lifetime(
     # components and returns None when the decomposition is not meaningful.
     fractions = component_fractions(values, names)
     tau_mean  = fractions["tau_mean_amp"] if fractions else float("nan")
+    if fractions:
+        # Folded into `fractions` so every consumer that already reads the
+        # means from there gets the errors without being handed a second
+        # dict to look in.
+        _tau_errs = mean_lifetime_errors(
+            values, [(f"A{i}", f"tau{i}") for i in fractions["indices"]],
+            free, pcov)
+        if _tau_errs:
+            fractions.update(_tau_errs)
+    tau_mean_err = (fractions.get("tau_mean_amp_err", float("nan"))
+                    if fractions else float("nan"))
 
     return {
         "model": model, "names": names, "free": free,
@@ -846,6 +858,7 @@ def fit_lifetime(
         "channel": channel, "n_bins": n_bins,
         "fit_start_ns": float(fit_start_ns), "fit_end_ns": float(fit_end_ns),
         "drop_edges": drop_edges, "tau_mean": tau_mean,
+        "tau_mean_err": tau_mean_err,
         "fractions": fractions,
     }
 
@@ -968,9 +981,13 @@ def plot_lifetime_fit(
             for i in fr["indices"]:
                 lines.append(f"  {i}: α = {fr['alpha'][i]:.3f}   f = {fr['f'][i]:.3f}")
         if np.isfinite(result.get("tau_mean", float("nan"))):
-            lines.append(f"⟨τ⟩ = {result['tau_mean']:.4g} ns  (ampl.)")
+            _e = result.get("tau_mean_err", float("nan"))
+            _pm = f" ± {_e:.2g}" if np.isfinite(_e) else ""
+            lines.append(f"⟨τ⟩ = {result['tau_mean']:.4g}{_pm} ns  (ampl.)")
         if fr:
-            lines.append(f"⟨τ⟩ = {fr['tau_mean_int']:.4g} ns  (int.)")
+            _e = fr.get("tau_mean_int_err", float("nan"))
+            _pm = f" ± {_e:.2g}" if np.isfinite(_e) else ""
+            lines.append(f"⟨τ⟩ = {fr['tau_mean_int']:.4g}{_pm} ns  (int.)")
         gof = (f"red. χ² = {result['red_chi2']:.3g}"
                if result["weighted"] else f"R² = {result['r2']:.4f}")
         lines.append(gof)
@@ -1234,11 +1251,20 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
                      f"{result['values'][f'tau{i}']:>14.6g}")
     if np.isfinite(result.get("tau_mean", float("nan"))):
         L.append("")
+        _ea = result.get("tau_mean_err", float("nan"))
+        _pma = f" ± {_ea:.6g}" if np.isfinite(_ea) else ""
         L.append(f"derived    : amplitude-weighted mean lifetime "
-                 f"⟨τ⟩ = {result['tau_mean']:.6g} ns")
+                 f"⟨τ⟩ = {result['tau_mean']:.6g}{_pma} ns")
         if fr:
+            _ei = fr.get("tau_mean_int_err", float("nan"))
+            _pmi = f" ± {_ei:.6g}" if np.isfinite(_ei) else ""
             L.append(f"             intensity-weighted mean lifetime "
-                     f"⟨τ⟩ = {fr['tau_mean_int']:.6g} ns")
+                     f"⟨τ⟩ = {fr['tau_mean_int']:.6g}{_pmi} ns")
+        if fr and not np.isfinite(_ea):
+            # Silence here would read as "no uncertainty", which is the one
+            # thing it does not mean.
+            L.append("             (no uncertainty: the fit returned no "
+                     "usable covariance)")
     L.append("")
     L.append("Goodness of fit")
     L.append("-" * 60)
@@ -1313,7 +1339,8 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
     if fr:
         for i in fr["indices"]:
             p_header += [f"alpha{i}", f"f{i}"]
-        p_header += ["tau_mean_amp_ns", "tau_mean_int_ns"]
+        p_header += ["tau_mean_amp_ns", "tau_mean_amp_err_ns",
+                     "tau_mean_int_ns", "tau_mean_int_err_ns"]
 
     p_header += ["weighted", "r2", "chi2", "red_chi2", "n_points", "dof"]
 
@@ -1337,7 +1364,9 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
             row.append(float(fr["alpha"][i]))
             row.append(float(fr["f"][i]))
         row.append(float(fr["tau_mean_amp"]))
+        row.append(float(fr.get("tau_mean_amp_err", float("nan"))))
         row.append(float(fr["tau_mean_int"]))
+        row.append(float(fr.get("tau_mean_int_err", float("nan"))))
     row += [
         "yes" if result["weighted"] else "no",
         float(result["r2"]),
@@ -1368,6 +1397,10 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
                         "fraction (fraction of photons)")
         comments.append("note_tau_mean : tau_mean_amp = sum(A*tau)/sum(A) ; "
                         "tau_mean_int = sum(A*tau^2)/sum(A*tau)")
+        comments.append("note_tau_mean_err : 1-sigma, propagated through the "
+                        "full parameter covariance (amplitudes and lifetimes "
+                        "are correlated, so this is not a sum in quadrature "
+                        "of the individual errors)")
 
     _write_params_table(params_path, comments, p_header, [row],
                         log_tag="lifetime fit")
@@ -3307,7 +3340,10 @@ def _lifetime_setup_dialog(parent, fcs_data, model, channel, n_bins,
             for n in result["names"]
         )
         if np.isfinite(result.get("tau_mean", float("nan"))):
-            summary += f"\n⟨τ⟩ = {result['tau_mean']:.4g} ns (amplitude-weighted)"
+            _e = result.get("tau_mean_err", float("nan"))
+            _pm = f" ± {_e:.2g}" if np.isfinite(_e) else ""
+            summary += (f"\n⟨τ⟩ = {result['tau_mean']:.4g}{_pm} ns "
+                        f"(amplitude-weighted)")
         _fr = result.get("fractions")
         if _fr:
             summary += "\n" + "   ".join(

@@ -56,6 +56,7 @@ import fcs_export
 import fcs_fisher
 
 from fcs_fitcommon import (
+    mean_lifetime_errors,
     fits_dir as _fits_dir,
     new_fit_dir as _new_fit_dir,
     fmt_bound as _fmt,
@@ -369,6 +370,11 @@ def fit_lifetime(
     red_chi2 = chi2 / dof if dof > 0 else float("nan")
 
     derived = _derived_lifetimes(model, values)
+    if model.n_exp > 1:
+        _tau_errs = mean_lifetime_errors(
+            values, list(zip(model.amp_names, model.tau_names)), free, pcov)
+        if _tau_errs:
+            derived.update(_tau_errs)
 
     win = (
         float(t[fit_mask][0]) if fit_mask.any() else float(t[0]),
@@ -532,8 +538,13 @@ def plot_lifetime_fit(
         else:
             lines.append(f"τ{i+1} = {tv:.3g}{tag} ns")
     if model.n_exp > 1:
-        lines.append(f"⟨τ⟩amp = {result['derived']['tau_mean_amp']:.3g} ns")
-        lines.append(f"⟨τ⟩int = {result['derived']['tau_mean_int']:.3g} ns")
+        _der = result["derived"]
+        _ea = _der.get("tau_mean_amp_err", float("nan"))
+        _ei = _der.get("tau_mean_int_err", float("nan"))
+        _pma = f" ± {_ea:.2g}" if np.isfinite(_ea) else ""
+        _pmi = f" ± {_ei:.2g}" if np.isfinite(_ei) else ""
+        lines.append(f"⟨τ⟩amp = {_der['tau_mean_amp']:.3g}{_pma} ns")
+        lines.append(f"⟨τ⟩int = {_der['tau_mean_int']:.3g}{_pmi} ns")
     bgv = result["values"].get("bg", 0.0)
     lines.append(f"bg = {bgv:.3g} cnt")
     if not result["fixed"].get("shift", True):
@@ -665,8 +676,17 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
                      f"{der.get('alphas', {}).get(tn, float('nan')):>12.4f}"
                      f"{der['fractions'].get(tn, float('nan')):>12.4f}")
         L.append("")
-        L.append(f"  amplitude-weighted <tau>   : {der['tau_mean_amp']:.4f} ns")
-        L.append(f"  intensity-weighted <tau>   : {der['tau_mean_int']:.4f} ns")
+        _ea = der.get("tau_mean_amp_err", float("nan"))
+        _ei = der.get("tau_mean_int_err", float("nan"))
+        _pma = f" +/- {_ea:.4f}" if np.isfinite(_ea) else ""
+        _pmi = f" +/- {_ei:.4f}" if np.isfinite(_ei) else ""
+        L.append(f"  amplitude-weighted <tau>   : "
+                 f"{der['tau_mean_amp']:.4f}{_pma} ns")
+        L.append(f"  intensity-weighted <tau>   : "
+                 f"{der['tau_mean_int']:.4f}{_pmi} ns")
+        if not np.isfinite(_ea):
+            L.append("  (no uncertainty on <tau>: the Jacobian step returned "
+                     "no usable covariance)")
     else:
         L.append(f"  lifetime                   : "
                  f"{result['values'][model.tau_names[0]]:.4f} ns")
@@ -738,7 +758,8 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
     if model.n_exp > 1:
         for i in range(len(model.tau_names)):
             p_header += [f"alpha{i + 1}", f"f{i + 1}"]
-        p_header += ["tau_mean_amp_ns", "tau_mean_int_ns"]
+        p_header += ["tau_mean_amp_ns", "tau_mean_amp_err_ns",
+                     "tau_mean_int_ns", "tau_mean_int_err_ns"]
     p_header += ["weighted", "r2", "chi2", "red_chi2", "n_points", "dof"]
 
     row: list = [
@@ -761,7 +782,9 @@ def export_lifetime_fit(result: dict, source_path: str | Path,
             row.append(float(der.get("alphas", {}).get(tn, float("nan"))))
             row.append(float(der["fractions"].get(tn, float("nan"))))
         row.append(float(der["tau_mean_amp"]))
+        row.append(float(der.get("tau_mean_amp_err", float("nan"))))
         row.append(float(der["tau_mean_int"]))
+        row.append(float(der.get("tau_mean_int_err", float("nan"))))
     row += [
         "yes" if result["weighted"] else "no",
         float(result["r2"]),
